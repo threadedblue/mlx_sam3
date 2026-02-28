@@ -8,8 +8,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-BACKEND_DIR="$SCRIPT_DIR/backend"
-FRONTEND_DIR="$SCRIPT_DIR/frontend"
+BACKEND_DIR="$SCRIPT_DIR/app/backend"
+FRONTEND_DIR="$SCRIPT_DIR/app/frontend"
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -81,24 +81,16 @@ fi
 
 echo -e "${GREEN}Starting Backend (FastAPI) on http://localhost:8000${NC}"
 cd "$PROJECT_ROOT"
-uv run python "$BACKEND_DIR/main.py" &
+cd "$BACKEND_DIR"
+uv run uvicorn main:app --reload &
 BACKEND_PID=$!
 PIDS+=($BACKEND_PID)
-
-# Wait a moment for backend to start
-sleep 2
-
-echo -e "${GREEN}Starting Frontend (Next.js) on http://localhost:3000${NC}"
-cd "$FRONTEND_DIR"
-npm run dev &
-FRONTEND_PID=$!
-PIDS+=($FRONTEND_PID)
 
 echo ""
 echo -e "${GREEN}════════════════════════════════════════${NC}"
 echo -e "${GREEN}  Servers are running!${NC}"
-echo -e "${GREEN}  Frontend: http://localhost:3000${NC}"
 echo -e "${GREEN}  Backend:  http://localhost:8000${NC}"
+echo -e "${GREEN}  Frontend: http://localhost:8000/web${NC}"
 echo -e "${GREEN}  API Docs: http://localhost:8000/docs${NC}"
 echo -e "${GREEN}════════════════════════════════════════${NC}"
 echo ""

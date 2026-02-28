@@ -1,0 +1,9 @@
+# Flutter Project Rules
+- **Flutter Version:** 3.38.1
+- **Dart Version:** 3.10.0+
+- **Strict Rules:**
+  - ALWAYS use `ThemeData.useMaterial3: true`.
+  - Use `CardThemeData` instead of `CardTheme` in ThemeData.
+  - Use `TabBarThemeData` instead of `TabBarTheme` in ThemeData.
+  - Avoid `dart:ui` PathEffects for web; use the `path_drawing` package instead.
+  - Target Platform: Web (FastAPI backend).

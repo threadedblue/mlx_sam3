@@ -14,8 +14,11 @@ import mlx.core as mx
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from pathlib import Path
 
 # Add parent directory to path to import sam3
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -58,6 +61,11 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+BASE_DIR = Path(__file__).resolve().parent
+FLUTTER_WEB_DIR = BASE_DIR.parent / "frontend" / "build" / "web"
+print(f"===> {FLUTTER_WEB_DIR}")
+
 
 # CORS middleware for frontend
 app.add_middleware(
@@ -163,16 +171,15 @@ def serialize_state(state: dict) -> dict:
     return result
 
 
-@app.get("/")
-async def root():
-    return {"message": "SAM3 Segmentation API", "status": "running"}
-
-
 @app.get("/health")
 async def health():
     return {"status": "healthy", "model_loaded": model is not None}
 
 
+@app.get("/")
+async def root():
+    return {"message": "SAM3 Segmentation API", "status": "running"}
+    
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
     """Upload an image and initialize a session."""
@@ -352,7 +359,8 @@ async def delete_session(session_id: str):
     raise HTTPException(status_code=404, detail="Session not found")
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+app.mount(
+    "/web",
+    StaticFiles(directory=FLUTTER_WEB_DIR, html=True),
+    name="frontend",
+)
