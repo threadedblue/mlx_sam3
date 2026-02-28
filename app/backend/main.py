@@ -6,6 +6,8 @@ Provides endpoints for image upload, text prompts, box prompts, and segmentation
 import io
 import os
 import sys
+import json
+from datetime import datetime
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -202,7 +204,10 @@ async def upload_image(file: UploadFile = File(...)):
         # Store session with image info
         sessions[session_id] = {
             "state": state,
+            "original_image_bytes": contents,
+            "original_filename": file.filename,
             "image_size": image.size,
+            "created_at": datetime.utcnow().isoformat(),
         }
         
         return {
@@ -232,6 +237,7 @@ async def segment_with_text(request: TextPromptRequest):
         start_time = time.perf_counter()
         state = processor.set_text_prompt(request.prompt, session["state"])
         processing_time_ms = (time.perf_counter() - start_time) * 1000
+        session.setdefault("prompts", []).append(request.prompt)
         session["state"] = state
         start = time.perf_counter()
         results = serialize_state(state)
@@ -281,6 +287,12 @@ async def add_box_prompt(request: BoxPromptRequest):
             "label": request.label
         })
         
+        session.setdefault("prompts", []).append({
+            "type": "box",
+            "box": request.box,
+            "label": "positive" if request.label else "negative"
+        })
+        
         start_time = time.perf_counter()
         state = processor.add_geometric_prompt(request.box, request.label, state)
         processing_time_ms = (time.perf_counter() - start_time) * 1000
@@ -317,6 +329,8 @@ async def reset_prompts(request: SessionRequest):
         
         if "prompted_boxes" in state:
             del state["prompted_boxes"]
+        if "prompts" in session:
+            session["prompts"] = []
         
         return {
             "session_id": request.session_id,
@@ -329,6 +343,69 @@ async def reset_prompts(request: SessionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error resetting prompts: {str(e)}")
 
+
+@app.post("/saveMasks")
+async def save_masks(request: SessionRequest):
+    """Saves the session data, including original image and masks, to the filesystem."""
+    if processor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
+
+    session = sessions.get(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        start_time = time.perf_counter()
+        state = session["state"]
+        
+        # Define storage paths relative to the project root
+        storage_root = BASE_DIR.parent.parent / "storage" / "sessions"
+        session_dir = storage_root / request.session_id
+        masks_dir = session_dir / "masks"
+        segments_dir = session_dir / "segments"
+
+        # Create directories
+        masks_dir.mkdir(parents=True, exist_ok=True)
+        segments_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Save original image
+        if "original_image_bytes" in session:
+            (session_dir / "original.png").write_bytes(session["original_image_bytes"])
+
+        # 2. Save masks as individual PNG files
+        mask_count = 0
+        if "masks" in state:
+            masks = state["masks"]
+            mask_count = len(masks)
+            for i, mask_mx in enumerate(masks):
+                mask_np = np.array(mask_mx)
+                mask_binary = (mask_np > 0.5).astype(np.uint8) * 255
+                if mask_binary.ndim == 3:
+                    mask_binary = mask_binary[0]
+                
+                mask_image = Image.fromarray(mask_binary, mode='L')
+                mask_image.save(masks_dir / f"mask_{i:03d}.png")
+
+        # 3. Save session metadata
+        session_data = {
+            "session_id": request.session_id,
+            "created_at": session.get("created_at"),
+            "original_filename": session.get("original_filename"),
+            "prompts": session.get("prompts", []),
+            "mask_count": mask_count
+        }
+        (session_dir / "session.json").write_text(json.dumps(session_data, indent=2))
+
+        processing_time_ms = (time.perf_counter() - start_time) * 1000
+
+        return {
+            "session_id": request.session_id,
+            "message": f"Session saved to {session_dir}",
+            "processing_time_ms": round(processing_time_ms, 2),
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving session: {str(e)}")
 
 @app.post("/confidence")
 async def set_confidence(request: ConfidenceRequest):

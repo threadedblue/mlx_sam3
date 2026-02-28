@@ -13,6 +13,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:file_picker/file_picker.dart';
 
 import 'services/api_service.dart';
@@ -58,7 +59,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // State
   String? _sessionId;
-
+  
   Uint8List? _imageBytes; // Web-safe image data
   String? _imageName; // Optional, useful for upload filename
   Size? _imageSize; // Original size (from backend)
@@ -98,6 +99,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _backendStatus = health['model_loaded'] == true ? "online" : "offline";
       });
     } catch (e) {
+      debugPrint("Health check error: $e");
       if (!mounted) return;
       setState(() {
         _backendStatus = "offline";
@@ -225,6 +227,27 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _saveMasks() async {
+    if (_sessionId == null) return;
+    setState(() => _isLoading = true);
+    try {
+      final response = await _api.saveMasks(_sessionId!);
+      if (!mounted) return;
+      if (response != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Masks saved successfully")),
+        );
+        _addTiming("Save Masks", response['processing_time_ms']);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     // If you later want a responsive layout, you can use isWide.
@@ -260,6 +283,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 _buildBoxPromptCard(),
                 const SizedBox(height: 16),
                 _buildResultsCard(),
+                const SizedBox(height: 16),
+                _buildDownloadCard(),
                 const SizedBox(height: 16),
                 _buildPerformanceCard(),
                 if (_error != null) ...[
@@ -535,6 +560,40 @@ class _HomeScreenState extends State<HomeScreen> {
                 icon: const Icon(Icons.delete_outline, size: 16),
                 label: const Text("Clear All Prompts"),
                 style: OutlinedButton.styleFrom(foregroundColor: Colors.red),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDownloadCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.download, size: 16),
+                SizedBox(width: 8),
+                Text("Download", style: TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              "Save the image and generated masks.",
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: (_sessionId == null || _isLoading) ? null : _saveMasks,
+                icon: const Icon(Icons.save_alt, size: 16),
+                label: const Text("Save Masks"),
               ),
             ),
           ],
