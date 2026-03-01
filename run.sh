@@ -23,6 +23,15 @@ echo -e "${BLUE}║   SAM3 Segmentation Studio Launcher    ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
 echo ""
 
+# Check for --clear-storage argument
+for arg in "$@"; do
+  if [ "$arg" == "--clear-storage" ]; then
+    echo -e "${YELLOW}Clearing storage directory ($SCRIPT_DIR/storage)...${NC}"
+    rm -rf "$SCRIPT_DIR/storage"
+    echo -e "${GREEN}Storage cleared.${NC}"
+  fi
+done
+
 # Array to store process PIDs
 PIDS=()
 
@@ -102,4 +111,3 @@ echo ""
 set +e  # Temporarily disable exit on error for wait
 wait "${PIDS[@]}" 2>/dev/null
 set -e  # Re-enable exit on error
-

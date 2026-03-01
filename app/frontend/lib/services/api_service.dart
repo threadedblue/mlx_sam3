@@ -127,4 +127,22 @@ class ApiService {
       rethrow;
     }
   }
+
+  Future<Map<String, dynamic>?> saveMasks(String sessionId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/saveMasks'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId}),
+      );
+
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      }
+      throw Exception('Save masks failed: ${response.body}');
+    } catch (e) {
+      print('Error saving masks: $e');
+      rethrow;
+    }
+  }
 }
