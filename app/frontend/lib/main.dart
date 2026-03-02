@@ -70,6 +70,9 @@ class _HomeScreenState extends State<HomeScreen> {
   String _backendStatus = "checking";
   String _boxMode = "positive"; // "positive" or "negative"
 
+  List<String> _savedSessions = [];
+  String? _selectedSavedSession;
+
   // Timing
   final List<Map<String, dynamic>> _timings = [];
   Timer? _healthCheckTimer;
@@ -78,6 +81,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _checkHealth();
+    _loadSavedSessions();
     _healthCheckTimer = Timer.periodic(
       const Duration(seconds: 10),
       (_) => _checkHealth(),
@@ -106,6 +110,19 @@ class _HomeScreenState extends State<HomeScreen> {
         _error ??= "Health check failed: $e";
       });
     }
+  }
+
+  Future<void> _loadSavedSessions() async {
+    final sessions = await _api.listSessions();
+    if (!mounted) return;
+    setState(() {
+      _savedSessions = sessions;
+      if (_savedSessions.isNotEmpty && _selectedSavedSession == null) {
+        _selectedSavedSession = _savedSessions.first;
+      } else if (!_savedSessions.contains(_selectedSavedSession)) {
+        _selectedSavedSession = _savedSessions.isNotEmpty ? _savedSessions.first : null;
+      }
+    });
   }
 
   void _addTiming(String label, dynamic duration) {
@@ -237,8 +254,122 @@ class _HomeScreenState extends State<HomeScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Masks saved successfully")),
         );
+        _loadSavedSessions(); // Refresh list
         _addTiming("Save Masks", response['processing_time_ms']);
       }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _handleCreateSegments() async {
+    if (_sessionId == null) return;
+    setState(() => _isLoading = true);
+    try {
+      final response = await _api.createSegments(_sessionId!);
+      if (!mounted) return;
+      if (response != null) {
+        final count = response['segment_count'];
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("$count segments created successfully")),
+        );
+        _addTiming("Create Segments", response['processing_time_ms']);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _handleShowSegments() async {
+    if (_sessionId == null) return;
+    setState(() => _isLoading = true);
+    List<String> segmentUrls = [];
+    try {
+      segmentUrls = await _api.showSegments(_sessionId!);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    }
+
+    if (!mounted) return;
+    if (segmentUrls.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("No segments found. Please create them first.")),
+      );
+      return;
+    }
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Generated Segments"),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: GridView.builder(
+            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+              maxCrossAxisExtent: 150,
+              childAspectRatio: 1,
+              crossAxisSpacing: 10,
+              mainAxisSpacing: 10,
+            ),
+            itemCount: segmentUrls.length,
+            itemBuilder: (context, index) {
+              return Image.network(segmentUrls[index], fit: BoxFit.cover);
+            },
+          ),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text("Close"))],
+      ),
+    );
+  }
+
+  Future<void> _handleNewSession() async {
+    setState(() => _isLoading = true);
+    try {
+      final newId = await _api.newSession();
+      if (!mounted) return;
+      setState(() {
+        _sessionId = newId;
+        _imageBytes = null;
+        _imageSize = null;
+        _result = null;
+        _error = null;
+        _textController.clear();
+      });
+      await _api.createSessionDirs(_sessionId!);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("New session created: $newId")),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _handleDeleteSession() async {
+    if (_selectedSavedSession == null) return;
+    setState(() => _isLoading = true);
+    try {
+      await _api.deleteSession(_selectedSavedSession!);
+      await _loadSavedSessions();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Session deleted")),
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
@@ -259,7 +390,7 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Icon(Icons.auto_awesome, color: Colors.indigo),
             SizedBox(width: 10),
-            Text('SAM3 Studio', style: TextStyle(fontWeight: FontWeight.bold)),
+            Text('SAM3 MLX Studio', style: TextStyle(fontWeight: FontWeight.bold)),
           ],
         ),
         actions: [
@@ -276,6 +407,8 @@ class _HomeScreenState extends State<HomeScreen> {
             child: ListView(
               padding: const EdgeInsets.all(16),
               children: [
+                _buildSessionCard(),
+                const SizedBox(height: 16),
                 _buildUploadCard(),
                 const SizedBox(height: 16),
                 _buildTextPromptCard(),
@@ -285,6 +418,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 _buildResultsCard(),
                 const SizedBox(height: 16),
                 _buildDownloadCard(),
+                const SizedBox(height: 16),
+                _buildSegmentsCard(),
                 const SizedBox(height: 16),
                 _buildPerformanceCard(),
                 if (_error != null) ...[
@@ -378,6 +513,61 @@ class _HomeScreenState extends State<HomeScreen> {
           const SizedBox(width: 6),
           Text(text, style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w500)),
         ],
+      ),
+    );
+  }
+
+  Widget _buildSessionCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.folder_shared, size: 16),
+                SizedBox(width: 8),
+                Text("Session Management", style: TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              value: _selectedSavedSession,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: "Saved Sessions",
+                border: OutlineInputBorder(),
+                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              ),
+              items: _savedSessions.map((s) {
+                return DropdownMenuItem(value: s, child: Text(s, overflow: TextOverflow.ellipsis));
+              }).toList(),
+              onChanged: (val) {
+                setState(() => _selectedSavedSession = val);
+              },
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.tonal(
+                    onPressed: _isLoading ? null : _handleNewSession,
+                    child: const Text("New"),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: (_selectedSavedSession == null || _isLoading) ? null : _handleDeleteSession,
+                    style: OutlinedButton.styleFrom(foregroundColor: Colors.red),
+                    child: const Text("Delete"),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -595,6 +785,51 @@ class _HomeScreenState extends State<HomeScreen> {
                 icon: const Icon(Icons.save_alt, size: 16),
                 label: const Text("Save Masks"),
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSegmentsCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.category_outlined, size: 16),
+                SizedBox(width: 8),
+                Text("Segments", style: TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              "Create and view individual segment images.",
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: (_sessionId == null || _isLoading) ? null : _handleCreateSegments,
+                    icon: const Icon(Icons.cut, size: 16),
+                    label: const Text("Create Segments"),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: (_sessionId == null || _isLoading) ? null : _handleShowSegments,
+                    icon: const Icon(Icons.image_search, size: 16),
+                    label: const Text("Show Segments"),
+                  ),
+                ),
+              ],
             ),
           ],
         ),

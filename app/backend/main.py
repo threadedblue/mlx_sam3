@@ -17,7 +17,7 @@ import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from PIL import Image
+from PIL import Image, ImageDraw
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pathlib import Path
@@ -29,13 +29,15 @@ import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
+from services import SegmentationService
+
 # Global model and processor
 model = None
 processor = None
+service = None
 
-# Session storage for processing states
-sessions: dict = {}
-
+BASE_DIR = Path(__file__).resolve().parent
+STORAGE_DIR = BASE_DIR.parent.parent / "storage" / "sessions"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -43,29 +45,28 @@ async def lifespan(app: FastAPI):
     global model, processor
     
     sam3_root = os.path.dirname(sam3.__file__)
-    # bpe_path = os.path.join(sam3_root, "..", "assets", "bpe_simple_vocab_16e6.txt.gz")
-    # checkpoint_path = os.path.join(sam3_root, "..", "sam3-mod-weights", "model.safetensors")
     
-    # print(f"Loading SAM3 model from {checkpoint_path}...")
     model = build_sam3_image_model()
     processor = Sam3Processor(model)
     print("SAM3 model loaded successfully!")
     
+    # Initialize Service Layer
+    global service
+    service = SegmentationService(STORAGE_DIR)
+    
     yield
     
-    # Cleanup
-    sessions.clear()
-
+    # Cleanup if needed
 
 app = FastAPI(
-    title="SAM3 Segmentation API",
+    title="SAM3 Segmentation API for MLX",
     description="API for interactive image segmentation using SAM3 model",
     version="1.0.0",
     lifespan=lifespan
 )
 
-BASE_DIR = Path(__file__).resolve().parent
 FLUTTER_WEB_DIR = BASE_DIR.parent / "frontend" / "build" / "web"
+STORAGE_PARENT_DIR = STORAGE_DIR.parent
 print(f"===> {FLUTTER_WEB_DIR}")
 
 
@@ -201,14 +202,14 @@ async def upload_image(file: UploadFile = File(...)):
         state = processor.set_image(image)
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         
-        # Store session with image info
-        sessions[session_id] = {
+        # Register session in service
+        service.register_session_data(session_id, {
             "state": state,
             "original_image_bytes": contents,
             "original_filename": file.filename,
             "image_size": image.size,
             "created_at": datetime.utcnow().isoformat(),
-        }
+        })
         
         return {
             "session_id": session_id,
@@ -229,7 +230,7 @@ async def segment_with_text(request: TextPromptRequest):
     if processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
     
-    session = sessions.get(request.session_id)
+    session = service.get_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -262,7 +263,7 @@ async def add_box_prompt(request: BoxPromptRequest):
     if processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
     
-    session = sessions.get(request.session_id)
+    session = service.get_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -316,7 +317,7 @@ async def reset_prompts(request: SessionRequest):
     if processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
     
-    session = sessions.get(request.session_id)
+    session = service.get_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -350,60 +351,15 @@ async def save_masks(request: SessionRequest):
     if processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
-    session = sessions.get(request.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
     try:
-        start_time = time.perf_counter()
-        state = session["state"]
-        
-        # Define storage paths relative to the project root
-        storage_root = BASE_DIR.parent.parent / "storage" / "sessions"
-        session_dir = storage_root / request.session_id
-        masks_dir = session_dir / "masks"
-        segments_dir = session_dir / "segments"
-
-        # Create directories
-        masks_dir.mkdir(parents=True, exist_ok=True)
-        segments_dir.mkdir(parents=True, exist_ok=True)
-
-        # 1. Save original image
-        if "original_image_bytes" in session:
-            (session_dir / "original.png").write_bytes(session["original_image_bytes"])
-
-        # 2. Save masks as individual PNG files
-        mask_count = 0
-        if "masks" in state:
-            masks = state["masks"]
-            mask_count = len(masks)
-            for i, mask_mx in enumerate(masks):
-                mask_np = np.array(mask_mx)
-                mask_binary = (mask_np > 0.5).astype(np.uint8) * 255
-                if mask_binary.ndim == 3:
-                    mask_binary = mask_binary[0]
-                
-                mask_image = Image.fromarray(mask_binary, mode='L')
-                mask_image.save(masks_dir / f"mask_{i:03d}.png")
-
-        # 3. Save session metadata
-        session_data = {
-            "session_id": request.session_id,
-            "created_at": session.get("created_at"),
-            "original_filename": session.get("original_filename"),
-            "prompts": session.get("prompts", []),
-            "mask_count": mask_count
-        }
-        (session_dir / "session.json").write_text(json.dumps(session_data, indent=2))
-
-        processing_time_ms = (time.perf_counter() - start_time) * 1000
-
+        result = service.save_masks_to_disk(request.session_id)
         return {
             "session_id": request.session_id,
-            "message": f"Session saved to {session_dir}",
-            "processing_time_ms": round(processing_time_ms, 2),
+            "message": f"Session saved to {result['path']}",
+            "processing_time_ms": round(result['processing_time_ms'], 2),
         }
-
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error saving session: {str(e)}")
 
@@ -413,7 +369,7 @@ async def set_confidence(request: ConfidenceRequest):
     if processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
     
-    session = sessions.get(request.session_id)
+    session = service.get_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -430,14 +386,114 @@ async def set_confidence(request: ConfidenceRequest):
 @app.delete("/session/{session_id}")
 async def delete_session(session_id: str):
     """Delete a session and free memory."""
-    if session_id in sessions:
-        del sessions[session_id]
+    if service.delete_session_memory(session_id):
         return {"message": "Session deleted"}
     raise HTTPException(status_code=404, detail="Session not found")
+
+
+@app.get("/listSessions")
+async def list_sessions():
+    """List all saved sessions in storage."""
+    if not STORAGE_DIR.exists():
+        return []
+    
+    # List directories only
+    sessions_list = [
+        d.name for d in STORAGE_DIR.iterdir() 
+        if d.is_dir() and not d.name.startswith('.')
+    ]
+    # Sort by modification time (newest first) if possible, or just name
+    sessions_list.sort(reverse=True)
+    return sessions_list
+
+
+@app.get("/newSession")
+async def new_session():
+    session_id = str(uuid.uuid4())
+
+    return {"session_id": session_id}
+
+
+@app.delete("/deleteSession/{session_id}")
+async def delete_saved_session(session_id: str):
+    """Deletes the storage directory for a specific session."""
+    session_dir = STORAGE_DIR / session_id
+    if session_dir.exists() and session_dir.is_dir():
+        shutil.rmtree(session_dir)
+        return {"message": f"Session {session_id} deleted", "session_id": session_id}
+    
+    raise HTTPException(status_code=404, detail="Saved session not found")
+
+
+@app.post("/createSegments")
+async def create_segments(request: SessionRequest):
+    """Creates segmented image files from the current masks."""
+    session = sessions.get(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if "original_image_bytes" not in session or "state" not in session or "masks" not in session["state"]:
+        raise HTTPException(status_code=400, detail="Image or masks not available in session. Please generate masks first.")
+
+    try:
+        start_time = time.perf_counter()
+        
+        original_image = Image.open(io.BytesIO(session["original_image_bytes"])).convert("RGBA")
+        masks = session["state"]["masks"]
+        
+        session_dir = STORAGE_DIR / request.session_id
+        segments_dir = session_dir / "segments"
+        segments_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clear old segments
+        for f in segments_dir.glob('*.png'):
+            f.unlink()
+
+        for i, mask_mx in enumerate(masks):
+            mask_np = np.array(mask_mx)
+            mask_binary = (mask_np > 0.5).astype(np.uint8)
+            if mask_binary.ndim == 3:
+                mask_binary = mask_binary[0]
+            
+            mask_image = Image.fromarray(mask_binary * 255, 'L')
+
+            segment_image = Image.new("RGBA", original_image.size, (0, 0, 0, 0))
+            segment_image.paste(original_image, (0, 0), mask_image)
+            
+            segment_image.save(segments_dir / f"segment_{i:03d}.png")
+
+        processing_time_ms = (time.perf_counter() - start_time) * 1000
+        return {
+            "message": f"{len(masks)} segments created in {segments_dir}",
+            "segment_count": len(masks),
+            "processing_time_ms": round(processing_time_ms, 2),
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating segments: {str(e)}")
+
+
+@app.get("/showSegments/{session_id}")
+async def show_segments(session_id: str):
+    """Returns a list of URLs for the generated segments."""
+    segments_dir = service.storage_dir / session_id / "segments_raw"
+    if not segments_dir.exists():
+        return []
+
+    segment_files = sorted(segments_dir.glob("*.png"))
+    base_path = f"/storage/sessions/{session_id}/segments_raw" # This path is for the static mount
+    urls = [f"{base_path}/{f.name}" for f in segment_files]
+    return urls
 
 
 app.mount(
     "/web",
     StaticFiles(directory=FLUTTER_WEB_DIR, html=True),
     name="frontend",
+)
+
+app.mount(
+    "/storage",
+    StaticFiles(directory=STORAGE_PARENT_DIR),
+    name="storage"
 )

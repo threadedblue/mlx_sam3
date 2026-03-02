@@ -145,4 +145,92 @@ class ApiService {
       rethrow;
     }
   }
+
+  Future<List<String>> listSessions() async {
+    try {
+      final response = await http.get(Uri.parse('$baseUrl/listSessions'));
+      if (response.statusCode == 200) {
+        final List<dynamic> list = jsonDecode(response.body);
+        return list.cast<String>();
+      }
+      return [];
+    } catch (e) {
+      print('Error listing sessions: $e');
+      return [];
+    }
+  }
+
+  Future<String> newSession() async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/newSession'),
+        headers: {'Content-Type': 'application/json'},
+      );
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        return data['session_id'];
+      }
+      throw Exception('New session failed: ${response.body}');
+    } catch (e) {
+      print('Error creating session: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> createSessionDirs(String sessionId) async {
+    try {
+      final response = await http.post(Uri.parse('$baseUrl/createSessionDirs/$sessionId'),
+          headers: {'Content-Type': 'application/json'});
+      if (response.statusCode != 200) {
+        throw Exception('Failed to create session directories');
+      }
+    } catch (e) {
+      print('Error creating session directories: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> deleteSession(String sessionId) async {
+    try {
+      final response = await http.delete(Uri.parse('$baseUrl/deleteSession/$sessionId'));
+      if (response.statusCode != 200) {
+        throw Exception('Delete session failed: ${response.body}');
+      }
+    } catch (e) {
+      print('Error deleting session: $e');
+      rethrow;
+    }
+  }
+
+  Future<Map<String, dynamic>?> createSegments(String sessionId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/createSegments'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId}),
+      );
+
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      }
+      throw Exception('Create segments failed: ${response.body}');
+    } catch (e) {
+      print('Error creating segments: $e');
+      rethrow;
+    }
+  }
+
+  Future<List<String>> showSegments(String sessionId) async {
+    try {
+      final response = await http.get(Uri.parse('$baseUrl/showSegments/$sessionId'));
+      if (response.statusCode == 200) {
+        final List<dynamic> list = jsonDecode(response.body);
+        return list.cast<String>().map((path) => '$baseUrl$path').toList();
+      }
+      return [];
+    } catch (e) {
+      print('Error showing segments: $e');
+      return [];
+    }
+  }
 }
