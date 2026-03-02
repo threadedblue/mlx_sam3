@@ -409,8 +409,8 @@ async def list_sessions():
 
 @app.get("/newSession")
 async def new_session():
-    session_id = str(uuid.uuid4())
-
+    """Creates a new session ID and its storage directories."""
+    session_id = service.create_session()
     return {"session_id": session_id}
 
 
