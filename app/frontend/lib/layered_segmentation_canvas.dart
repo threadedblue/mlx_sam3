@@ -1,0 +1,200 @@
+// lib/layered_segmentation_canvas.dart
+
+import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+
+/// A data class to hold information about a single segmented area.
+/// [path] defines the shape of the segment.
+/// [color] is used for the mask layer.
+/// [retouchedImage] is an optional image for the 'finals' layer.
+class Segment {
+  final Path path;
+  final Color color;
+  final ui.Image? retouchedImage;
+
+  Segment({required this.path, required this.color, this.retouchedImage});
+}
+
+/// A widget that displays an image and its segmentations in four distinct,
+/// toggleable layers:
+/// 1. [Original]: The base image.
+/// 2. [Masks]: Colored overlays representing the segmentation masks.
+/// 3. [Raw]: The parts of the original image "cut out" by the masks.
+/// 4. [Finals]: Retouched images displayed within their segment boundaries.
+class LayeredSegmentationCanvas extends StatelessWidget {
+  final ui.Image originalImage;
+  final List<Segment> segments;
+  final bool showOriginal;
+  final bool showMasks;
+  final bool showRaw;
+  final bool showFinals;
+
+  const LayeredSegmentationCanvas({
+    super.key,
+    required this.originalImage,
+    required this.segments,
+    required this.showOriginal,
+    required this.showMasks,
+    required this.showRaw,
+    required this.showFinals,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // Use a FittedBox to ensure the canvas scales to fit its container
+    // while maintaining the original image's aspect ratio.
+    return FittedBox(
+      fit: BoxFit.contain,
+      child: SizedBox(
+        width: originalImage.width.toDouble(),
+        height: originalImage.height.toDouble(),
+        child: Stack(
+          children: [
+            // Layer 1: Original Image
+            Visibility(
+              visible: showOriginal,
+              child: CustomPaint(
+                painter: OriginalImagePainter(image: originalImage),
+                size: Size.infinite, // Expands to the Stack's constraints
+              ),
+            ),
+            // Layer 2: Segmentation Masks
+            Visibility(
+              visible: showMasks,
+              child: CustomPaint(
+                painter: MasksPainter(segments: segments),
+                size: Size.infinite,
+              ),
+            ),
+            // Layer 3: Raw Cutouts from Original
+            Visibility(
+              visible: showRaw,
+              child: CustomPaint(
+                painter: RawCutoutsPainter(
+                  originalImage: originalImage,
+                  segments: segments,
+                ),
+                size: Size.infinite,
+              ),
+            ),
+            // Layer 4: Final Retouched Images
+            Visibility(
+              visible: showFinals,
+              child: CustomPaint(
+                painter: FinalsPainter(segments: segments),
+                size: Size.infinite,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+//--- Custom Painters for Each Layer ---
+
+/// Layer 1: Draws the original image.
+class OriginalImagePainter extends CustomPainter {
+  final ui.Image image;
+
+  OriginalImagePainter({required this.image});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawImage(image, Offset.zero, Paint());
+  }
+
+  @override
+  bool shouldRepaint(covariant OriginalImagePainter oldDelegate) {
+    return image != oldDelegate.image;
+  }
+}
+
+/// Layer 2: Draws semi-transparent colored masks for each segment.
+class MasksPainter extends CustomPainter {
+  final List<Segment> segments;
+
+  MasksPainter({required this.segments});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    for (final segment in segments) {
+      final paint = Paint()
+        ..color = segment.color.withOpacity(0.5)
+        ..style = PaintingStyle.fill;
+      canvas.drawPath(segment.path, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant MasksPainter oldDelegate) {
+    // For better performance, consider a deep list comparison or versioning.
+    return !listEquals(segments, oldDelegate.segments);
+  }
+}
+
+/// Layer 3: Draws the parts of the original image that correspond to the masks.
+class RawCutoutsPainter extends CustomPainter {
+  final ui.Image originalImage;
+  final List<Segment> segments;
+
+  RawCutoutsPainter({required this.originalImage, required this.segments});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final imageRect = Rect.fromLTWH(0, 0, size.width, size.height);
+
+    for (final segment in segments) {
+      // Create a temporary drawing layer.
+      canvas.saveLayer(imageRect, Paint());
+
+      // Draw the original image into the temporary layer.
+      canvas.drawImage(originalImage, Offset.zero, Paint());
+
+      // Use BlendMode.dstIn to keep the destination (image) pixels only where
+      // the source (mask path) is drawn, effectively creating a cutout.
+      final maskPaint = Paint()..blendMode = BlendMode.dstIn;
+      canvas.drawPath(segment.path, maskPaint);
+
+      // Composite the temporary layer back onto the main canvas.
+      canvas.restore();
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant RawCutoutsPainter oldDelegate) {
+    return originalImage != oldDelegate.originalImage ||
+        !listEquals(segments, oldDelegate.segments);
+  }
+}
+
+/// Layer 4: Draws the final, retouched images, clipped to their segment path.
+class FinalsPainter extends CustomPainter {
+  final List<Segment> segments;
+
+  FinalsPainter({required this.segments});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    for (final segment in segments) {
+      if (segment.retouchedImage != null) {
+        // Save the current canvas state and clip the drawing area to the path.
+        canvas.save();
+        canvas.clipPath(segment.path);
+
+        // Draw the retouched image. It will only be visible inside the clipped path.
+        canvas.drawImage(segment.retouchedImage!, Offset.zero, Paint());
+
+        // Restore the canvas to its original state (removes the clip).
+        canvas.restore();
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant FinalsPainter oldDelegate) {
+    return !listEquals(segments, oldDelegate.segments);
+  }
+}

@@ -1,18 +1,22 @@
 import 'package:flutter/material.dart';
 
 class SegmentLayersCard extends StatelessWidget {
+  final bool showOriginal;
   final bool showMasks;
   final bool showRaw;
   final bool showFinal;
+  final ValueChanged<bool> onOriginalToggle;
   final ValueChanged<bool> onMasksToggle;
   final ValueChanged<bool> onRawToggle;
   final ValueChanged<bool> onFinalToggle;
 
   const SegmentLayersCard({
     super.key,
+    required this.showOriginal,
     required this.showMasks,
     required this.showRaw,
     required this.showFinal,
+    required this.onOriginalToggle,
     required this.onMasksToggle,
     required this.onRawToggle,
     required this.onFinalToggle,
@@ -42,6 +46,7 @@ class SegmentLayersCard extends StatelessWidget {
           style: Theme.of(context).textTheme.titleMedium,
         ),
         const SizedBox(height: 8),
+        _buildLayerCheckbox('Original', showOriginal, onOriginalToggle),
         _buildLayerCheckbox('Masks', showMasks, onMasksToggle),
         _buildLayerCheckbox('Raw', showRaw, onRawToggle),
         _buildLayerCheckbox('Final', showFinal, onFinalToggle),

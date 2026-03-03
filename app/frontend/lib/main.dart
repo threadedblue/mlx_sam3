@@ -1,16 +1,17 @@
 // DROP-IN replacement for your file (Flutter Web-safe: no dart:io, no File/Image.file)
 //
 // What changed vs your version:
-// - Removed dart:io usage (File) and switched to Uint8List + Image.memory (works on web).
-// - _checkHealth() is wrapped in try/catch to avoid “white screen” on backend/CORS failures.
-// - Canvas widget now takes imageBytes instead of imageFile.
-// - Box drawing remains the same.
-// - NOTE: Your ApiService must support uploading bytes. See the small adapter call below.
+// - Refactored the main canvas into a layered architecture using a new `LayeredSegmentationCanvas` widget.
+// - The old `SegmentationCanvas` is replaced with a new version that composes the layers and interaction controls.
+// - The old `SegmentationPainter` is removed and its logic is split into `_updateSegmentsFromResult` (for data) and a new `PromptPainter` (for display).
+// - State management is updated to handle `ui.Image` and `List<Segment>` for the new canvas.
+// - The "Segment Layers" card now includes a toggle for the "Original" image layer.
 //
 // If your current ApiService only accepts File, update it to accept bytes, or create an overload.
 
 import 'dart:async';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 // import 'package:flutter/foundation.dart' show kIsWeb;
@@ -18,6 +19,7 @@ import 'package:file_picker/file_picker.dart';
 
 import 'services/api_service.dart';
 import 'segment_layers_card.dart';
+import 'layered_segmentation_canvas.dart';
 
 void main() {
   runApp(const SamApp());
@@ -63,15 +65,18 @@ class _HomeScreenState extends State<HomeScreen> {
   
   Uint8List? _imageBytes; // Web-safe image data
   String? _imageName; // Optional, useful for upload filename
-  Size? _imageSize; // Original size (from backend)
+  ui.Image? _uiImage; // Decoded image for canvas
+  Size? _imageSize; // Original size
 
   Map<String, dynamic>? _result;
+  List<Segment> _segments = [];
   bool _isLoading = false;
   String? _error;
   String _backendStatus = "checking";
   String _boxMode = "positive"; // "positive" or "negative"
 
   // Layer Visibility
+  bool _showOriginal = true;
   bool _showMasks = true;
   bool _showRaw = true;
   bool _showFinal = true;
@@ -143,6 +148,46 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  Future<ui.Image> _decodeImage(Uint8List bytes) {
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromList(bytes, (ui.Image img) {
+      return completer.complete(img);
+    });
+    return completer.future;
+  }
+
+  void _updateSegmentsFromResult() {
+    if (_result == null) {
+      if (mounted) setState(() => _segments = []);
+      return;
+    }
+
+    final List<Segment> newSegments = [];
+    // The API result may contain 'masks' or 'boxes'. We check for both.
+    final masks = _result!['masks'] as List? ?? _result!['boxes'] as List?;
+
+    if (masks != null) {
+      final colors = [
+        Colors.red, Colors.blue, Colors.green, Colors.yellow, 
+        Colors.purple, Colors.orange, Colors.cyan, Colors.pink
+      ];
+      int colorIndex = 0;
+      for (var maskData in masks) {
+        if (maskData is List && maskData.length == 4) {
+          final list = maskData.map((e) => (e as num).toDouble()).toList();
+          final rect = Rect.fromLTRB(list[0], list[1], list[2], list[3]);
+          final path = Path()..addRect(rect);
+          newSegments.add(Segment(
+            path: path,
+            color: colors[colorIndex % colors.length],
+          ));
+          colorIndex++;
+        }
+      }
+    }
+    if (mounted) setState(() => _segments = newSegments);
+  }
+
   Future<void> _pickImage() async {
     FilePickerResult? result = await FilePicker.platform.pickFiles(
       type: FileType.image,
@@ -154,14 +199,18 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (bytes == null) return;
 
+    final decodedImage = await _decodeImage(bytes);
+
     setState(() {
       _isLoading = true;
       _error = null;
       _imageBytes = bytes;
       _imageName = picked?.name;
+      _uiImage = decodedImage;
       _sessionId = null;
       _result = null;
       _imageSize = null;
+      _segments = [];
     });
 
     try {
@@ -197,7 +246,10 @@ class _HomeScreenState extends State<HomeScreen> {
       final response = await _api.segmentWithText(_sessionId!, _textController.text);
       if (!mounted) return;
       if (response != null) {
-        setState(() => _result = response['results'] as Map<String, dynamic>?);
+        setState(() {
+          _result = response['results'] as Map<String, dynamic>?;
+          _updateSegmentsFromResult();
+        });
         _addTiming("Text: ${_textController.text}", response['processing_time_ms']);
       }
     } catch (e) {
@@ -216,7 +268,10 @@ class _HomeScreenState extends State<HomeScreen> {
       final response = await _api.segmentWithBox(_sessionId!, box, _boxMode == "positive");
       if (!mounted) return;
       if (response != null) {
-        setState(() => _result = response['results'] as Map<String, dynamic>?);
+        setState(() {
+          _result = response['results'] as Map<String, dynamic>?;
+          _updateSegmentsFromResult();
+        });
         _addTiming("Box ($_boxMode)", response['processing_time_ms']);
       }
     } catch (e) {
@@ -238,6 +293,7 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
           _textController.clear();
+          _updateSegmentsFromResult();
         });
         _addTiming("Reset Prompts", response['processing_time_ms']);
       }
@@ -348,6 +404,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _sessionId = newId;
         _imageBytes = null;
+        _uiImage = null;
         _imageSize = null;
         _result = null;
         _error = null;
@@ -470,14 +527,18 @@ class _HomeScreenState extends State<HomeScreen> {
                         ],
                       ),
                     )
-                  : (_imageSize == null)
+                  : (_uiImage == null)
                       ? const Center(child: CircularProgressIndicator())
                       : SegmentationCanvas(
-                          imageBytes: _imageBytes!,
-                          imageSize: _imageSize!,
+                          uiImage: _uiImage!,
+                          segments: _segments,
                           result: _result,
                           isLoading: _isLoading,
                           onBoxDrawn: _sendBoxPrompt,
+                          showOriginal: _showOriginal,
+                          showMasks: _showMasks,
+                          showRaw: _showRaw,
+                          showFinals: _showFinal,
                         ),
             ),
           ),
@@ -847,9 +908,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildSegmentLayersCard() {
     return SegmentLayersCard(
+      showOriginal: _showOriginal,
       showMasks: _showMasks,
       showRaw: _showRaw,
       showFinal: _showFinal,
+      onOriginalToggle: (val) => setState(() => _showOriginal = val),
       onMasksToggle: (val) => setState(() => _showMasks = val),
       onRawToggle: (val) => setState(() => _showRaw = val),
       onFinalToggle: (val) => setState(() => _showFinal = val),
@@ -922,19 +985,27 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 class SegmentationCanvas extends StatefulWidget {
-  final Uint8List imageBytes;
-  final Size imageSize;
+  final ui.Image uiImage;
+  final List<Segment> segments;
   final Map<String, dynamic>? result;
   final bool isLoading;
   final Function(List<double>) onBoxDrawn;
+  final bool showOriginal;
+  final bool showMasks;
+  final bool showRaw;
+  final bool showFinals;
 
   const SegmentationCanvas({
     super.key,
-    required this.imageBytes,
-    required this.imageSize,
+    required this.uiImage,
+    required this.segments,
     this.result,
     required this.isLoading,
     required this.onBoxDrawn,
+    required this.showOriginal,
+    required this.showMasks,
+    required this.showRaw,
+    required this.showFinals,
   });
 
   @override
@@ -947,130 +1018,104 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
 
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final double scaleW = constraints.maxWidth / widget.imageSize.width;
-        final double scaleH = constraints.maxHeight / widget.imageSize.height;
-        final double scale = scaleW < scaleH ? scaleW : scaleH;
+    return Stack(
+      children: [
+        // The core display layers
+        LayeredSegmentationCanvas(
+          originalImage: widget.uiImage,
+          segments: widget.segments,
+          showOriginal: widget.showOriginal,
+          showMasks: widget.showMasks,
+          showRaw: widget.showRaw,
+          showFinals: widget.showFinals,
+        ),
 
-        final double displayedW = widget.imageSize.width * scale;
-        final double displayedH = widget.imageSize.height * scale;
+        // The interaction and prompt overlay
+        _buildInteractionOverlay(),
 
-        final double offsetX = (constraints.maxWidth - displayedW) / 2;
-        final double offsetY = (constraints.maxHeight - displayedH) / 2;
+        // Loading indicator on top of everything
+        if (widget.isLoading)
+          Container(
+            color: Colors.black12,
+            child: const Center(child: CircularProgressIndicator()),
+          ),
+      ],
+    );
+  }
 
-        return Stack(
-          fit: StackFit.expand,
-          children: [
-            Center(child: Image.memory(widget.imageBytes, fit: BoxFit.contain)),
-
-            CustomPaint(
-              painter: SegmentationPainter(
-                result: widget.result,
-                imageSize: widget.imageSize,
-                displaySize: Size(displayedW, displayedH),
-                offset: Offset(offsetX, offsetY),
-                scale: scale,
+  Widget _buildInteractionOverlay() {
+    // This overlay needs to scale and position itself exactly like the
+    // content of LayeredSegmentationCanvas. We can achieve this by
+    // wrapping it in an identical FittedBox/SizedBox structure.
+    return FittedBox(
+      fit: BoxFit.contain,
+      child: SizedBox(
+        width: widget.uiImage.width.toDouble(),
+        height: widget.uiImage.height.toDouble(),
+        child: LayoutBuilder(builder: (context, constraints) {
+          // Inside this LayoutBuilder, the coordinate system matches the original image.
+          return Stack(
+            children: [
+              // Painter for showing existing prompts (the blue/red boxes)
+              CustomPaint(
+                size: Size.infinite,
+                painter: PromptPainter(result: widget.result),
               ),
-            ),
 
-            GestureDetector(
-              onPanStart: (details) {
-                setState(() {
+              // Gesture detector for drawing new boxes
+              GestureDetector(
+                onPanStart: (details) => setState(() {
                   _startDrag = details.localPosition;
                   _currentDrag = details.localPosition;
-                });
-              },
-              onPanUpdate: (details) {
-                setState(() => _currentDrag = details.localPosition);
-              },
-              onPanEnd: (details) {
-                if (_startDrag != null && _currentDrag != null) {
-                  final rect = Rect.fromPoints(_startDrag!, _currentDrag!);
+                }),
+                onPanUpdate: (details) => setState(() => _currentDrag = details.localPosition),
+                onPanEnd: (details) {
+                  if (_startDrag != null && _currentDrag != null) {
+                    final rect = Rect.fromPoints(_startDrag!, _currentDrag!);
 
-                  final double x = (rect.left - offsetX) / scale;
-                  final double y = (rect.top - offsetY) / scale;
-                  final double w = rect.width / scale;
-                  final double h = rect.height / scale;
+                    // Normalize coordinates for the API call.
+                    final double nx = rect.center.dx / widget.uiImage.width;
+                    final double ny = rect.center.dy / widget.uiImage.height;
+                    final double nw = rect.width / widget.uiImage.width;
+                    final double nh = rect.height / widget.uiImage.height;
 
-                  final double nx = (x + w / 2) / widget.imageSize.width;
-                  final double ny = (y + h / 2) / widget.imageSize.height;
-                  final double nw = w / widget.imageSize.width;
-                  final double nh = h / widget.imageSize.height;
-
-                  if (nw > 0.01 && nh > 0.01) {
-                    widget.onBoxDrawn([nx, ny, nw, nh]);
+                    if (nw > 0.005 && nh > 0.005) { // Avoid tiny boxes
+                      widget.onBoxDrawn([nx, ny, nw, nh]);
+                    }
                   }
-                }
-                setState(() {
-                  _startDrag = null;
-                  _currentDrag = null;
-                });
-              },
-              child: Container(color: Colors.transparent),
-            ),
+                  setState(() {
+                    _startDrag = null;
+                    _currentDrag = null;
+                  });
+                },
+                child: Container(color: Colors.transparent),
+              ),
 
-            if (_startDrag != null && _currentDrag != null)
-              CustomPaint(
-                painter: DragBoxPainter(
-                  rect: Rect.fromPoints(_startDrag!, _currentDrag!),
+              // Painter for the box being currently drawn
+              if (_startDrag != null && _currentDrag != null)
+                CustomPaint(
+                  size: Size.infinite,
+                  painter: DragBoxPainter(
+                    rect: Rect.fromPoints(_startDrag!, _currentDrag!),
+                  ),
                 ),
-              ),
-
-            if (widget.isLoading)
-              Container(
-                color: Colors.black12,
-                child: const Center(child: CircularProgressIndicator()),
-              ),
-          ],
-        );
-      },
+            ],
+          );
+        }),
+      ),
     );
   }
 }
 
-class SegmentationPainter extends CustomPainter {
+/// A painter for drawing the user's input prompts (positive/negative boxes).
+class PromptPainter extends CustomPainter {
   final Map<String, dynamic>? result;
-  final Size imageSize;
-  final Size displaySize;
-  final Offset offset;
-  final double scale;
 
-  SegmentationPainter({
-    required this.result,
-    required this.imageSize,
-    required this.displaySize,
-    required this.offset,
-    required this.scale,
-  });
+  PromptPainter({required this.result});
 
   @override
   void paint(Canvas canvas, Size size) {
     if (result == null) return;
-
-    final boxes = result!['boxes'] as List?;
-    if (boxes != null) {
-      final paint = Paint()
-        ..color = Colors.green.withOpacity(0.5)
-        ..style = PaintingStyle.fill;
-
-      final borderPaint = Paint()
-        ..color = Colors.green
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.0;
-
-      for (var b in boxes) {
-        final list = (b as List).map((e) => (e as num).toDouble()).toList();
-        final rect = Rect.fromLTRB(
-          list[0] * scale + offset.dx,
-          list[1] * scale + offset.dy,
-          list[2] * scale + offset.dx,
-          list[3] * scale + offset.dy,
-        );
-        canvas.drawRect(rect, paint);
-        canvas.drawRect(rect, borderPaint);
-      }
-    }
 
     final promptedBoxes = result!['prompted_boxes'] as List?;
     if (promptedBoxes != null) {
@@ -1083,12 +1128,8 @@ class SegmentationPainter extends CustomPainter {
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2.0;
 
-        final rect = Rect.fromLTRB(
-          box[0] * scale + offset.dx,
-          box[1] * scale + offset.dy,
-          box[2] * scale + offset.dx,
-          box[3] * scale + offset.dy,
-        );
+        // Coordinates are already in image space, no scaling needed.
+        final rect = Rect.fromLTRB(box[0], box[1], box[2], box[3]);
         canvas.drawRect(rect, paint);
 
         final iconPaint = Paint()..color = label ? Colors.blue : Colors.red;
@@ -1098,7 +1139,7 @@ class SegmentationPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+  bool shouldRepaint(covariant PromptPainter oldDelegate) => result != oldDelegate.result;
 }
 
 class DragBoxPainter extends CustomPainter {
@@ -1121,7 +1162,7 @@ class DragBoxPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+  bool shouldRepaint(covariant DragBoxPainter oldDelegate) => rect != oldDelegate.rect;
 }
 
 /*
