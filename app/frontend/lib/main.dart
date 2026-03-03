@@ -13,10 +13,11 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+// import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:file_picker/file_picker.dart';
 
 import 'services/api_service.dart';
+import 'segment_layers_card.dart';
 
 void main() {
   runApp(const SamApp());
@@ -69,6 +70,11 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _error;
   String _backendStatus = "checking";
   String _boxMode = "positive"; // "positive" or "negative"
+
+  // Layer Visibility
+  bool _showMasks = true;
+  bool _showRaw = true;
+  bool _showFinal = true;
 
   List<String> _savedSessions = [];
   String? _selectedSavedSession;
@@ -420,6 +426,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 _buildDownloadCard(),
                 const SizedBox(height: 16),
                 _buildSegmentsCard(),
+                const SizedBox(height: 16),
+                _buildSegmentLayersCard(),
                 const SizedBox(height: 16),
                 _buildPerformanceCard(),
                 if (_error != null) ...[
@@ -834,6 +842,17 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _buildSegmentLayersCard() {
+    return SegmentLayersCard(
+      showMasks: _showMasks,
+      showRaw: _showRaw,
+      showFinal: _showFinal,
+      onMasksToggle: (val) => setState(() => _showMasks = val),
+      onRawToggle: (val) => setState(() => _showRaw = val),
+      onFinalToggle: (val) => setState(() => _showFinal = val),
     );
   }
 
