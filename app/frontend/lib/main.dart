@@ -74,6 +74,7 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _error;
   String _backendStatus = "checking";
   String _boxMode = "positive"; // "positive" or "negative"
+  String _pointMode = "positive"; // "positive" or "negative"
 
   // Layer Visibility
   bool _showOriginal = true;
@@ -283,6 +284,28 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _sendPointPrompt(List<double> point) async {
+    if (_sessionId == null) return;
+    setState(() => _isLoading = true);
+    try {
+      final response = await _api.segmentWithPoint(_sessionId!, point, _pointMode == "positive");
+      if (!mounted) return;
+      if (response != null) {
+        setState(() {
+          _result = response['results'] as Map<String, dynamic>?;
+          _updateSegmentsFromResult();
+        });
+        _addTiming("Point ($_pointMode)", response['processing_time_ms']);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    }
+  }
+
   Future<void> _reset() async {
     if (_sessionId == null) return;
     setState(() => _isLoading = true);
@@ -478,6 +501,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(height: 16),
                 _buildBoxPromptCard(),
                 const SizedBox(height: 16),
+                _buildPointPromptCard(),
+                const SizedBox(height: 16),
                 _buildResultsCard(),
                 const SizedBox(height: 16),
                 _buildDownloadCard(),
@@ -535,6 +560,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           result: _result,
                           isLoading: _isLoading,
                           onBoxDrawn: _sendBoxPrompt,
+                          onPointDrawn: _sendPointPrompt,
                           showOriginal: _showOriginal,
                           showMasks: _showMasks,
                           showRaw: _showRaw,
@@ -791,6 +817,57 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _buildPointPromptCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.touch_app, size: 16),
+                SizedBox(width: 8),
+                Text("Point Prompts", style: TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text("Click on the image to select specific points", style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(
+                        value: "positive",
+                        label: Text("Include"),
+                        icon: Icon(Icons.add_circle_outline, size: 16),
+                      ),
+                      ButtonSegment(
+                        value: "negative",
+                        label: Text("Exclude"),
+                        icon: Icon(Icons.remove_circle_outline, size: 16),
+                      ),
+                    ],
+                    selected: {_pointMode},
+                    onSelectionChanged: (Set<String> newSelection) {
+                      setState(() => _pointMode = newSelection.first);
+                    },
+                    style: const ButtonStyle(
+                      visualDensity: VisualDensity.compact,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildResultsCard() {
     final maskCount = (_result?['masks'] as List?)?.length ?? 0;
     final boxCount = (_result?['prompted_boxes'] as List?)?.length ?? 0;
@@ -990,6 +1067,7 @@ class SegmentationCanvas extends StatefulWidget {
   final Map<String, dynamic>? result;
   final bool isLoading;
   final Function(List<double>) onBoxDrawn;
+  final Function(List<double>) onPointDrawn;
   final bool showOriginal;
   final bool showMasks;
   final bool showRaw;
@@ -1002,6 +1080,7 @@ class SegmentationCanvas extends StatefulWidget {
     this.result,
     required this.isLoading,
     required this.onBoxDrawn,
+    required this.onPointDrawn,
     required this.showOriginal,
     required this.showMasks,
     required this.showRaw,
@@ -1064,6 +1143,15 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
 
               // Gesture detector for drawing new boxes
               GestureDetector(
+                onTapUp: (details) {
+                  final local = details.localPosition;
+                  final nx = local.dx / widget.uiImage.width;
+                  final ny = local.dy / widget.uiImage.height;
+                  // Simple bounds check to ensure we clicked inside
+                  if (nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1) {
+                    widget.onPointDrawn([nx, ny]);
+                  }
+                },
                 onPanStart: (details) => setState(() {
                   _startDrag = details.localPosition;
                   _currentDrag = details.localPosition;
@@ -1116,6 +1204,21 @@ class PromptPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     if (result == null) return;
+
+    final promptedPoints = result!['prompted_points'] as List?;
+    if (promptedPoints != null) {
+      for (var pp in promptedPoints) {
+        final point = (pp['point'] as List).map((e) => (e as num).toDouble()).toList();
+        final label = pp['label'] as int; // 1 or 0
+
+        final paint = Paint()
+          ..color = (label == 1) ? Colors.green : Colors.red
+          ..style = PaintingStyle.fill;
+
+        // Draw a dot for the point
+        canvas.drawCircle(Offset(point[0], point[1]), 5.0, paint);
+      }
+    }
 
     final promptedBoxes = result!['prompted_boxes'] as List?;
     if (promptedBoxes != null) {

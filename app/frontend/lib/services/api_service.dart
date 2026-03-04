@@ -110,6 +110,28 @@ class ApiService {
     }
   }
 
+  Future<Map<String, dynamic>?> segmentWithPoint(String sessionId, List<double> point, bool label) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/segment/point'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'session_id': sessionId,
+          'point': point, // [x, y] normalized
+          'label': label,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      }
+      throw Exception('Point segmentation failed: ${response.body}');
+    } catch (e) {
+      print('Error point segment: $e');
+      rethrow;
+    }
+  }
+
   Future<Map<String, dynamic>?> resetPrompts(String sessionId) async {
     try {
       final response = await http.post(
