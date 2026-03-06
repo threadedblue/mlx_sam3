@@ -12,10 +12,9 @@ import 'layer_state.dart';
 /// [retouchedImage] is an optional image for the 'finals' layer.
 class Segment {
   final Path path;
-  final Color color;
   final ui.Image? retouchedImage;
 
-  Segment({required this.path, required this.color, this.retouchedImage});
+  Segment({required this.path, this.retouchedImage});
 }
 
 /// A widget that displays an image and its segmentations in four distinct,
@@ -116,11 +115,37 @@ class MasksPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    const singleColor = Colors.blue;
+
+    final fillPaint = Paint()
+      ..color = singleColor.withOpacity(0.2)
+      ..style = PaintingStyle.fill;
+
+    final stripePaint = Paint()
+      ..color = singleColor.withOpacity(0.5)
+      ..strokeWidth = 2.0
+      ..style = PaintingStyle.stroke;
+
     for (final segment in segments) {
-      final paint = Paint()
-        ..color = segment.color.withOpacity(0.5)
-        ..style = PaintingStyle.fill;
-      canvas.drawPath(segment.path, paint);
+      // First, draw a light, uniform fill.
+      canvas.drawPath(segment.path, fillPaint);
+
+      // Then, clip to the path and draw a stripe pattern on top.
+      // This makes the masks distinguishable from a solid color overlay.
+      canvas.save();
+      canvas.clipPath(segment.path);
+
+      // Draw diagonal stripes across the whole canvas; they will be clipped.
+      // The pattern will be consistent across all segments.
+      for (double i = -size.height; i < size.width; i += 8) {
+        canvas.drawLine(
+          Offset(i, 0),
+          Offset(i + size.height, size.height),
+          stripePaint,
+        );
+      }
+
+      canvas.restore();
     }
   }
 

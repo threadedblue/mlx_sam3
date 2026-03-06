@@ -161,35 +161,75 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _updateSegmentsFromResult() {
+    // This method is called inside setState(), so we update _segments directly.
+    debugPrint('Updating segments from result...');
     if (_result == null) {
-      if (mounted) setState(() => _segments = []);
+      _segments = [];
       return;
     }
 
     final List<Segment> newSegments = [];
-    // The API result may contain 'masks' or 'boxes'. We check for both.
-    final masks = _result!['masks'] as List? ?? _result!['boxes'] as List?;
 
-    if (masks != null) {
-      final colors = [
-        Colors.red, Colors.blue, Colors.green, Colors.yellow, 
-        Colors.purple, Colors.orange, Colors.cyan, Colors.pink
-      ];
-      int colorIndex = 0;
-      for (var maskData in masks) {
-        if (maskData is List && maskData.length == 4) {
-          final list = maskData.map((e) => (e as num).toDouble()).toList();
-          final rect = Rect.fromLTRB(list[0], list[1], list[2], list[3]);
-          final path = Path()..addRect(rect);
-          newSegments.add(Segment(
-            path: path,
-            color: colors[colorIndex % colors.length],
-          ));
-          colorIndex++;
+    try {
+      // 1. Try to load Masks (RLE)
+      final masks = _result!['masks'] as List?;
+      if (masks != null && masks.isNotEmpty && masks[0] is Map) {
+        for (var maskData in masks) {
+          try {
+            final rle = maskData as Map;
+            final counts = (rle['counts'] as List).cast<int>();
+            final size = (rle['size'] as List).cast<int>(); // [H, W]
+            final w = size[1];
+            
+            final path = Path();
+            int p = 0;
+            bool isForeground = false; // First run is always background (0) per backend logic
+
+            for (final count in counts) {
+              if (isForeground) {
+                // Add rects for this run of 1s
+                int start = p;
+                int end = p + count;
+                int curr = start;
+                while (curr < end) {
+                  int y = curr ~/ w;
+                  int x = curr % w;
+                  int endOfRow = (y + 1) * w;
+                  int runEnd = (end < endOfRow) ? end : endOfRow;
+                  int len = runEnd - curr;
+                  path.addRect(Rect.fromLTWH(x.toDouble(), y.toDouble(), len.toDouble(), 1.0));
+                  curr = runEnd;
+                }
+              }
+              p += count;
+              isForeground = !isForeground;
+            }
+            newSegments.add(Segment(path: path));
+          } catch (e, st) {
+            debugPrint('Error parsing RLE mask: $e\n$st');
+          }
+        }
+      } 
+      // 2. Fallback to Boxes if no RLE masks found
+      else {
+        final boxes = _result!['boxes'] as List? ?? _result!['masks'] as List?;
+        if (boxes != null) {
+          for (var maskData in boxes) {
+            if (maskData is List && maskData.length == 4) {
+              final list = maskData.map((e) => (e as num).toDouble()).toList();
+              final rect = Rect.fromLTRB(list[0], list[1], list[2], list[3]);
+              final path = Path()..addRect(rect);
+              newSegments.add(Segment(path: path));
+            }
+          }
         }
       }
+    } catch (e, st) {
+      debugPrint('Error updating segments from result: $e\n$st');
     }
-    if (mounted) setState(() => _segments = newSegments);
+    
+    _segments = newSegments;
+    debugPrint('Finished updating segments. Found ${newSegments.length} segments.');
   }
 
   Future<void> _pickImage() async {

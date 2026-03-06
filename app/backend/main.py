@@ -160,7 +160,7 @@ async def segment_with_text(request: TextPromptRequest):
         raise HTTPException(status_code=503, detail="Model not loaded yet")
     
     session = service.get_session(request.session_id)
-    print("session:id==", session.get(id))
+    print(f"session:id=={request.session_id}")
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -423,24 +423,23 @@ async def load_session(session_id: str):
         # A general catch-all for other potential file or system errors.
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-# DUPLICATE OF loadSessions
-# @app.post("/updateState", response_model=Dict[str, Any])
-# async def update_state(request: SessionRequest):
-#     """
-#     Loads the complete state for a given session_id.
+@app.post("/updateState", response_model=Dict[str, Any])
+async def update_state(request: SessionRequest):
+    """
+    Loads the complete state for a given session_id.
 
-#     This endpoint reads the session's state.json file, finds the original image,
-#     encodes it to base64, and returns it along with other session metadata like
-#     image dimensions and prompt results. This allows the frontend to fully
-#     reconstruct and display a previously saved session.
-#     """
-#     try:
-#         return service.load_session_from_disk(request.session_id)
-#     except FileNotFoundError as e:
-#         raise HTTPException(status_code=404, detail=str(e))
-#     except Exception as e:
-#         # A general catch-all for other potential file or system errors.
-#         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+    This endpoint reads the session's state.json file, finds the original image,
+    encodes it to base64, and returns it along with other session metadata like
+    image dimensions and prompt results. This allows the frontend to fully
+    reconstruct and display a previously saved session.
+    """
+    try:
+        return service.load_session_from_disk(request.session_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        # A general catch-all for other potential file or system errors.
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 app.mount(
     "/web",
