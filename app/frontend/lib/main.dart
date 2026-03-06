@@ -10,6 +10,7 @@
 // If your current ApiService only accepts File, update it to accept bytes, or create an overload.
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -19,7 +20,9 @@ import 'package:file_picker/file_picker.dart';
 
 import 'services/api_service.dart';
 import 'segment_layers_card.dart';
+import 'package:provider/provider.dart';
 import 'layered_segmentation_canvas.dart';
+import 'layer_state.dart';
 
 void main() {
   runApp(const SamApp());
@@ -30,31 +33,37 @@ class SamApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'SAM3 Studio',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.indigo,
-          brightness: Brightness.light,
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (context) => LayerState()),
+      ],
+      child: MaterialApp(
+        title: 'SAM3 Studio',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: Colors.indigo,
+            brightness: Brightness.light,
+          ),
+          useMaterial3: true,
+          cardTheme: const CardThemeData(
+            elevation: 2,
+            margin: EdgeInsets.zero,
+          ),
         ),
-        useMaterial3: true,
-        cardTheme: const CardThemeData(
-          elevation: 2,
-          margin: EdgeInsets.zero,
-        ),
+        home: const HomeScreen(),
       ),
-      home: const HomeScreen(),
     );
   }
 }
+
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
-}
+} 
 
 class _HomeScreenState extends State<HomeScreen> {
   final ApiService _api = ApiService();
@@ -73,16 +82,10 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isLoading = false;
   String? _error;
   String _backendStatus = "checking";
-  String _boxMode = "positive"; // "positive" or "negative"
+    String _boxMode = "positive"; // "positive" or "negative"
   String _pointMode = "positive"; // "positive" or "negative"
 
-  // Layer Visibility
-  bool _showOriginal = true;
-  bool _showMasks = true;
-  bool _showRaw = true;
-  bool _showFinal = true;
-
-  List<String> _savedSessions = [];
+    List<String> _savedSessions = [];
   String? _selectedSavedSession;
 
   // Timing
@@ -465,6 +468,50 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _handleSessionChange(String? newSessionId) async {
+    if (newSessionId == null || newSessionId == _sessionId) return;
+
+    setState(() {
+      _isLoading = true;
+      _error = null;
+      _selectedSavedSession = newSessionId; // Update dropdown selection immediately
+    });
+
+    try {
+      final sessionData = await _api.updateState(newSessionId);
+      if (!mounted) return;
+
+      // Assumes backend returns image as base64 string.
+      final imageB64 = sessionData['image_b64'] as String?;
+      if (imageB64 == null) {
+        throw Exception("Backend response did not include 'image_b64'.");
+      }
+
+      final imageBytes = base64Decode(imageB64);
+      final decodedImage = await _decodeImage(imageBytes);
+
+      setState(() {
+        _sessionId = newSessionId;
+        _imageBytes = imageBytes;
+        _uiImage = decodedImage;
+        _imageSize = Size(
+          (sessionData['width'] as num).toDouble(),
+          (sessionData['height'] as num).toDouble(),
+        );
+        _result = sessionData['results'] as Map<String, dynamic>?;
+        _segments = [];
+        _updateSegmentsFromResult();
+        _textController.clear();
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = "Failed to load session: $e");
+    } finally {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     // If you later want a responsive layout, you can use isWide.
@@ -561,10 +608,6 @@ class _HomeScreenState extends State<HomeScreen> {
                           isLoading: _isLoading,
                           onBoxDrawn: _sendBoxPrompt,
                           onPointDrawn: _sendPointPrompt,
-                          showOriginal: _showOriginal,
-                          showMasks: _showMasks,
-                          showRaw: _showRaw,
-                          showFinals: _showFinal,
                         ),
             ),
           ),
@@ -638,9 +681,7 @@ class _HomeScreenState extends State<HomeScreen> {
               items: _savedSessions.map((s) {
                 return DropdownMenuItem(value: s, child: Text(s, overflow: TextOverflow.ellipsis));
               }).toList(),
-              onChanged: (val) {
-                setState(() => _selectedSavedSession = val);
-              },
+              onChanged: _isLoading ? null : _handleSessionChange,
             ),
             const SizedBox(height: 12),
             Row(
@@ -984,16 +1025,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildSegmentLayersCard() {
-    return SegmentLayersCard(
-      showOriginal: _showOriginal,
-      showMasks: _showMasks,
-      showRaw: _showRaw,
-      showFinal: _showFinal,
-      onOriginalToggle: (val) => setState(() => _showOriginal = val),
-      onMasksToggle: (val) => setState(() => _showMasks = val),
-      onRawToggle: (val) => setState(() => _showRaw = val),
-      onFinalToggle: (val) => setState(() => _showFinal = val),
-    );
+    // This widget now manages its own state via a Consumer<LayerState>
+    return const SegmentLayersCard();
   }
 
   Widget _buildResultRow(String label, String value) {
@@ -1068,10 +1101,6 @@ class SegmentationCanvas extends StatefulWidget {
   final bool isLoading;
   final Function(List<double>) onBoxDrawn;
   final Function(List<double>) onPointDrawn;
-  final bool showOriginal;
-  final bool showMasks;
-  final bool showRaw;
-  final bool showFinals;
 
   const SegmentationCanvas({
     super.key,
@@ -1081,10 +1110,6 @@ class SegmentationCanvas extends StatefulWidget {
     required this.isLoading,
     required this.onBoxDrawn,
     required this.onPointDrawn,
-    required this.showOriginal,
-    required this.showMasks,
-    required this.showRaw,
-    required this.showFinals,
   });
 
   @override
@@ -1103,10 +1128,6 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
         LayeredSegmentationCanvas(
           originalImage: widget.uiImage,
           segments: widget.segments,
-          showOriginal: widget.showOriginal,
-          showMasks: widget.showMasks,
-          showRaw: widget.showRaw,
-          showFinals: widget.showFinals,
         ),
 
         // The interaction and prompt overlay

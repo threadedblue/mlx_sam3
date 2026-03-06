@@ -224,6 +224,24 @@ class ApiService {
     }
   }
 
+  Future<Map<String, dynamic>> updateState(String sessionId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/updateState'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId}),
+      );
+
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      }
+      throw Exception('Failed to load session state: ${response.body}');
+    } catch (e) {
+      print('Error loading session state: $e');
+      rethrow;
+    }
+  }
+
   Future<Map<String, dynamic>?> createSegments(String sessionId) async {
     try {
       final response = await http.post(

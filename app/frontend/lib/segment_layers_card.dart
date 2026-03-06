@@ -1,33 +1,16 @@
 import 'package:flutter/material.dart';
+import 'layer_state.dart';
+import 'package:provider/provider.dart';
 
 class SegmentLayersCard extends StatelessWidget {
-  final bool showOriginal;
-  final bool showMasks;
-  final bool showRaw;
-  final bool showFinal;
-  final ValueChanged<bool> onOriginalToggle;
-  final ValueChanged<bool> onMasksToggle;
-  final ValueChanged<bool> onRawToggle;
-  final ValueChanged<bool> onFinalToggle;
-
-  const SegmentLayersCard({
-    super.key,
-    required this.showOriginal,
-    required this.showMasks,
-    required this.showRaw,
-    required this.showFinal,
-    required this.onOriginalToggle,
-    required this.onMasksToggle,
-    required this.onRawToggle,
-    required this.onFinalToggle,
-  });
+  const SegmentLayersCard({super.key});
 
   Widget _buildLayerCheckbox(
       String label, bool value, ValueChanged<bool> onChanged) {
     return CheckboxListTile(
       title: Text(label),
       value: value,
-      onChanged: (v) => onChanged(v ?? false),
+      onChanged: (newValue) => onChanged(newValue ?? false),
       controlAffinity: ListTileControlAffinity.leading,
       contentPadding: EdgeInsets.zero,
       dense: true,
@@ -44,10 +27,17 @@ class SegmentLayersCard extends StatelessWidget {
           style: Theme.of(context).textTheme.titleMedium,
         ),
         const SizedBox(height: 8),
-        _buildLayerCheckbox('Original', showOriginal, onOriginalToggle),
-        _buildLayerCheckbox('Masks', showMasks, onMasksToggle),
-        _buildLayerCheckbox('Raw', showRaw, onRawToggle),
-        _buildLayerCheckbox('Final', showFinal, onFinalToggle),
+        Consumer<LayerState>(builder: (context, layerState, child) {
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildLayerCheckbox('Original', layerState.showOriginal, layerState.setOriginal),
+              _buildLayerCheckbox('Masks', layerState.showMasks, layerState.setMasks),
+              _buildLayerCheckbox('Raw', layerState.showRaw, layerState.setRaw),
+              _buildLayerCheckbox('Final', layerState.showFinal, layerState.setFinal),
+            ],
+          );
+        }),
       ],
     );
   }

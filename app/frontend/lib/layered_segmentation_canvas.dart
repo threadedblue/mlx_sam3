@@ -4,6 +4,8 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import 'package:provider/provider.dart';
+import 'layer_state.dart';
 /// A data class to hold information about a single segmented area.
 /// [path] defines the shape of the segment.
 /// [color] is used for the mask layer.
@@ -25,19 +27,11 @@ class Segment {
 class LayeredSegmentationCanvas extends StatelessWidget {
   final ui.Image originalImage;
   final List<Segment> segments;
-  final bool showOriginal;
-  final bool showMasks;
-  final bool showRaw;
-  final bool showFinals;
 
   const LayeredSegmentationCanvas({
     super.key,
     required this.originalImage,
     required this.segments,
-    required this.showOriginal,
-    required this.showMasks,
-    required this.showRaw,
-    required this.showFinals,
   });
 
   @override
@@ -49,45 +43,47 @@ class LayeredSegmentationCanvas extends StatelessWidget {
       child: SizedBox(
         width: originalImage.width.toDouble(),
         height: originalImage.height.toDouble(),
-        child: Stack(
-          children: [
-            // Layer 1: Original Image
-            Visibility(
-              visible: showOriginal,
-              child: CustomPaint(
-                painter: OriginalImagePainter(image: originalImage),
-                size: Size.infinite, // Expands to the Stack's constraints
-              ),
-            ),
-            // Layer 2: Segmentation Masks
-            Visibility(
-              visible: showMasks,
-              child: CustomPaint(
-                painter: MasksPainter(segments: segments),
-                size: Size.infinite,
-              ),
-            ),
-            // Layer 3: Raw Cutouts from Original
-            Visibility(
-              visible: showRaw,
-              child: CustomPaint(
-                painter: RawCutoutsPainter(
-                  originalImage: originalImage,
-                  segments: segments,
+        child: Consumer<LayerState>(builder: (context, layerState, _) {
+          return Stack(
+            children: [
+              // Layer 1: Original Image
+              Visibility(
+                visible: layerState.showOriginal,
+                child: CustomPaint(
+                  painter: OriginalImagePainter(image: originalImage),
+                  size: Size.infinite, // Expands to the Stack's constraints
                 ),
-                size: Size.infinite,
               ),
-            ),
-            // Layer 4: Final Retouched Images
-            Visibility(
-              visible: showFinals,
-              child: CustomPaint(
-                painter: FinalsPainter(segments: segments),
-                size: Size.infinite,
+              // Layer 2: Segmentation Masks
+              Visibility(
+                visible: layerState.showMasks,
+                child: CustomPaint(
+                  painter: MasksPainter(segments: segments),
+                  size: Size.infinite,
+                ),
               ),
-            ),
-          ],
-        ),
+              // Layer 3: Raw Cutouts from Original
+              Visibility(
+                visible: layerState.showRaw,
+                child: CustomPaint(
+                  painter: RawCutoutsPainter(
+                    originalImage: originalImage,
+                    segments: segments,
+                  ),
+                  size: Size.infinite,
+                ),
+              ),
+              // Layer 4: Final Retouched Images
+              Visibility(
+                visible: layerState.showFinal,
+                child: CustomPaint(
+                  painter: FinalsPainter(segments: segments),
+                  size: Size.infinite,
+                ),
+              ),
+            ],
+          );
+        }),
       ),
     );
   }
@@ -98,7 +94,7 @@ class LayeredSegmentationCanvas extends StatelessWidget {
 /// Layer 1: Draws the original image.
 class OriginalImagePainter extends CustomPainter {
   final ui.Image image;
-
+  
   OriginalImagePainter({required this.image});
 
   @override
@@ -134,6 +130,7 @@ class MasksPainter extends CustomPainter {
     return !listEquals(segments, oldDelegate.segments);
   }
 }
+
 
 /// Layer 3: Draws the parts of the original image that correspond to the masks.
 class RawCutoutsPainter extends CustomPainter {

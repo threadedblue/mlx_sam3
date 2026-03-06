@@ -7,6 +7,9 @@ import io
 import os
 import sys
 import json
+import shutil
+import base64
+from typing import Dict, Any
 from datetime import datetime
 import time
 import uuid
@@ -18,7 +21,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
 
@@ -29,7 +32,7 @@ import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
-from services import SegmentationService
+from services import SegmentationService, serialize_state
 
 # Global model and processor
 model = None
@@ -100,80 +103,6 @@ class SessionRequest(BaseModel):
     session_id: str
 
 
-def mask_to_rle(mask: np.ndarray) -> dict:
-    """
-    Encode a binary mask to RLE (Run-Length Encoding) format.
-    
-    Args:
-        mask: 2D binary numpy array (H, W) with values 0 or 1
-        
-    Returns:
-        dict with 'counts' (list of run lengths) and 'size' [H, W]
-    """
-    # Flatten the mask in row-major (C) order
-    flat = mask.flatten()
-    
-    # Find where values change
-    diff = np.diff(flat)
-    change_indices = np.where(diff != 0)[0] + 1
-    
-    # Build run lengths
-    run_starts = np.concatenate([[0], change_indices])
-    run_ends = np.concatenate([change_indices, [len(flat)]])
-    run_lengths = (run_ends - run_starts).tolist()
-    
-    # If mask starts with 1, prepend a 0-length run for background
-    if flat[0] == 1:
-        run_lengths = [0] + run_lengths
-    
-    return {
-        "counts": run_lengths,
-        "size": list(mask.shape)  # [H, W]
-    }
-
-
-def serialize_state(state: dict) -> dict:
-    """Convert state arrays to JSON-serializable format."""
-    result = {
-        "original_width": state.get("original_width"),
-        "original_height": state.get("original_height"),
-    }
-    
-    if "masks" in state:
-        masks = state["masks"]
-        boxes = state["boxes"]
-        scores = state["scores"]
-        
-        masks_list = []
-        boxes_list = []
-        scores_list = []
-        
-        for i in range(len(scores)):
-            mask_np = np.array(masks[i])
-            box_np = np.array(boxes[i])
-            score_np = float(np.array(scores[i]))
-            
-            # Convert mask to binary and get the 2D mask (handle [1, H, W] shape)
-            mask_binary = (mask_np > 0.5).astype(np.uint8)
-            if mask_binary.ndim == 3:
-                mask_binary = mask_binary[0]  # Take first channel
-            
-            # Encode as RLE
-            rle = mask_to_rle(mask_binary)
-            masks_list.append(rle)
-            boxes_list.append(box_np.tolist())
-            scores_list.append(score_np)
-        
-        result["masks"] = masks_list
-        result["boxes"] = boxes_list
-        result["scores"] = scores_list
-    
-    if "prompted_boxes" in state:
-        result["prompted_boxes"] = state["prompted_boxes"]
-    
-    return result
-
-
 @app.get("/health")
 async def health():
     return {"status": "healthy", "model_loaded": model is not None}
@@ -231,6 +160,7 @@ async def segment_with_text(request: TextPromptRequest):
         raise HTTPException(status_code=503, detail="Model not loaded yet")
     
     session = service.get_session(request.session_id)
+    print("session==", session)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -240,6 +170,7 @@ async def segment_with_text(request: TextPromptRequest):
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session.setdefault("prompts", []).append(request.prompt)
         session["state"] = state
+        service.save_app_state_to_disk(request.session_id)
         start = time.perf_counter()
         results = serialize_state(state)
         end = time.perf_counter()
@@ -298,6 +229,7 @@ async def add_box_prompt(request: BoxPromptRequest):
         state = processor.add_geometric_prompt(request.box, request.label, state)
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
+        service.save_app_state_to_disk(request.session_id)
         
         return {
             "session_id": request.session_id,
@@ -332,6 +264,8 @@ async def reset_prompts(request: SessionRequest):
             del state["prompted_boxes"]
         if "prompts" in session:
             session["prompts"] = []
+        
+        service.save_app_state_to_disk(request.session_id)
         
         return {
             "session_id": request.session_id,
@@ -428,47 +362,21 @@ async def delete_saved_session(session_id: str):
 @app.post("/createSegments")
 async def create_segments(request: SessionRequest):
     """Creates segmented image files from the current masks."""
-    session = sessions.get(request.session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    if "original_image_bytes" not in session or "state" not in session or "masks" not in session["state"]:
-        raise HTTPException(status_code=400, detail="Image or masks not available in session. Please generate masks first.")
-
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
     try:
-        start_time = time.perf_counter()
-        
-        original_image = Image.open(io.BytesIO(session["original_image_bytes"])).convert("RGBA")
-        masks = session["state"]["masks"]
-        
-        session_dir = STORAGE_DIR / request.session_id
-        segments_dir = session_dir / "segments"
-        segments_dir.mkdir(parents=True, exist_ok=True)
-
-        # Clear old segments
-        for f in segments_dir.glob('*.png'):
-            f.unlink()
-
-        for i, mask_mx in enumerate(masks):
-            mask_np = np.array(mask_mx)
-            mask_binary = (mask_np > 0.5).astype(np.uint8)
-            if mask_binary.ndim == 3:
-                mask_binary = mask_binary[0]
-            
-            mask_image = Image.fromarray(mask_binary * 255, 'L')
-
-            segment_image = Image.new("RGBA", original_image.size, (0, 0, 0, 0))
-            segment_image.paste(original_image, (0, 0), mask_image)
-            
-            segment_image.save(segments_dir / f"segment_{i:03d}.png")
-
-        processing_time_ms = (time.perf_counter() - start_time) * 1000
+        result = service.create_segments(request.session_id)
         return {
-            "message": f"{len(masks)} segments created in {segments_dir}",
-            "segment_count": len(masks),
-            "processing_time_ms": round(processing_time_ms, 2),
+            "message": f"{result['count']} segments created in {result['path']}",
+            "segment_count": result['count'],
+            "processing_time_ms": round(result['processing_time_ms'], 2),
         }
-
+    except ValueError as e:
+        # This will catch "Session not found" or "Image or masks not available"
+        if "not found" in str(e):
+            raise HTTPException(status_code=404, detail=str(e))
+        else:
+            raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating segments: {str(e)}")
 
@@ -485,6 +393,62 @@ async def show_segments(session_id: str):
     urls = [f"{base_path}/{f.name}" for f in segment_files]
     return urls
 
+@app.post("/updateState", response_model=Dict[str, Any])
+async def update_state(request: SessionRequest):
+    """
+    Loads the complete state for a given session_id.
+
+    This endpoint reads the session's state.json file, finds the original image,
+    encodes it to base64, and returns it along with other session metadata like
+    image dimensions and prompt results. This allows the frontend to fully
+    reconstruct and display a previously saved session.
+    """
+    session_id = request.session_id
+    print("session_id", session_id)
+    session_dir = STORAGE_DIR / session_id
+    state_file = session_dir / "session.json"
+
+    if not state_file.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session state file not found for session_id: {session_id}"
+        )
+
+    try:
+        # 1. Read the state file to get metadata.
+        with open(state_file, 'r') as f:
+            state_data = json.load(f)
+
+        image_path_str = state_data.get("image_path")
+        if not image_path_str:
+            raise HTTPException(status_code=500, detail="Image path not found in state file.")
+
+        # Ensure the path is valid and points to a file.
+        image_path = Path(image_path_str)
+        if not image_path.is_file():
+            raise HTTPException(status_code=404, detail=f"Image file not found at path: {image_path}")
+
+        # 2. Read the image file as bytes and encode it to a base64 string.
+        with open(image_path, "rb") as image_file:
+            image_bytes = image_file.read()
+            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        # 3. Construct the response payload exactly as the frontend expects it.
+        response_data = {
+            "image_b64": image_b64,
+            "width": state_data.get("width"),
+            "height": state_data.get("height"),
+            "results": state_data.get("results", {}),
+            "session_id": session_id,
+        }
+
+        return JSONResponse(content=response_data)
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail=f"Failed to parse state.json for session {session_id}.")
+    except Exception as e:
+        # A general catch-all for other potential file or system errors.
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 app.mount(
     "/web",
