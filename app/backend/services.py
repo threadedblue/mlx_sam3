@@ -1,6 +1,7 @@
 import io
 import json
 import shutil
+import base64
 import time
 import uuid
 from datetime import datetime
@@ -84,6 +85,9 @@ def serialize_state(state: dict) -> dict:
 
 
 class SegmentationService:
+    SESSION_STATE_FILENAME = "session.json"
+    ORIGINAL_IMAGE_FILENAME = "original.png"
+
     def __init__(self, storage_dir: Path):
         self.storage_dir = storage_dir
         # In-memory session storage
@@ -128,7 +132,7 @@ class SegmentationService:
         session_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Save original image if it exists
-        image_path = session_dir / "image.png"
+        image_path = session_dir / self.ORIGINAL_IMAGE_FILENAME
         if "original_image_bytes" in session:
             image_path.write_bytes(session["original_image_bytes"])
 
@@ -148,7 +152,41 @@ class SegmentationService:
         }
 
         # 3. Write to state.json, which is read by the /updateState endpoint
-        (session_dir / "state.json").write_text(json.dumps(state_data, indent=2))
+        (session_dir / self.SESSION_STATE_FILENAME).write_text(json.dumps(state_data, indent=2))
+
+    def load_session_from_disk(self, session_id: str) -> Dict[str, Any]:
+        """Load session state and image from disk."""
+        session_dir = self.storage_dir / session_id
+        state_file = session_dir / self.SESSION_STATE_FILENAME
+
+        print("state_file==",state_file)
+
+        if not state_file.exists():
+            raise FileNotFoundError(f"State file not found for session {session_id}")
+
+        state_data = json.loads(state_file.read_text())
+
+        image_path_str = state_data.get("image_path")
+        if image_path_str:
+            image_path = Path(image_path_str)
+        else:
+            image_path = session_dir / self.ORIGINAL_IMAGE_FILENAME
+
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+
+        image_bytes = image_path.read_bytes()
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        return {
+            "session_id": session_id,
+            "image_b64": image_b64,
+            "width": state_data.get("width"),
+            "height": state_data.get("height"),
+            "results": state_data.get("results", {}),
+            "prompts": state_data.get("prompts", []),
+            "created_at": state_data.get("created_at"),
+        }
 
     def delete_session_memory(self, session_id: str) -> bool:
         """Remove session from memory."""
@@ -194,7 +232,7 @@ class SegmentationService:
 
         # 1. Save original image
         if "original_image_bytes" in session:
-            (session_dir / "original.png").write_bytes(session["original_image_bytes"])
+            (session_dir / self.ORIGINAL_IMAGE_FILENAME).write_bytes(session["original_image_bytes"])
 
         # 2. Save masks
         mask_count = 0
@@ -218,7 +256,7 @@ class SegmentationService:
             "prompts": session.get("prompts", []),
             "mask_count": mask_count
         }
-        (session_dir / "session.json").write_text(json.dumps(session_data, indent=2))
+        (session_dir / self.SESSION_STATE_FILENAME).write_text(json.dumps(session_data, indent=2))
 
         return {
             "path": str(session_dir),

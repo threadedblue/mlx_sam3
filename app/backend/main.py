@@ -393,6 +393,25 @@ async def show_segments(session_id: str):
     urls = [f"{base_path}/{f.name}" for f in segment_files]
     return urls
 
+@app.get("/loadSession/{session_id}", response_model=Dict[str, Any])
+async def load_session(session_id: str):
+    """
+    Loads the complete state for a given session_id from disk.
+
+    This endpoint reads the session's state.json file, finds the original image,
+    encodes it to base64, and returns it along with other session metadata like
+    image dimensions and prompt results. This allows the frontend to fully
+    reconstruct and display a previously saved session.
+    """
+    try:
+        return service.load_session_from_disk(session_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        # A general catch-all for other potential file or system errors.
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+
 @app.post("/updateState", response_model=Dict[str, Any])
 async def update_state(request: SessionRequest):
     """
@@ -403,49 +422,10 @@ async def update_state(request: SessionRequest):
     image dimensions and prompt results. This allows the frontend to fully
     reconstruct and display a previously saved session.
     """
-    session_id = request.session_id
-    print("session_id", session_id)
-    session_dir = STORAGE_DIR / session_id
-    state_file = session_dir / "session.json"
-
-    if not state_file.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Session state file not found for session_id: {session_id}"
-        )
-
     try:
-        # 1. Read the state file to get metadata.
-        with open(state_file, 'r') as f:
-            state_data = json.load(f)
-
-        image_path_str = state_data.get("image_path")
-        if not image_path_str:
-            raise HTTPException(status_code=500, detail="Image path not found in state file.")
-
-        # Ensure the path is valid and points to a file.
-        image_path = Path(image_path_str)
-        if not image_path.is_file():
-            raise HTTPException(status_code=404, detail=f"Image file not found at path: {image_path}")
-
-        # 2. Read the image file as bytes and encode it to a base64 string.
-        with open(image_path, "rb") as image_file:
-            image_bytes = image_file.read()
-            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-        # 3. Construct the response payload exactly as the frontend expects it.
-        response_data = {
-            "image_b64": image_b64,
-            "width": state_data.get("width"),
-            "height": state_data.get("height"),
-            "results": state_data.get("results", {}),
-            "session_id": session_id,
-        }
-
-        return JSONResponse(content=response_data)
-
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail=f"Failed to parse state.json for session {session_id}.")
+        return service.load_session_from_disk(request.session_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         # A general catch-all for other potential file or system errors.
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
