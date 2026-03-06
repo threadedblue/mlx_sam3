@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     
     # Initialize Service Layer
     global service
-    service = SegmentationService(STORAGE_DIR)
+    service = SegmentationService(STORAGE_DIR, processor)
     
     yield
     
@@ -160,7 +160,7 @@ async def segment_with_text(request: TextPromptRequest):
         raise HTTPException(status_code=503, detail="Model not loaded yet")
     
     session = service.get_session(request.session_id)
-    print("session==", session)
+    print("session:id==", session.get(id))
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -170,7 +170,7 @@ async def segment_with_text(request: TextPromptRequest):
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session.setdefault("prompts", []).append(request.prompt)
         session["state"] = state
-        service.save_app_state_to_disk(request.session_id)
+        service.save_session_to_disk(request.session_id)
         start = time.perf_counter()
         results = serialize_state(state)
         end = time.perf_counter()
@@ -229,7 +229,7 @@ async def add_box_prompt(request: BoxPromptRequest):
         state = processor.add_geometric_prompt(request.box, request.label, state)
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
-        service.save_app_state_to_disk(request.session_id)
+        service.save_session_to_disk(request.session_id)
         
         return {
             "session_id": request.session_id,
@@ -265,7 +265,7 @@ async def reset_prompts(request: SessionRequest):
         if "prompts" in session:
             session["prompts"] = []
         
-        service.save_app_state_to_disk(request.session_id)
+        service.save_session_to_disk(request.session_id)
         
         return {
             "session_id": request.session_id,
@@ -277,6 +277,18 @@ async def reset_prompts(request: SessionRequest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error resetting prompts: {str(e)}")
+
+@app.post("/saveSession")
+async def save_session(request: SessionRequest):
+    """Manually save the current session state to disk."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+    
+    try:
+        service.save_session_to_disk(request.session_id)
+        return {"message": "Session saved", "session_id": request.session_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/saveMasks")
@@ -411,24 +423,24 @@ async def load_session(session_id: str):
         # A general catch-all for other potential file or system errors.
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
+# DUPLICATE OF loadSessions
+# @app.post("/updateState", response_model=Dict[str, Any])
+# async def update_state(request: SessionRequest):
+#     """
+#     Loads the complete state for a given session_id.
 
-@app.post("/updateState", response_model=Dict[str, Any])
-async def update_state(request: SessionRequest):
-    """
-    Loads the complete state for a given session_id.
-
-    This endpoint reads the session's state.json file, finds the original image,
-    encodes it to base64, and returns it along with other session metadata like
-    image dimensions and prompt results. This allows the frontend to fully
-    reconstruct and display a previously saved session.
-    """
-    try:
-        return service.load_session_from_disk(request.session_id)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        # A general catch-all for other potential file or system errors.
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+#     This endpoint reads the session's state.json file, finds the original image,
+#     encodes it to base64, and returns it along with other session metadata like
+#     image dimensions and prompt results. This allows the frontend to fully
+#     reconstruct and display a previously saved session.
+#     """
+#     try:
+#         return service.load_session_from_disk(request.session_id)
+#     except FileNotFoundError as e:
+#         raise HTTPException(status_code=404, detail=str(e))
+#     except Exception as e:
+#         # A general catch-all for other potential file or system errors.
+#         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 app.mount(
     "/web",

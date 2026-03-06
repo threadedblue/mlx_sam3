@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional
 
 import numpy as np
 from PIL import Image
+from sam3.model.sam3_image_processor import Sam3Processor
 
 
 def mask_to_rle(mask: np.ndarray) -> dict:
@@ -88,14 +89,73 @@ class SegmentationService:
     SESSION_STATE_FILENAME = "session.json"
     ORIGINAL_IMAGE_FILENAME = "original.png"
 
-    def __init__(self, storage_dir: Path):
+    def __init__(self, storage_dir: Path, processor: Sam3Processor):
         self.storage_dir = storage_dir
+        self.processor = processor
         # In-memory session storage
         self.sessions: Dict[str, Dict[str, Any]] = {}
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve a session from memory."""
-        return self.sessions.get(session_id)
+        """
+        Retrieve a session from memory.
+        If not in memory, it attempts to load it from disk.
+        """
+        session = self.sessions.get(session_id)
+        if session:
+            return session
+
+        # Session not in memory, try to load from disk
+        print(f"Session {session_id} not in memory, attempting to load from disk.")
+        return self._load_session_into_memory(session_id)
+
+    def _load_session_into_memory(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Reads a session from disk, reconstructs its MLX state,
+        and loads it into the in-memory session cache.
+        """
+        session_dir = self.storage_dir / session_id
+        state_file = session_dir / self.SESSION_STATE_FILENAME
+        image_file = session_dir / self.ORIGINAL_IMAGE_FILENAME
+
+        if not (session_dir.is_dir() and state_file.exists() and image_file.exists()):
+            return None
+
+        try:
+            # 1. Load metadata and image bytes
+            state_data = json.loads(state_file.read_text())
+            image_bytes = image_file.read_bytes()
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+            # 2. Re-initialize model state with the image
+            state = self.processor.set_image(image)
+
+            # 3. Re-apply prompts to reconstruct the full state
+            prompts = state_data.get("prompts", [])
+            for p in prompts:
+                if isinstance(p, str):  # Text prompt
+                    state = self.processor.set_text_prompt(p, state)
+                elif isinstance(p, dict) and p.get("type") in ["box", "point"]:
+                    prompt_geom = p.get("box") or p.get("point")
+                    is_positive = p.get("label") == "positive"
+                    if prompt_geom:
+                        state = self.processor.add_geometric_prompt(prompt_geom, is_positive, state)
+
+            # 4. Construct the session object and store it in memory
+            session_data = {
+                "state": state,
+                "original_image_bytes": image_bytes,
+                "original_filename": state_data.get("original_filename"),
+                "image_size": (state_data.get("width"), state_data.get("height")),
+                "created_at": state_data.get("created_at"),
+                "prompts": prompts,
+            }
+            self.sessions[session_id] = session_data
+            print(f"Successfully loaded session {session_id} from disk into memory.")
+            return session_data
+        except Exception as e:
+            # Using print for visibility in logs, but proper logging is better
+            print(f"Error loading session {session_id} into memory: {e}")
+            return None
 
     def create_session(self) -> str:
         """Create a new session ID and initialize storage directories."""
@@ -116,12 +176,12 @@ class SegmentationService:
             self.sessions[session_id] = {}
         self.sessions[session_id].update(data)
         try:
-            self.save_app_state_to_disk(session_id)
+            self.save_session_to_disk(session_id)
         except Exception as e:
             # Log this error, but don't fail the request
             print(f"Warning: Failed to save initial state for session {session_id}: {e}")
 
-    def save_app_state_to_disk(self, session_id: str):
+    def save_session_to_disk(self, session_id: str):
         """Saves the full application state to disk for later reloading via /updateState."""
         session = self.get_session(session_id)
         if not session:
@@ -223,6 +283,7 @@ class SegmentationService:
 
         start_time = time.perf_counter()
         state = session["state"]
+        image_size = session.get("image_size", (None, None))
         
         session_dir = self.storage_dir / session_id
         masks_dir = session_dir / "masks"
@@ -231,8 +292,9 @@ class SegmentationService:
         masks_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Save original image
+        image_path = session_dir / self.ORIGINAL_IMAGE_FILENAME
         if "original_image_bytes" in session:
-            (session_dir / self.ORIGINAL_IMAGE_FILENAME).write_bytes(session["original_image_bytes"])
+            image_path.write_bytes(session["original_image_bytes"])
 
         # 2. Save masks
         mask_count = 0
@@ -253,7 +315,11 @@ class SegmentationService:
             "session_id": session_id,
             "created_at": session.get("created_at"),
             "original_filename": session.get("original_filename"),
+            "image_path": str(image_path),
+            "width": image_size[0],
+            "height": image_size[1],
             "prompts": session.get("prompts", []),
+            "results": serialize_state(state),
             "mask_count": mask_count
         }
         (session_dir / self.SESSION_STATE_FILENAME).write_text(json.dumps(session_data, indent=2))
