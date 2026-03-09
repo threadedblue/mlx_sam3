@@ -103,6 +103,11 @@ class SessionRequest(BaseModel):
     session_id: str
 
 
+class SessionSettingsRequest(BaseModel):
+    session_id: str
+    settings: Dict[str, Any]
+
+
 @app.get("/health")
 async def health():
     return {"status": "healthy", "model_loaded": model is not None}
@@ -277,6 +282,20 @@ async def reset_prompts(request: SessionRequest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error resetting prompts: {str(e)}")
+
+
+@app.post("/session/settings")
+async def save_session_settings(request: SessionSettingsRequest):
+    """Saves arbitrary UI settings (like layer visibility) to the session file."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+    try:
+        service.save_session_settings(request.session_id, request.settings)
+        return {"message": "Settings saved", "session_id": request.session_id}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/saveSession")
 async def save_session(request: SessionRequest):

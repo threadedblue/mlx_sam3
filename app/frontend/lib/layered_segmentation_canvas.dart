@@ -115,7 +115,7 @@ class MasksPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    const singleColor = Colors.blue;
+    const singleColor = ui.Color.fromARGB(255, 48, 42, 42); // Dark grey
 
     final fillPaint = Paint()
       ..color = singleColor.withOpacity(0.2)

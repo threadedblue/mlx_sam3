@@ -92,6 +92,10 @@ class _HomeScreenState extends State<HomeScreen> {
   final List<Map<String, dynamic>> _timings = [];
   Timer? _healthCheckTimer;
 
+  // Layer State
+  LayerState? _layerState;
+  bool _isRestoringState = false;
+
   @override
   void initState() {
     super.initState();
@@ -104,9 +108,25 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final newLayerState = Provider.of<LayerState>(context, listen: false);
+    if (_layerState != newLayerState) {
+      _layerState?.removeListener(_onLayerStateChanged);
+      _layerState = newLayerState;
+      _layerState?.addListener(_onLayerStateChanged);
+    }
+  }
+
+  void _onLayerStateChanged() {
+    if (!_isRestoringState) _saveLayerState();
+  }
+
+  @override
   void dispose() {
     _healthCheckTimer?.cancel();
     _textController.dispose();
+    _layerState?.removeListener(_onLayerStateChanged);
     super.dispose();
   }
 
@@ -542,6 +562,20 @@ class _HomeScreenState extends State<HomeScreen> {
         _segments = [];
         _updateSegmentsFromResult();
         _textController.clear();
+
+        // Restore layer state if provided by backend
+        if (sessionData['view_layers'] != null) {
+          _isRestoringState = true;
+          try {
+            final Map<String, dynamic> layers = Map<String, dynamic>.from(sessionData['view_layers']);
+            _layerState?.setOriginal(layers['original'] ?? true);
+            _layerState?.setMasks(layers['masks'] ?? true);
+            _layerState?.setRaw(layers['raw'] ?? false);
+            _layerState?.setFinal(layers['final'] ?? false);
+          } finally {
+            _isRestoringState = false;
+          }
+        }
       });
     } catch (e) {
       if (!mounted) return;
@@ -549,6 +583,24 @@ class _HomeScreenState extends State<HomeScreen> {
     } finally {
       if (!mounted) return;
       setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _saveLayerState() async {
+    if (_sessionId == null || _layerState == null) return;
+    try {
+      // Note: Ensure ApiService has saveSessionSettings(String, Map)
+      await _api.saveSessionSettings(_sessionId!, {
+        'view_layers': {
+          'original': _layerState!.showOriginal,
+          'masks': _layerState!.showMasks,
+          'raw': _layerState!.showRaw,
+          'final': _layerState!.showFinal,
+        }
+      });
+    } catch (e) {
+      // Ignore errors for background saves
+      debugPrint("Failed to save layer state: $e");
     }
   }
 
@@ -711,7 +763,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
-              value: _selectedSavedSession,
+              initialValue: _selectedSavedSession,
               isExpanded: true,
               decoration: const InputDecoration(
                 labelText: "Saved Sessions",

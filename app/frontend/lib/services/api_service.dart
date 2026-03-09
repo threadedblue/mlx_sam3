@@ -273,4 +273,22 @@ class ApiService {
       return [];
     }
   }
+
+  Future<void> saveSessionSettings(String sessionId, Map<String, dynamic> settings) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/session/settings'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'session_id': sessionId,
+          'settings': settings,
+        }),
+      );
+      if (response.statusCode != 200) {
+        print('Failed to save session settings: ${response.body}');
+      }
+    } catch (e) {
+      print('Error saving session settings: $e');
+    }
+  }
 }

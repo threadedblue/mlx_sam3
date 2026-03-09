@@ -214,6 +214,19 @@ class SegmentationService:
         # 3. Write to state.json, which is read by the /updateState endpoint
         (session_dir / self.SESSION_STATE_FILENAME).write_text(json.dumps(state_data, indent=2))
 
+    def save_session_settings(self, session_id: str, settings: Dict[str, Any]):
+        """Saves UI-specific settings to the session's state file."""
+        session_dir = self.storage_dir / session_id
+        state_file = session_dir / self.SESSION_STATE_FILENAME
+
+        if not state_file.exists():
+            raise FileNotFoundError(f"State file not found for session {session_id}, cannot save settings.")
+
+        # Read, update, write
+        state_data = json.loads(state_file.read_text())
+        state_data.update(settings)  # Merge the new settings
+        state_file.write_text(json.dumps(state_data, indent=2))
+
     def load_session_from_disk(self, session_id: str) -> Dict[str, Any]:
         """Load session state and image from disk."""
         session_dir = self.storage_dir / session_id
@@ -238,7 +251,7 @@ class SegmentationService:
         image_bytes = image_path.read_bytes()
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        return {
+        response = {
             "session_id": session_id,
             "image_b64": image_b64,
             "width": state_data.get("width"),
@@ -247,6 +260,11 @@ class SegmentationService:
             "prompts": state_data.get("prompts", []),
             "created_at": state_data.get("created_at"),
         }
+
+        if "view_layers" in state_data:
+            response["view_layers"] = state_data["view_layers"]
+
+        return response
 
     def delete_session_memory(self, session_id: str) -> bool:
         """Remove session from memory."""
@@ -335,30 +353,35 @@ class SegmentationService:
         if not session:
             raise ValueError("Session not found")
             
-        if "original_image_bytes" not in session or "state" not in session or "masks" not in session["state"]:
+        if "original_image_bytes" not in session or "state" not in session or session["state"].get("masks") is None:
             raise ValueError("Image or masks not available")
 
         start_time = time.perf_counter()
         
         original_image = Image.open(io.BytesIO(session["original_image_bytes"])).convert("RGBA")
         masks = session["state"]["masks"]
-        
+        print("1==")
         segments_dir = self.storage_dir / session_id / "segments_raw"
         # Clear old segments
         for f in segments_dir.glob('*.png'):
             f.unlink()
-
+        print("2==")
         for i, mask_mx in enumerate(masks):
             mask_np = np.array(mask_mx)
             mask_binary = (mask_np > 0.5).astype(np.uint8)
             if mask_binary.ndim == 3:
                 mask_binary = mask_binary[0]
-            
+            print("2.5==")
             mask_image = Image.fromarray(mask_binary * 255, 'L')
+            print("2.6==")
             segment_image = Image.new("RGBA", original_image.size, (0, 0, 0, 0))
+            print("2.7==")
             segment_image.paste(original_image, (0, 0), mask_image)
+            print("2.8==", segments_dir, f"segment_{i:03d}.png")
+            segments_dir.mkdir(parents=True, exist_ok=True)
             segment_image.save(segments_dir / f"segment_{i:03d}.png")
-
+            print("2.9==", segments_dir, f"segment_{i:03d}.png")
+        print("3==")
         return {
             "count": len(masks),
             "path": str(segments_dir),
