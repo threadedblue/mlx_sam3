@@ -3,11 +3,12 @@ FastAPI backend for SAM3 segmentation model.
 Provides endpoints for image upload, text prompts, box prompts, and segmentation results.
 """
 
-import io
 import os
+import io
 import sys
 import json
 import shutil
+import traceback
 import base64
 from typing import Dict, Any
 from datetime import datetime
@@ -31,6 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
+import google.generativeai as genai
+from dotenv import load_dotenv
 
 from services import SegmentationService, serialize_state
 
@@ -45,20 +48,30 @@ STORAGE_DIR = BASE_DIR.parent.parent / "storage" / "sessions"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup."""
+    load_dotenv()
+
     global model, processor
-    
+
     sam3_root = os.path.dirname(sam3.__file__)
-    
+
     model = build_sam3_image_model()
     processor = Sam3Processor(model)
     print("SAM3 model loaded successfully!")
-    
+
     # Initialize Service Layer
     global service
     service = SegmentationService(STORAGE_DIR, processor)
-    
+
+    # Configure Gemini
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("Warning: GEMINI_API_KEY not set. AI captioning will be disabled.")
+    else:
+        genai.configure(api_key=api_key)
+        print("Gemini SDK configured.")
+
     yield
-    
+
     # Cleanup if needed
 
 app = FastAPI(
@@ -106,6 +119,12 @@ class SessionRequest(BaseModel):
 class SessionSettingsRequest(BaseModel):
     session_id: str
     settings: Dict[str, Any]
+
+
+class LoraAppendRequest(BaseModel):
+    session_id: str
+    segment_index: int
+    prompt: str
 
 
 @app.get("/health")
@@ -156,6 +175,26 @@ async def upload_image(file: UploadFile = File(...)):
     
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error processing image: {str(e)}")
+
+
+@app.post("/process-image")
+async def process_image(file: UploadFile = File(...)):
+    """Generate a descriptive caption for an image and save both."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(status_code=503, detail="AI captioning is not configured on the server (GEMINI_API_KEY is missing).")
+
+    try:
+        # The service method will handle reading the file and calling the AI model
+        caption = await service.generate_caption(file)
+        return {"caption": caption}
+    except Exception as e:
+        # Log the full error for debugging
+        print(f"Error during image processing: {e}")
+        traceback.print_exc()
+        # Raise a generic but informative error to the client
+        raise HTTPException(status_code=500, detail=f"Error processing image with AI: {str(e)}")
 
 
 @app.post("/segment/text")
@@ -459,6 +498,33 @@ async def update_state(request: SessionRequest):
     except Exception as e:
         # A general catch-all for other potential file or system errors.
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+@app.post("/lora/append")
+async def append_lora_entry(request: LoraAppendRequest):
+    """Refine a segment caption via Gemini and append it to the LoRA JSONL dataset."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not set")
+    try:
+        result = await service.append_lora_entry(request.session_id, request.segment_index, request.prompt)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error appending LoRA entry: {str(e)}")
+
+
+@app.get("/lora/count")
+async def get_lora_count():
+    """Return the number of entries in the global LoRA JSONL dataset."""
+    jsonl_path = STORAGE_DIR.parent / "lora_dataset.jsonl"
+    if not jsonl_path.exists():
+        return {"count": 0}
+    count = sum(1 for line in jsonl_path.open("r", encoding="utf-8") if line.strip())
+    return {"count": count}
+
 
 app.mount(
     "/web",

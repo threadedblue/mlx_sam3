@@ -291,4 +291,65 @@ class ApiService {
       print('Error saving session settings: $e');
     }
   }
+
+  Future<Map<String, dynamic>> appendLoraEntry(String sessionId, int segmentIndex, String prompt) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/lora/append'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'session_id': sessionId, 'segment_index': segmentIndex, 'prompt': prompt}),
+    );
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body) as Map<String, dynamic>;
+    }
+    String detail = "Failed to append LoRA entry";
+    try { detail = (jsonDecode(response.body) as Map)['detail'] ?? detail; } catch (_) {}
+    throw Exception("LoRA append failed (${response.statusCode}): $detail");
+  }
+
+  Future<int> getLoraCount() async {
+    try {
+      final response = await http.get(Uri.parse('$baseUrl/lora/count'));
+      if (response.statusCode == 200) {
+        return (jsonDecode(response.body) as Map<String, dynamic>)['count'] as int? ?? 0;
+      }
+      return 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  Future<String> generateCaption(Uint8List bytes, {required String filename}) async {
+    final uri = Uri.parse("$baseUrl/process-image");
+    final request = http.MultipartRequest("POST", uri);
+
+    request.files.add(
+      http.MultipartFile.fromBytes(
+        "file", // must match FastAPI field name
+        bytes,
+        filename: filename,
+      ),
+    );
+
+    try {
+      final streamed = await request.send();
+      final response = await http.Response.fromStream(streamed);
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        return data['caption'] as String;
+      } else {
+        String detail = "Failed to generate caption";
+        try {
+          final errorData = jsonDecode(response.body);
+          detail = errorData['detail'] ?? detail;
+        } catch (_) {
+          detail = response.body.isNotEmpty ? response.body : detail;
+        }
+        throw Exception("Caption generation failed: ${response.statusCode} - $detail");
+      }
+    } catch (e) {
+      print('Error generating caption: $e');
+      rethrow;
+    }
+  }
 }

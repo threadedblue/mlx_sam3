@@ -7,6 +7,7 @@ sheels/
 storage/
 *.egg-info
 
+.env
 # Virtual environments
 .venv
 

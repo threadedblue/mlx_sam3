@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import shutil
 import base64
 import time
@@ -7,6 +8,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+
+from fastapi import UploadFile
+import google.generativeai as genai
 
 import numpy as np
 from PIL import Image
@@ -94,6 +98,8 @@ class SegmentationService:
         self.processor = processor
         # In-memory session storage
         self.sessions: Dict[str, Dict[str, Any]] = {}
+        # New directory for AI captions
+        self.segment_prompt_dir = self.storage_dir.parent / "segment_prompt"
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -387,3 +393,83 @@ class SegmentationService:
             "path": str(segments_dir),
             "processing_time_ms": (time.perf_counter() - start_time) * 1000
         }
+
+    async def append_lora_entry(self, session_id: str, segment_index: int, original_prompt: str) -> Dict[str, Any]:
+        """Call Gemini to refine a caption for a segment, then append to the global JSONL."""
+        segment_path = self.storage_dir / session_id / "segments_raw" / f"segment_{segment_index:03d}.png"
+        if not segment_path.exists():
+            raise ValueError(f"Segment {segment_index} not found. Run 'Create Segments' first.")
+
+        original_image_path = self.storage_dir / session_id / self.ORIGINAL_IMAGE_FILENAME
+        if not original_image_path.exists():
+            raise ValueError("Original image not found for this session.")
+
+        original_img = Image.open(original_image_path).convert("RGB")
+        segment_img = Image.open(segment_path).convert("RGBA")
+
+        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        system_prompt = (
+            f"You are a LoRA training data expert for diffusion models. "
+            f"You are given an original image and one transparent-background crop showing a single segmented region. "
+            f"The user's rough label for this region is: '{original_prompt}'. "
+            f"Write a precise, detailed LoRA training caption for the segmented object or region. "
+            f"Format: comma-separated descriptive phrases, starting with the main subject. "
+            f"Describe appearance, texture, color, and context. Do not mention 'segment', 'mask', or 'crop'."
+        )
+        response = await gemini_model.generate_content_async([system_prompt, original_img, segment_img])
+        refined_prompt = response.text.strip()
+
+        file_name = f"sessions/{session_id}/segments_raw/segment_{segment_index:03d}.png"
+        entry = {"file_name": file_name, "text": refined_prompt}
+
+        jsonl_stem = re.sub(r'\s+', '_', original_prompt.strip())
+        jsonl_filename = f"{jsonl_stem}.jsonl"
+        jsonl_path = self.storage_dir.parent / jsonl_filename
+        with jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+        entry_count = sum(1 for line in jsonl_path.open("r", encoding="utf-8") if line.strip())
+
+        return {
+            "refined_prompt": refined_prompt,
+            "file_name": file_name,
+            "jsonl_filename": jsonl_filename,
+            "entry_count": entry_count,
+        }
+
+    async def generate_caption(self, file: UploadFile) -> str:
+        """
+        Generates a caption for an image using Gemini, saves the image and caption.
+        """
+        # Ensure the target directory exists
+        self.segment_prompt_dir.mkdir(exist_ok=True)
+
+        # Read file content
+        contents = await file.read()
+        filename = file.filename if file.filename else "untitled.jpg"
+
+        # Save the original image
+        image_path = self.segment_prompt_dir / filename
+        image_path.write_bytes(contents)
+
+        # Prepare for Gemini
+        img = Image.open(io.BytesIO(contents))
+        model = genai.GenerativeModel('gemini-1.5-flash')
+
+        prompt_text = (
+            "Generate a detailed, descriptive caption for this image, suitable for training a Stable Diffusion LoRA. "
+            "The caption should be a series of comma-separated keywords and phrases. "
+            "Start with the main subject, then describe their appearance, clothing, pose, and the background. "
+            "Mention the style of the image (e.g., photo, illustration, 3d render) and any notable lighting or color schemes. "
+            "Be concise but comprehensive."
+        )
+
+        # Generate content
+        response = await model.generate_content_async([prompt_text, img])
+        caption = response.text
+
+        # Save the generated prompt as a text file
+        prompt_path = self.segment_prompt_dir / Path(filename).with_suffix('.txt')
+        prompt_path.write_text(caption)
+
+        return caption

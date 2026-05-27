@@ -22,6 +22,7 @@ import 'services/api_service.dart';
 import 'segment_layers_card.dart';
 import 'package:provider/provider.dart';
 import 'layered_segmentation_canvas.dart';
+import 'training_data_card.dart';
 import 'layer_state.dart';
 
 void main() {
@@ -46,11 +47,17 @@ class SamApp extends StatelessWidget {
             brightness: Brightness.light,
           ),
           useMaterial3: true,
-          cardTheme: const CardThemeData(
-            elevation: 2,
-            margin: EdgeInsets.zero,
-          ),
+          cardTheme: const CardThemeData(elevation: 2, margin: EdgeInsets.zero),
         ),
+        darkTheme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: Colors.indigo,
+            brightness: Brightness.dark,
+          ),
+          useMaterial3: true,
+          cardTheme: const CardThemeData(elevation: 2, margin: EdgeInsets.zero),
+        ),
+        themeMode: ThemeMode.dark,
         home: const HomeScreen(),
       ),
     );
@@ -604,6 +611,31 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _handleGenerateCaption() async {
+    if (_imageBytes == null) return;
+    setState(() => _isLoading = true);
+    try {
+      final caption = await _api.generateCaption(
+        _imageBytes!,
+        filename: _imageName ?? 'upload.jpg',
+      );
+      if (!mounted) return;
+      setState(() {
+        _textController.text = caption;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("AI Caption generated and copied to Text Prompt field.")),
+      );
+      _addTiming("AI Caption", 0); // Just to show it happened
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     // If you later want a responsive layout, you can use isWide.
@@ -636,6 +668,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(height: 16),
                 _buildUploadCard(),
                 const SizedBox(height: 16),
+                _buildCaptionCard(),
+                const SizedBox(height: 16),
                 _buildTextPromptCard(),
                 const SizedBox(height: 16),
                 _buildBoxPromptCard(),
@@ -650,19 +684,21 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(height: 16),
                 _buildSegmentLayersCard(),
                 const SizedBox(height: 16),
+                _buildTrainingDataCard(),
+                const SizedBox(height: 16),
                 _buildPerformanceCard(),
                 if (_error != null) ...[
                   const SizedBox(height: 16),
                   Container(
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      color: Colors.red.shade50,
+                      color: Theme.of(context).colorScheme.errorContainer,
                       borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.red.shade200),
+                      border: Border.all(color: Theme.of(context).colorScheme.error),
                     ),
                     child: Text(
                       _error!,
-                      style: TextStyle(color: Colors.red.shade800, fontSize: 12),
+                      style: TextStyle(color: Theme.of(context).colorScheme.onErrorContainer, fontSize: 12),
                     ),
                   ),
                 ],
@@ -675,9 +711,9 @@ class _HomeScreenState extends State<HomeScreen> {
             child: Container(
               margin: const EdgeInsets.fromLTRB(0, 16, 16, 16),
               decoration: BoxDecoration(
-                color: Colors.grey.shade100,
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.grey.shade300),
+                border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
               ),
               clipBehavior: Clip.antiAlias,
               child: (_imageBytes == null)
@@ -685,9 +721,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(Icons.image_outlined, size: 64, color: Colors.grey.shade400),
+                          Icon(Icons.image_outlined, size: 64, color: Theme.of(context).colorScheme.onSurfaceVariant),
                           const SizedBox(height: 16),
-                          Text("Upload an image to start", style: TextStyle(color: Colors.grey.shade500)),
+                          Text("Upload an image to start", style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant)),
                         ],
                       ),
                     )
@@ -733,9 +769,9 @@ class _HomeScreenState extends State<HomeScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
+        color: color.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: color.withOpacity(0.3)),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
       child: Row(
         children: [
@@ -822,15 +858,15 @@ class _HomeScreenState extends State<HomeScreen> {
                 width: double.infinity,
                 padding: const EdgeInsets.all(24),
                 decoration: BoxDecoration(
-                  border: Border.all(color: Colors.grey.shade300, style: BorderStyle.solid),
+                  border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
                   borderRadius: BorderRadius.circular(8),
-                  color: Colors.grey.shade50,
+                  color: Theme.of(context).colorScheme.surfaceContainerLow,
                 ),
                 child: Column(
                   children: [
-                    Icon(Icons.add_photo_alternate, size: 32, color: Colors.grey.shade400),
+                    Icon(Icons.add_photo_alternate, size: 32, color: Theme.of(context).colorScheme.onSurfaceVariant),
                     const SizedBox(height: 8),
-                    Text("Click to upload", style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+                    Text("Click to upload", style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant, fontSize: 12)),
                   ],
                 ),
               ),
@@ -840,9 +876,47 @@ class _HomeScreenState extends State<HomeScreen> {
                 padding: const EdgeInsets.only(top: 8),
                 child: Text(
                   "${_imageSize!.width.toInt()} × ${_imageSize!.height.toInt()} px",
-                  style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+                  style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.onSurfaceVariant),
                 ),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCaptionCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.smart_toy_outlined, size: 16),
+                SizedBox(width: 8),
+                Text("AI Captioning", style: TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              "Use AI to generate a descriptive prompt for the uploaded image.",
+              style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: (_imageBytes == null || _isLoading) ? null : _handleGenerateCaption,
+                icon: const Icon(Icons.auto_fix_high, size: 16),
+                label: const Text("Generate Caption"),
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.deepPurple.shade400,
+                  foregroundColor: Colors.white,
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -914,7 +988,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
             const SizedBox(height: 12),
-            Text("Draw boxes to include/exclude regions", style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+            Text("Draw boxes to include/exclude regions", style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
             const SizedBox(height: 12),
             Row(
               children: [
@@ -965,7 +1039,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
             const SizedBox(height: 12),
-            Text("Click on the image to select specific points", style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
+            Text("Click on the image to select specific points", style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
             const SizedBox(height: 12),
             Row(
               children: [
@@ -1054,7 +1128,7 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 12),
             Text(
               "Save the image and generated masks.",
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+              style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
             ),
             const SizedBox(height: 12),
             SizedBox(
@@ -1088,7 +1162,7 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 12),
             Text(
               "Create and view individual segment images.",
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+              style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
             ),
             const SizedBox(height: 12),
             Row(
@@ -1121,13 +1195,21 @@ class _HomeScreenState extends State<HomeScreen> {
     return const SegmentLayersCard();
   }
 
+  Widget _buildTrainingDataCard() {
+    return TrainingDataCard(
+      sessionId: _sessionId,
+      segmentCount: _segments.length,
+      currentPrompt: _textController.text,
+    );
+  }
+
   Widget _buildResultRow(String label, String value) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label, style: TextStyle(fontSize: 13, color: Colors.grey.shade600)),
+          Text(label, style: TextStyle(fontSize: 13, color: Theme.of(context).colorScheme.onSurfaceVariant)),
           Text(value, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
         ],
       ),
@@ -1150,7 +1232,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 12),
             if (_timings.isEmpty)
-              Text("No requests yet", style: TextStyle(fontSize: 12, color: Colors.grey.shade500))
+              Text("No requests yet", style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant))
             else
               ListView.builder(
                 shrinkWrap: true,
@@ -1169,7 +1251,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         Expanded(
                           child: Text(
                             t['label'].toString(),
-                            style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                            style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),
@@ -1372,7 +1454,7 @@ class DragBoxPainter extends CustomPainter {
     canvas.drawRect(rect, paint);
 
     final fillPaint = Paint()
-      ..color = Colors.blue.withOpacity(0.1)
+      ..color = Colors.blue.withValues(alpha: 0.1)
       ..style = PaintingStyle.fill;
     canvas.drawRect(rect, fillPaint);
   }
