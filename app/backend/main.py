@@ -5,12 +5,14 @@ Provides endpoints for image upload, text prompts, box prompts, and segmentation
 
 import os
 import io
+import re
 import sys
 import json
+import asyncio
 import shutil
 import traceback
 import base64
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 import time
 import uuid
@@ -498,6 +500,130 @@ async def update_state(request: SessionRequest):
     except Exception as e:
         # A general catch-all for other potential file or system errors.
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+# ── LoRA training run state ──────────────────────────────────────────────────
+_lora_runs: Dict[str, Dict[str, Any]] = {}
+
+
+class LoraTrainRequest(BaseModel):
+    dataset_dir: str
+    output_dir: str
+    script_path: str = "train_dreambooth_lora_flux.py"
+    rank: int = 16
+    learning_rate: float = 1e-4
+    num_train_epochs: int = 1
+    resolution: int = 1024
+    mixed_precision: str = "bf16"
+
+
+async def _run_training(run_id: str, req: LoraTrainRequest) -> None:
+    run = _lora_runs[run_id]
+    cmd = [
+        sys.executable, req.script_path,
+        "--pretrained_model_name_or_path", "black-forest-labs/FLUX.1-dev",
+        "--instance_data_dir", req.dataset_dir,
+        "--output_dir", req.output_dir,
+        "--resolution", str(req.resolution),
+        "--train_batch_size", "1",
+        "--gradient_accumulation_steps", "4",
+        "--num_train_epochs", str(req.num_train_epochs),
+        "--learning_rate", str(req.learning_rate),
+        "--lr_scheduler", "constant",
+        "--mixed_precision", req.mixed_precision,
+        "--rank", str(req.rank),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            run["logs"].append(line)
+            m = re.search(r"Steps:\s*(\d+)/(\d+)", line)
+            if m:
+                run["current_step"] = int(m.group(1))
+                run["total_steps"] = int(m.group(2))
+        await proc.wait()
+        if proc.returncode == 0:
+            safetensors = sorted(
+                Path(req.output_dir).glob("**/*.safetensors"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            run["output_path"] = str(safetensors[0]) if safetensors else None
+            run["status"] = "done"
+        else:
+            run["status"] = "failed"
+            run["last_error"] = next(
+                (l for l in reversed(run["logs"]) if l.strip()), "Unknown error"
+            )
+    except Exception as exc:
+        run["status"] = "failed"
+        run["last_error"] = str(exc)
+        run["logs"].append(f"EXCEPTION: {exc}")
+    finally:
+        run["completed_at"] = time.time()
+
+
+@app.get("/pipeline/lora_train/ready")
+async def lora_train_ready(dataset_dir: str):
+    """Check whether metadata.jsonl exists in dataset_dir."""
+    jsonl_path = Path(dataset_dir) / "metadata.jsonl"
+    if not jsonl_path.exists():
+        return {"ready": False, "image_count": 0, "file_size_bytes": 0}
+    lines = [l for l in jsonl_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return {
+        "ready": True,
+        "image_count": len(lines),
+        "file_size_bytes": jsonl_path.stat().st_size,
+    }
+
+
+@app.post("/pipeline/lora_train/run")
+async def lora_train_run(request: LoraTrainRequest):
+    """Launch training as a background subprocess and return a run_id."""
+    run_id = str(uuid.uuid4())
+    _lora_runs[run_id] = {
+        "status": "running",
+        "current_step": 0,
+        "total_steps": 0,
+        "started_at": time.time(),
+        "completed_at": None,
+        "logs": [],
+        "output_path": None,
+        "last_error": None,
+    }
+    asyncio.create_task(_run_training(run_id, request))
+    return {"run_id": run_id}
+
+
+@app.get("/pipeline/lora_train/status/{run_id}")
+async def lora_train_status(run_id: str):
+    """Return current training status and progress."""
+    run = _lora_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    elapsed = int((run["completed_at"] or time.time()) - run["started_at"])
+    return {
+        "status": run["status"],
+        "current_step": run["current_step"],
+        "total_steps": run["total_steps"],
+        "elapsed_seconds": elapsed,
+        "output_path": run["output_path"],
+        "last_error": run["last_error"],
+    }
+
+
+@app.get("/pipeline/lora_train/logs/{run_id}")
+async def lora_train_logs(run_id: str):
+    """Return all accumulated stdout/stderr lines for a run."""
+    run = _lora_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run["logs"]
+
 
 @app.post("/lora/append")
 async def append_lora_entry(request: LoraAppendRequest):

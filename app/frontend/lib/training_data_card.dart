@@ -5,12 +5,16 @@ class TrainingDataCard extends StatefulWidget {
   final String? sessionId;
   final int segmentCount;
   final String currentPrompt;
+  final VoidCallback? onRunning;
+  final VoidCallback? onComplete;
 
   const TrainingDataCard({
     super.key,
     required this.sessionId,
     required this.segmentCount,
     required this.currentPrompt,
+    this.onRunning,
+    this.onComplete,
   });
 
   @override
@@ -36,6 +40,7 @@ class _TrainingDataCardState extends State<TrainingDataCard> {
 
   Future<void> _run() async {
     if (widget.sessionId == null || widget.currentPrompt.isEmpty) return;
+    widget.onRunning?.call();
     setState(() {
       _isLoading = true;
       _error = null;
@@ -54,6 +59,7 @@ class _TrainingDataCardState extends State<TrainingDataCard> {
         _savedFilename = result['jsonl_filename'] as String?;
         _entryCount = result['entry_count'] as int? ?? _entryCount + 1;
       });
+      widget.onComplete?.call();
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
@@ -175,9 +181,35 @@ class _TrainingDataCardState extends State<TrainingDataCard> {
                 ),
               ),
             ],
+            if (_isLoading) ...[
+              const SizedBox(height: 10),
+              Text(
+                "Calling Gemini — this may take a few seconds…",
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              ),
+            ],
             if (_error != null) ...[
               const SizedBox(height: 8),
-              Text(_error!, style: TextStyle(fontSize: 11, color: cs.error)),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: cs.errorContainer,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(Icons.error_outline, size: 16, color: cs.onErrorContainer),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: SelectableText(
+                        _error!,
+                        style: TextStyle(fontSize: 11, color: cs.onErrorContainer),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ],
           ],
         ),

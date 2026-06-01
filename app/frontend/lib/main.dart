@@ -23,7 +23,10 @@ import 'segment_layers_card.dart';
 import 'package:provider/provider.dart';
 import 'layered_segmentation_canvas.dart';
 import 'training_data_card.dart';
+import 'lora_train_card.dart';
 import 'layer_state.dart';
+import 'models/result_datum.dart';
+import 'widgets/result_cell.dart';
 
 void main() {
   runApp(const SamApp());
@@ -97,6 +100,26 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // Timing
   final List<Map<String, dynamic>> _timings = [];
+
+  // Per-card result state
+  bool _imageSourceRunning = false;
+  List<ResultDatum> _imageSourceResult = [];
+  bool _textPromptRunning = false;
+  List<ResultDatum> _textPromptResult = [];
+  bool _boxRunning = false;
+  List<ResultDatum> _boxResult = [];
+  bool _pointRunning = false;
+  List<ResultDatum> _pointResult = [];
+  bool _resultsRunning = false;
+  List<ResultDatum> _resultsResult = [];
+  bool _downloadRunning = false;
+  List<ResultDatum> _downloadResult = [];
+  bool _segmentsRunning = false;
+  List<ResultDatum> _segmentsResult = [];
+  bool _loraTrainPrepRunning = false;
+  List<ResultDatum> _loraTrainPrepResult = [];
+  bool _loraTrainRunning = false;
+  List<ResultDatum> _loraTrainResult = [];
   Timer? _healthCheckTimer;
 
   // Layer State
@@ -274,6 +297,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
     setState(() {
       _isLoading = true;
+      _imageSourceRunning = true;
+      _imageSourceResult = [];
       _error = null;
       _imageBytes = bytes;
       _imageName = picked?.name;
@@ -285,9 +310,6 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
-      // --- IMPORTANT ---
-      // This requires ApiService.uploadImageBytes(...)
-      // If you don't have it yet, add it (see comment below).
       final response = await _api.uploadImageBytes(bytes, filename: _imageName ?? "upload.png");
 
       if (response != null) {
@@ -298,6 +320,7 @@ class _HomeScreenState extends State<HomeScreen> {
             (response['width'] as num).toDouble(),
             (response['height'] as num).toDouble(),
           );
+          _imageSourceResult = [ResultDatum(label: 'Path', value: _imageName ?? '')];
         });
         _addTiming("Image Encoding", response['processing_time_ms']);
       }
@@ -306,13 +329,13 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _error = e.toString());
     } finally {
       if (!mounted) return;
-      setState(() => _isLoading = false);
+      setState(() { _isLoading = false; _imageSourceRunning = false; });
     }
   }
 
   Future<void> _sendTextPrompt() async {
     if (_sessionId == null || _textController.text.isEmpty) return;
-    setState(() => _isLoading = true);
+    setState(() { _isLoading = true; _textPromptRunning = true; _textPromptResult = []; });
     try {
       final response = await _api.segmentWithText(_sessionId!, _textController.text);
       if (!mounted) return;
@@ -320,6 +343,7 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
+          _textPromptResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
         _addTiming("Text: ${_textController.text}", response['processing_time_ms']);
       }
@@ -328,13 +352,13 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _error = e.toString());
     } finally {
       if (!mounted) return;
-      setState(() => _isLoading = false);
+      setState(() { _isLoading = false; _textPromptRunning = false; });
     }
   }
 
   Future<void> _sendBoxPrompt(List<double> box) async {
     if (_sessionId == null) return;
-    setState(() => _isLoading = true);
+    setState(() { _isLoading = true; _boxRunning = true; _boxResult = []; });
     try {
       final response = await _api.segmentWithBox(_sessionId!, box, _boxMode == "positive");
       if (!mounted) return;
@@ -342,6 +366,7 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
+          _boxResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
         _addTiming("Box ($_boxMode)", response['processing_time_ms']);
       }
@@ -350,13 +375,13 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _error = e.toString());
     } finally {
       if (!mounted) return;
-      setState(() => _isLoading = false);
+      setState(() { _isLoading = false; _boxRunning = false; });
     }
   }
 
   Future<void> _sendPointPrompt(List<double> point) async {
     if (_sessionId == null) return;
-    setState(() => _isLoading = true);
+    setState(() { _isLoading = true; _pointRunning = true; _pointResult = []; });
     try {
       final response = await _api.segmentWithPoint(_sessionId!, point, _pointMode == "positive");
       if (!mounted) return;
@@ -364,6 +389,7 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
+          _pointResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
         _addTiming("Point ($_pointMode)", response['processing_time_ms']);
       }
@@ -372,13 +398,13 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _error = e.toString());
     } finally {
       if (!mounted) return;
-      setState(() => _isLoading = false);
+      setState(() { _isLoading = false; _pointRunning = false; });
     }
   }
 
   Future<void> _reset() async {
     if (_sessionId == null) return;
-    setState(() => _isLoading = true);
+    setState(() { _isLoading = true; _resultsRunning = true; _resultsResult = []; });
     try {
       final response = await _api.resetPrompts(_sessionId!);
       if (!mounted) return;
@@ -387,6 +413,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _result = response['results'] as Map<String, dynamic>?;
           _textController.clear();
           _updateSegmentsFromResult();
+          _resultsResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
         _addTiming("Reset Prompts", response['processing_time_ms']);
       }
@@ -395,13 +422,13 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _error = e.toString());
     } finally {
       if (!mounted) return;
-      setState(() => _isLoading = false);
+      setState(() { _isLoading = false; _resultsRunning = false; });
     }
   }
 
   Future<void> _saveMasks() async {
     if (_sessionId == null) return;
-    setState(() => _isLoading = true);
+    setState(() { _isLoading = true; _downloadRunning = true; _downloadResult = []; });
     try {
       final response = await _api.saveMasks(_sessionId!);
       if (!mounted) return;
@@ -409,21 +436,22 @@ class _HomeScreenState extends State<HomeScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Masks saved successfully")),
         );
-        _loadSavedSessions(); // Refresh list
+        _loadSavedSessions();
         _addTiming("Save Masks", response['processing_time_ms']);
+        setState(() => _downloadResult = [const ResultDatum(label: 'Status', value: 'Done')]);
       }
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
     } finally {
       if (!mounted) return;
-      setState(() => _isLoading = false);
+      setState(() { _isLoading = false; _downloadRunning = false; });
     }
   }
 
   Future<void> _handleCreateSegments() async {
     if (_sessionId == null) return;
-    setState(() => _isLoading = true);
+    setState(() { _isLoading = true; _segmentsRunning = true; _segmentsResult = []; });
     try {
       final response = await _api.createSegments(_sessionId!);
       if (!mounted) return;
@@ -433,13 +461,14 @@ class _HomeScreenState extends State<HomeScreen> {
           SnackBar(content: Text("$count segments created successfully")),
         );
         _addTiming("Create Segments", response['processing_time_ms']);
+        setState(() => _segmentsResult = [const ResultDatum(label: 'Status', value: 'Done')]);
       }
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
     } finally {
       if (!mounted) return;
-      setState(() => _isLoading = false);
+      setState(() { _isLoading = false; _segmentsRunning = false; });
     }
   }
 
@@ -658,51 +687,67 @@ class _HomeScreenState extends State<HomeScreen> {
       body: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Sidebar
-          SizedBox(
-            width: 340,
-            child: ListView(
-              padding: const EdgeInsets.all(16),
-              children: [
-                _buildSessionCard(),
-                const SizedBox(height: 16),
-                _buildUploadCard(),
-                const SizedBox(height: 16),
-                _buildCaptionCard(),
-                const SizedBox(height: 16),
-                _buildTextPromptCard(),
-                const SizedBox(height: 16),
-                _buildBoxPromptCard(),
-                const SizedBox(height: 16),
-                _buildPointPromptCard(),
-                const SizedBox(height: 16),
-                _buildResultsCard(),
-                const SizedBox(height: 16),
-                _buildDownloadCard(),
-                const SizedBox(height: 16),
-                _buildSegmentsCard(),
-                const SizedBox(height: 16),
-                _buildSegmentLayersCard(),
-                const SizedBox(height: 16),
-                _buildTrainingDataCard(),
-                const SizedBox(height: 16),
-                _buildPerformanceCard(),
-                if (_error != null) ...[
+          // Sidebar + middle result column (scroll together)
+          SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: IntrinsicWidth(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildCardRow(_buildSessionCard(),      const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.errorContainer,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Theme.of(context).colorScheme.error),
-                    ),
-                    child: Text(
-                      _error!,
-                      style: TextStyle(color: Theme.of(context).colorScheme.onErrorContainer, fontSize: 12),
-                    ),
+                  _buildCardRow(_buildUploadCard(),       ResultCell(isRunning: _imageSourceRunning, data: _imageSourceResult)),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildCaptionCard(),      const ResultCell(isRunning: false, data: [])),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildTextPromptCard(),   ResultCell(isRunning: _textPromptRunning, data: _textPromptResult)),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildBoxPromptCard(),    ResultCell(isRunning: _boxRunning, data: _boxResult)),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildPointPromptCard(),  ResultCell(isRunning: _pointRunning, data: _pointResult)),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildResultsCard(),      ResultCell(isRunning: _resultsRunning, data: _resultsResult)),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildDownloadCard(),     ResultCell(isRunning: _downloadRunning, data: _downloadResult)),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildSegmentsCard(),     ResultCell(isRunning: _segmentsRunning, data: _segmentsResult)),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildSegmentLayersCard(), const ResultCell(isRunning: false, data: [])),
+                  const SizedBox(height: 16),
+                  _buildCardRow(
+                    _buildTrainingDataCard(),
+                    ResultCell(isRunning: _loraTrainPrepRunning, data: _loraTrainPrepResult),
                   ),
+                  const SizedBox(height: 16),
+                  _buildCardRow(
+                    LoraTrainCard(
+                      onRunning: () => setState(() { _loraTrainRunning = true; _loraTrainResult = []; }),
+                      onComplete: () => setState(() { _loraTrainRunning = false; _loraTrainResult = [const ResultDatum(label: 'Status', value: 'Done')]; }),
+                    ),
+                    ResultCell(isRunning: _loraTrainRunning, data: _loraTrainResult),
+                  ),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildPerformanceCard(), const ResultCell(isRunning: false, data: [])),
+                  if (_error != null) ...[
+                    const SizedBox(height: 16),
+                    SizedBox(
+                      width: 340,
+                      child: Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.errorContainer,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Theme.of(context).colorScheme.error),
+                        ),
+                        child: Text(
+                          _error!,
+                          style: TextStyle(color: Theme.of(context).colorScheme.onErrorContainer, fontSize: 12),
+                        ),
+                      ),
+                    ),
+                  ],
                 ],
-              ],
+              ),
             ),
           ),
 
@@ -738,6 +783,22 @@ class _HomeScreenState extends State<HomeScreen> {
                           onPointDrawn: _sendPointPrompt,
                         ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCardRow(Widget card, Widget cell) {
+    return IntrinsicHeight(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(width: 340, child: card),
+          const SizedBox(width: 8),
+          ConstrainedBox(
+            constraints: const BoxConstraints(minWidth: 140, maxWidth: 220),
+            child: cell,
           ),
         ],
       ),
@@ -1200,6 +1261,8 @@ class _HomeScreenState extends State<HomeScreen> {
       sessionId: _sessionId,
       segmentCount: _segments.length,
       currentPrompt: _textController.text,
+      onRunning: () => setState(() { _loraTrainPrepRunning = true; _loraTrainPrepResult = []; }),
+      onComplete: () => setState(() { _loraTrainPrepRunning = false; _loraTrainPrepResult = [const ResultDatum(label: 'Status', value: 'Done')]; }),
     );
   }
 
