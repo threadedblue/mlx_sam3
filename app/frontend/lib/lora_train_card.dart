@@ -1,14 +1,22 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
 import 'services/lora_train_service.dart';
 
-enum _CardState { waiting, ready, running, done, failed }
+enum _TrainState { idle, running, done, failed }
 
 class LoraTrainCard extends StatefulWidget {
   final VoidCallback? onRunning;
   final VoidCallback? onComplete;
+  final void Function(String? path)? onCompleteWithPath;
 
-  const LoraTrainCard({super.key, this.onRunning, this.onComplete});
+  const LoraTrainCard({
+    super.key,
+    this.onRunning,
+    this.onComplete,
+    this.onCompleteWithPath,
+  });
 
   @override
   State<LoraTrainCard> createState() => _LoraTrainCardState();
@@ -17,126 +25,125 @@ class LoraTrainCard extends StatefulWidget {
 class _LoraTrainCardState extends State<LoraTrainCard> {
   final _svc = LoraTrainService();
 
-  // Config controllers
-  final _datasetCtrl = TextEditingController();
-  final _outputCtrl = TextEditingController();
-  final _rankCtrl = TextEditingController(text: '16');
-  final _lrCtrl = TextEditingController(text: '0.0001');
-  final _epochsCtrl = TextEditingController(text: '1');
-  final _resCtrl = TextEditingController(text: '1024');
+  // Path controllers
+  final _metaCtrl   = TextEditingController();   // metadata.jsonl full path
+  final _outDirCtrl = TextEditingController();   // output directory
+
+  // Hyperparameter controllers
+  final _modelCtrl  = TextEditingController(text: 'black-forest-labs/FLUX.1-dev');
   final _scriptCtrl = TextEditingController(text: 'train_dreambooth_lora_flux.py');
+  final _lrCtrl     = TextEditingController(text: '0.0001');
+  final _epochsCtrl = TextEditingController(text: '1');
+  final _batchCtrl  = TextEditingController(text: '1');
+  final _rankCtrl   = TextEditingController(text: '16');
+  final _alphaCtrl  = TextEditingController(text: '16');
+  final _resCtrl    = TextEditingController(text: '1024');
   String _mixedPrecision = 'bf16';
 
-  _CardState _state = _CardState.waiting;
-  ReadinessResult? _readiness;
-  TrainStatus? _trainStatus;
+  _TrainState _state = _TrainState.idle;
+  TrainStatus? _status;
   List<String> _logs = [];
+  String? _outputPath;
   String? _error;
+  bool _showConfig = false;
   bool _showLogs = false;
 
-  Timer? _readinessTimer;
-  Timer? _logTimer;
   StreamSubscription<TrainStatus>? _statusSub;
-
-  @override
-  void initState() {
-    super.initState();
-    _startReadinessPoll();
-  }
+  Timer? _logTimer;
+  String? _runId;
 
   @override
   void dispose() {
-    _readinessTimer?.cancel();
-    _logTimer?.cancel();
     _statusSub?.cancel();
-    _datasetCtrl.dispose();
-    _outputCtrl.dispose();
-    _rankCtrl.dispose();
-    _lrCtrl.dispose();
-    _epochsCtrl.dispose();
-    _resCtrl.dispose();
-    _scriptCtrl.dispose();
+    _logTimer?.cancel();
+    for (final c in [
+      _metaCtrl, _outDirCtrl, _modelCtrl, _scriptCtrl,
+      _lrCtrl, _epochsCtrl, _batchCtrl, _rankCtrl, _alphaCtrl, _resCtrl,
+    ]) { c.dispose(); }
     super.dispose();
   }
 
-  void _startReadinessPoll() {
-    _checkReadiness();
-    _readinessTimer = Timer.periodic(const Duration(seconds: 10), (_) {
-      if (_state == _CardState.waiting) _checkReadiness();
-    });
+  // ── file pickers ──────────────────────────────────────────────────────────
+
+  Future<void> _pickMetadataFile() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.any,
+      dialogTitle: 'Select metadata.jsonl',
+    );
+    final path = result?.files.single.path;
+    if (path != null) setState(() => _metaCtrl.text = path);
   }
 
-  Future<void> _checkReadiness() async {
-    final dir = _datasetCtrl.text.trim();
-    if (dir.isEmpty) return;
-    try {
-      final r = await _svc.checkReadiness(dir);
-      if (!mounted) return;
-      setState(() {
-        _readiness = r;
-        if (r.ready && _state == _CardState.waiting) {
-          _state = _CardState.ready;
-          _readinessTimer?.cancel();
-        }
-      });
-    } catch (_) {}
+  Future<void> _pickOutputDir() async {
+    final dir = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Select output directory',
+    );
+    if (dir != null) setState(() => _outDirCtrl.text = dir);
   }
 
-  Future<void> _run() async {
+  // ── training ──────────────────────────────────────────────────────────────
+
+  Future<void> _train() async {
+    final metaPath = _metaCtrl.text.trim();
+    final outDir   = _outDirCtrl.text.trim();
+    if (metaPath.isEmpty || outDir.isEmpty) return;
+
+    // Derive dataset_dir from the metadata.jsonl path
+    final datasetDir = metaPath.contains('/')
+        ? metaPath.substring(0, metaPath.lastIndexOf('/'))
+        : '.';
+
     widget.onRunning?.call();
     setState(() {
-      _state = _CardState.running;
-      _trainStatus = null;
+      _state = _TrainState.running;
       _logs = [];
+      _outputPath = null;
       _error = null;
     });
 
     try {
       final config = TrainConfig(
-        datasetDir: _datasetCtrl.text.trim(),
-        outputDir: _outputCtrl.text.trim(),
+        datasetDir: datasetDir,
+        outputDir: outDir,
+        modelPath: _modelCtrl.text.trim(),
         scriptPath: _scriptCtrl.text.trim(),
         rank: int.tryParse(_rankCtrl.text) ?? 16,
+        alpha: int.tryParse(_alphaCtrl.text) ?? 16,
         learningRate: double.tryParse(_lrCtrl.text) ?? 1e-4,
         numTrainEpochs: int.tryParse(_epochsCtrl.text) ?? 1,
+        batchSize: int.tryParse(_batchCtrl.text) ?? 1,
         resolution: int.tryParse(_resCtrl.text) ?? 1024,
         mixedPrecision: _mixedPrecision,
       );
 
-      final runId = await _svc.startTraining(config);
-      _startLogPolling(runId);
+      _runId = await _svc.startTraining(config);
+      _startLogPolling(_runId!);
 
-      _statusSub = _svc.watchStatus(runId).listen(
+      _statusSub = _svc.watchStatus(_runId!).listen(
         (status) {
           if (!mounted) return;
-          setState(() {
-            _trainStatus = status;
-            if (status.status == 'done') {
-              _state = _CardState.done;
-              _stopPolling();
-              widget.onComplete?.call();
-            } else if (status.status == 'failed') {
-              _state = _CardState.failed;
-              _error = status.lastError;
-              _stopPolling();
-            }
-          });
+          setState(() => _status = status);
+          if (status.status == 'done') {
+            _outputPath = status.outputPath;
+            setState(() => _state = _TrainState.done);
+            _stopPolling();
+            widget.onComplete?.call();
+            widget.onCompleteWithPath?.call(_outputPath);
+          } else if (status.status == 'failed') {
+            _error = status.lastError;
+            setState(() => _state = _TrainState.failed);
+            _stopPolling();
+          }
         },
         onError: (e) {
           if (!mounted) return;
-          setState(() {
-            _state = _CardState.failed;
-            _error = e.toString();
-          });
+          setState(() { _state = _TrainState.failed; _error = e.toString(); });
           _stopPolling();
         },
       );
     } catch (e) {
       if (!mounted) return;
-      setState(() {
-        _state = _CardState.failed;
-        _error = e.toString();
-      });
+      setState(() { _state = _TrainState.failed; _error = e.toString(); });
     }
   }
 
@@ -152,94 +159,194 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
     _statusSub?.cancel();
   }
 
-  String _formatBytes(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  // ── helpers ───────────────────────────────────────────────────────────────
+
+  String _formatElapsed(int s) {
+    final m = s ~/ 60;
+    return m > 0 ? '${m}m ${s % 60}s' : '${s}s';
   }
 
-  String _formatElapsed(int seconds) {
-    final m = seconds ~/ 60;
-    final s = seconds % 60;
-    return m > 0 ? '${m}m ${s}s' : '${s}s';
-  }
+  bool get _canTrain =>
+      _metaCtrl.text.trim().isNotEmpty &&
+      _outDirCtrl.text.trim().isNotEmpty &&
+      _state != _TrainState.running;
+
+  // ── build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-
-    Color? leftBorderColor;
-    if (_state == _CardState.done) leftBorderColor = Colors.green;
-    if (_state == _CardState.failed) leftBorderColor = cs.error;
+    const deco = InputDecoration(
+      border: OutlineInputBorder(),
+      contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      isDense: true,
+    );
 
     return Card(
-      clipBehavior: Clip.antiAlias,
-      shape: leftBorderColor != null
-          ? Border(left: BorderSide(color: leftBorderColor, width: 4))
-              .toShapeBorder()
-          : null,
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _buildHeader(cs),
+            // ── header ──
+            Row(
+              children: [
+                const Icon(Icons.model_training, size: 16),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text('Train LoRA',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                _stateChip(cs),
+              ],
+            ),
+            const SizedBox(height: 14),
+
+            // ── metadata.jsonl path ──
+            Text('metadata.jsonl',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+            const SizedBox(height: 4),
+            Row(children: [
+              Expanded(
+                child: TextField(
+                  controller: _metaCtrl,
+                  decoration: deco.copyWith(hintText: '/path/to/metadata.jsonl'),
+                  style: const TextStyle(fontSize: 12),
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+              const SizedBox(width: 6),
+              _browseButton(_pickMetadataFile),
+            ]),
+            const SizedBox(height: 10),
+
+            // ── output directory ──
+            Text('Output directory',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+            const SizedBox(height: 4),
+            Row(children: [
+              Expanded(
+                child: TextField(
+                  controller: _outDirCtrl,
+                  decoration: deco.copyWith(hintText: '/path/to/output'),
+                  style: const TextStyle(fontSize: 12),
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+              const SizedBox(width: 6),
+              _browseButton(_pickOutputDir),
+            ]),
             const SizedBox(height: 12),
-            _buildBody(cs),
+
+            // ── config toggle ──
+            GestureDetector(
+              onTap: () => setState(() => _showConfig = !_showConfig),
+              child: Row(children: [
+                Icon(_showConfig ? Icons.expand_less : Icons.expand_more,
+                    size: 16, color: cs.onSurfaceVariant),
+                const SizedBox(width: 4),
+                Text('Hyperparameters',
+                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+              ]),
+            ),
+            if (_showConfig) ...[
+              const SizedBox(height: 10),
+              _configField('Base model', _modelCtrl, deco),
+              const SizedBox(height: 6),
+              _configField('Script path', _scriptCtrl, deco),
+              const SizedBox(height: 6),
+              Row(children: [
+                Expanded(child: _configField('Learning rate', _lrCtrl, deco,
+                    type: const TextInputType.numberWithOptions(decimal: true))),
+                const SizedBox(width: 6),
+                Expanded(child: _configField('Epochs', _epochsCtrl, deco,
+                    type: TextInputType.number)),
+              ]),
+              const SizedBox(height: 6),
+              Row(children: [
+                Expanded(child: _configField('Batch size', _batchCtrl, deco,
+                    type: TextInputType.number)),
+                const SizedBox(width: 6),
+                Expanded(child: _configField('Resolution', _resCtrl, deco,
+                    type: TextInputType.number)),
+              ]),
+              const SizedBox(height: 6),
+              Row(children: [
+                Expanded(child: _configField('Rank (r)', _rankCtrl, deco,
+                    type: TextInputType.number)),
+                const SizedBox(width: 6),
+                Expanded(child: _configField('Alpha', _alphaCtrl, deco,
+                    type: TextInputType.number)),
+              ]),
+              const SizedBox(height: 6),
+              DropdownButtonFormField<String>(
+                initialValue: _mixedPrecision,
+                decoration: deco.copyWith(labelText: 'Mixed precision'),
+                style: const TextStyle(fontSize: 12),
+                items: const [
+                  DropdownMenuItem(value: 'bf16', child: Text('bf16')),
+                  DropdownMenuItem(value: 'fp16', child: Text('fp16')),
+                  DropdownMenuItem(value: 'no',   child: Text('no')),
+                ],
+                onChanged: (v) { if (v != null) setState(() => _mixedPrecision = v); },
+              ),
+            ],
+            const SizedBox(height: 14),
+
+            // ── train button ──
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: _canTrain ? _train : null,
+                icon: _state == _TrainState.running
+                    ? const SizedBox(
+                        width: 16, height: 16,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: Colors.white),
+                      )
+                    : const Icon(Icons.play_arrow, size: 16),
+                label: Text(_state == _TrainState.running ? 'Training…' : 'Train'),
+              ),
+            ),
+
+            // ── progress ──
+            if (_state == _TrainState.running) ...[
+              const SizedBox(height: 10),
+              _progressSection(cs),
+            ],
+
+            // ── success ──
+            if (_state == _TrainState.done) ...[
+              const SizedBox(height: 12),
+              _successSection(cs),
+            ],
+
+            // ── error ──
+            if (_state == _TrainState.failed && _error != null) ...[
+              const SizedBox(height: 10),
+              _errorSection(cs),
+            ],
+
+            // ── logs ──
+            if (_logs.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              _logsSection(cs),
+            ],
           ],
         ),
       ),
     );
   }
 
-  Widget _buildHeader(ColorScheme cs) {
-    return Row(
-      children: [
-        Icon(Icons.model_training, size: 16,
-            color: _state == _CardState.waiting
-                ? cs.onSurfaceVariant
-                : cs.onSurface),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            'Train LoRA',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              color: _state == _CardState.waiting ? cs.onSurfaceVariant : null,
-            ),
-          ),
-        ),
-        _buildStateChip(cs),
-      ],
-    );
-  }
+  // ── sub-widgets ───────────────────────────────────────────────────────────
 
-  Widget _buildStateChip(ColorScheme cs) {
-    String label;
-    Color bg;
-    Color fg;
-    switch (_state) {
-      case _CardState.waiting:
-        label = 'Waiting';
-        bg = cs.surfaceContainerHighest;
-        fg = cs.onSurfaceVariant;
-      case _CardState.ready:
-        label = 'Ready';
-        bg = cs.primaryContainer;
-        fg = cs.onPrimaryContainer;
-      case _CardState.running:
-        label = 'Running';
-        bg = Colors.orange.withValues(alpha: 0.2);
-        fg = Colors.orange;
-      case _CardState.done:
-        label = 'Done';
-        bg = Colors.green.withValues(alpha: 0.15);
-        fg = Colors.green;
-      case _CardState.failed:
-        label = 'Failed';
-        bg = cs.errorContainer;
-        fg = cs.onErrorContainer;
-    }
+  Widget _stateChip(ColorScheme cs) {
+    final (label, bg, fg) = switch (_state) {
+      _TrainState.idle    => ('Idle',     cs.surfaceContainerHighest, cs.onSurfaceVariant),
+      _TrainState.running => ('Running',  Colors.orange.withValues(alpha: 0.2), Colors.orange),
+      _TrainState.done    => ('Done',     Colors.green.withValues(alpha: 0.15), Colors.green),
+      _TrainState.failed  => ('Failed',   cs.errorContainer, cs.onErrorContainer),
+    };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
       decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(12)),
@@ -247,245 +354,125 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
     );
   }
 
-  Widget _buildBody(ColorScheme cs) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _buildDatasetDirField(cs),
-        const SizedBox(height: 8),
-        _buildSubtitle(cs),
-        if (_state == _CardState.ready || _state == _CardState.waiting) ...[
-          const SizedBox(height: 10),
-          _buildConfigFields(cs),
-        ],
-        const SizedBox(height: 12),
-        _buildRunButton(cs),
-        if (_state == _CardState.running) ...[
-          const SizedBox(height: 10),
-          _buildProgress(cs),
-        ],
-        if (_state == _CardState.done && _trainStatus?.outputPath != null) ...[
-          const SizedBox(height: 8),
-          SelectableText(
-            '✓ ${_trainStatus!.outputPath}',
-            style: TextStyle(fontSize: 11, color: Colors.green),
-          ),
-        ],
-        if (_error != null) ...[
-          const SizedBox(height: 8),
-          Text(_error!, style: TextStyle(fontSize: 11, color: cs.error)),
-        ],
-        if (_logs.isNotEmpty) ...[
-          const SizedBox(height: 8),
-          _buildLogsSection(cs),
-        ],
-      ],
-    );
-  }
+  Widget _browseButton(VoidCallback onTap) => IconButton.outlined(
+        icon: const Icon(Icons.folder_open, size: 16),
+        onPressed: onTap,
+        tooltip: 'Browse',
+        style: IconButton.styleFrom(
+          padding: const EdgeInsets.all(8),
+          minimumSize: const Size(36, 36),
+        ),
+      );
 
-  Widget _buildDatasetDirField(ColorScheme cs) {
+  Widget _configField(String label, TextEditingController ctrl,
+      InputDecoration base, {TextInputType? type}) {
     return TextField(
-      controller: _datasetCtrl,
-      decoration: InputDecoration(
-        labelText: 'Dataset directory',
-        hintText: '/path/to/dataset',
-        border: const OutlineInputBorder(),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        isDense: true,
-        suffixIcon: IconButton(
-          icon: const Icon(Icons.refresh, size: 16),
-          tooltip: 'Check readiness',
-          onPressed: _checkReadiness,
-        ),
-      ),
+      controller: ctrl,
+      decoration: base.copyWith(labelText: label),
       style: const TextStyle(fontSize: 12),
-      onSubmitted: (_) => _checkReadiness(),
+      keyboardType: type,
     );
   }
 
-  Widget _buildSubtitle(ColorScheme cs) {
-    switch (_state) {
-      case _CardState.waiting:
-        return Text(
-          'Waiting for metadata.jsonl',
-          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-        );
-      case _CardState.ready:
-        final r = _readiness!;
-        return Text(
-          '${r.imageCount} images · ${_formatBytes(r.fileSizeBytes)}',
-          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-        );
-      case _CardState.running:
-        final elapsed = _trainStatus?.elapsedSeconds ?? 0;
-        return Text(
-          'Running · ${_formatElapsed(elapsed)}',
-          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-        );
-      case _CardState.done:
-        final elapsed = _trainStatus?.elapsedSeconds ?? 0;
-        return Text(
-          'Completed in ${_formatElapsed(elapsed)}',
-          style: const TextStyle(fontSize: 11, color: Colors.green),
-        );
-      case _CardState.failed:
-        return Text(
-          'Failed',
-          style: TextStyle(fontSize: 11, color: cs.error),
-        );
-    }
-  }
-
-  Widget _buildConfigFields(ColorScheme cs) {
-    const inputDeco = InputDecoration(
-      border: OutlineInputBorder(),
-      contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      isDense: true,
-    );
-    return Column(
-      children: [
-        TextField(
-          controller: _outputCtrl,
-          decoration: inputDeco.copyWith(labelText: 'Output directory'),
-          style: const TextStyle(fontSize: 12),
-        ),
-        const SizedBox(height: 6),
-        TextField(
-          controller: _scriptCtrl,
-          decoration: inputDeco.copyWith(labelText: 'Script path'),
-          style: const TextStyle(fontSize: 12),
-        ),
-        const SizedBox(height: 6),
-        Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _rankCtrl,
-                decoration: inputDeco.copyWith(labelText: 'Rank'),
-                style: const TextStyle(fontSize: 12),
-                keyboardType: TextInputType.number,
-              ),
-            ),
-            const SizedBox(width: 6),
-            Expanded(
-              child: TextField(
-                controller: _epochsCtrl,
-                decoration: inputDeco.copyWith(labelText: 'Epochs'),
-                style: const TextStyle(fontSize: 12),
-                keyboardType: TextInputType.number,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 6),
-        Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _lrCtrl,
-                decoration: inputDeco.copyWith(labelText: 'Learning rate'),
-                style: const TextStyle(fontSize: 12),
-                keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              ),
-            ),
-            const SizedBox(width: 6),
-            Expanded(
-              child: TextField(
-                controller: _resCtrl,
-                decoration: inputDeco.copyWith(labelText: 'Resolution'),
-                style: const TextStyle(fontSize: 12),
-                keyboardType: TextInputType.number,
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 6),
-        DropdownButtonFormField<String>(
-          initialValue: _mixedPrecision,
-          decoration: inputDeco.copyWith(labelText: 'Mixed precision'),
-          style: const TextStyle(fontSize: 12),
-          items: const [
-            DropdownMenuItem(value: 'bf16', child: Text('bf16')),
-            DropdownMenuItem(value: 'fp16', child: Text('fp16')),
-            DropdownMenuItem(value: 'no', child: Text('no')),
-          ],
-          onChanged: (v) { if (v != null) setState(() => _mixedPrecision = v); },
-        ),
-      ],
-    );
-  }
-
-  Widget _buildRunButton(ColorScheme cs) {
-    final canRun = (_state == _CardState.ready) &&
-        _outputCtrl.text.trim().isNotEmpty;
-    return SizedBox(
-      width: double.infinity,
-      child: FilledButton.icon(
-        onPressed: canRun ? _run : null,
-        icon: _state == _CardState.running
-            ? const SizedBox(
-                width: 16,
-                height: 16,
-                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-              )
-            : const Icon(Icons.play_arrow, size: 16),
-        label: const Text('Run'),
+  Widget _progressSection(ColorScheme cs) {
+    final current = _status?.currentStep ?? 0;
+    final total   = _status?.totalSteps  ?? 0;
+    final elapsed = _status?.elapsedSeconds ?? 0;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      LinearProgressIndicator(value: total > 0 ? current / total : null),
+      const SizedBox(height: 4),
+      Text(
+        total > 0
+            ? 'Step $current / $total  ·  ${_formatElapsed(elapsed)}'
+            : 'Starting…  ·  ${_formatElapsed(elapsed)}',
+        style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
       ),
-    );
+    ]);
   }
 
-  Widget _buildProgress(ColorScheme cs) {
-    final current = _trainStatus?.currentStep ?? 0;
-    final total = _trainStatus?.totalSteps ?? 0;
-    final progress = (total > 0) ? current / total : null;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        LinearProgressIndicator(value: progress),
-        if (total > 0)
-          Padding(
-            padding: const EdgeInsets.only(top: 4),
-            child: Text(
-              'Step $current / $total',
-              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-            ),
+  Widget _successSection(ColorScheme cs) {
+    final path = _outputPath ?? '(path not returned by backend)';
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.green.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.green.withValues(alpha: 0.3)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Row(children: [
+          Icon(Icons.check_circle_outline, size: 14, color: Colors.green),
+          SizedBox(width: 6),
+          Text('Training complete',
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.green)),
+        ]),
+        const SizedBox(height: 6),
+        SelectableText(path, style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: () {
+            Clipboard.setData(ClipboardData(text: path));
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Path copied to clipboard'), duration: Duration(seconds: 2)),
+            );
+          },
+          icon: const Icon(Icons.copy, size: 14),
+          label: const Text('Copy path', style: TextStyle(fontSize: 12)),
+          style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            minimumSize: Size.zero,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
           ),
-      ],
+        ),
+      ]),
     );
   }
 
-  Widget _buildLogsSection(ColorScheme cs) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        GestureDetector(
-          onTap: () => setState(() => _showLogs = !_showLogs),
-          child: Row(
-            children: [
-              Icon(_showLogs ? Icons.expand_less : Icons.expand_more, size: 16,
-                  color: cs.onSurfaceVariant),
+  Widget _errorSection(ColorScheme cs) => Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: cs.errorContainer,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(Icons.error_outline, size: 16, color: cs.onErrorContainer),
+          const SizedBox(width: 8),
+          Expanded(
+            child: SelectableText(_error!,
+                style: TextStyle(fontSize: 11, color: cs.onErrorContainer)),
+          ),
+        ]),
+      );
+
+  Widget _logsSection(ColorScheme cs) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          GestureDetector(
+            onTap: () => setState(() => _showLogs = !_showLogs),
+            child: Row(children: [
+              Icon(_showLogs ? Icons.expand_less : Icons.expand_more,
+                  size: 16, color: cs.onSurfaceVariant),
               const SizedBox(width: 4),
               Text('Logs (${_logs.length} lines)',
                   style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-            ],
+            ]),
           ),
-        ),
-        if (_showLogs)
-          Container(
-            margin: const EdgeInsets.only(top: 6),
-            height: 160,
-            decoration: BoxDecoration(
-              color: cs.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(6),
+          if (_showLogs)
+            Container(
+              margin: const EdgeInsets.only(top: 6),
+              height: 180,
+              decoration: BoxDecoration(
+                color: cs.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: _LogView(lines: _logs),
             ),
-            child: _LogView(lines: _logs),
-          ),
-      ],
-    );
-  }
+        ],
+      );
 }
 
-// Auto-scrolling log view
+// ── auto-scrolling log view ──────────────────────────────────────────────────
+
 class _LogView extends StatefulWidget {
   final List<String> lines;
   const _LogView({required this.lines});
@@ -498,22 +485,17 @@ class _LogViewState extends State<_LogView> {
   final _scroll = ScrollController();
 
   @override
-  void didUpdateWidget(_LogView oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.lines.length != oldWidget.lines.length) {
+  void didUpdateWidget(_LogView old) {
+    super.didUpdateWidget(old);
+    if (widget.lines.length != old.lines.length) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_scroll.hasClients) {
-          _scroll.jumpTo(_scroll.position.maxScrollExtent);
-        }
+        if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
       });
     }
   }
 
   @override
-  void dispose() {
-    _scroll.dispose();
-    super.dispose();
-  }
+  void dispose() { _scroll.dispose(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) {
@@ -524,40 +506,8 @@ class _LogViewState extends State<_LogView> {
       itemCount: widget.lines.length,
       itemBuilder: (_, i) => Text(
         widget.lines[i],
-        style: TextStyle(
-          fontSize: 10,
-          fontFamily: 'monospace',
-          color: cs.onSurfaceVariant,
-        ),
+        style: TextStyle(fontSize: 10, fontFamily: 'monospace', color: cs.onSurfaceVariant),
       ),
     );
   }
-}
-
-extension on Border {
-  ShapeBorder toShapeBorder() => _BorderShape(this);
-}
-
-class _BorderShape extends ShapeBorder {
-  final Border border;
-  const _BorderShape(this.border);
-
-  @override
-  EdgeInsetsGeometry get dimensions => EdgeInsets.only(left: border.left.width);
-
-  @override
-  Path getInnerPath(Rect rect, {TextDirection? textDirection}) =>
-      Path()..addRect(rect);
-
-  @override
-  Path getOuterPath(Rect rect, {TextDirection? textDirection}) =>
-      Path()..addRect(rect);
-
-  @override
-  void paint(Canvas canvas, Rect rect, {TextDirection? textDirection}) {
-    border.paint(canvas, rect);
-  }
-
-  @override
-  ShapeBorder scale(double t) => this;
 }

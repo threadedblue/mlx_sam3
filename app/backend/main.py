@@ -38,6 +38,14 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 
 from services import SegmentationService, serialize_state
+from lora_inferencer import (
+    validate_inference_inputs,
+    run_inference as _run_inference_fn,
+    release_pipeline as _release_inference_pipeline,
+    get_cached_model_path,
+    free_vram_mb,
+    sha256_of_file as _infer_sha256,
+)
 
 # Global model and processor
 model = None
@@ -46,6 +54,8 @@ service = None
 
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR.parent.parent / "storage" / "sessions"
+INFERENCE_DIR = BASE_DIR.parent.parent / "storage" / "inference"
+INFERENCE_CONFIG = BASE_DIR.parent.parent / "storage" / "inference_config.json"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -72,9 +82,17 @@ async def lifespan(app: FastAPI):
         genai.configure(api_key=api_key)
         print("Gemini SDK configured.")
 
+    # Pre-load last-used inference model in background (non-blocking)
+    _maybe_preload_inference_model()
+
     yield
 
-    # Cleanup if needed
+    # Release inference pipeline VRAM on shutdown
+    try:
+        _release_inference_pipeline()
+        print("Inference pipeline released.")
+    except Exception as exc:
+        print(f"Warning: error releasing inference pipeline: {exc}")
 
 app = FastAPI(
     title="SAM3 Segmentation API for MLX",
@@ -131,7 +149,16 @@ class LoraAppendRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "model_loaded": model is not None}
+    info: Dict[str, Any] = {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "inference_model_loaded": get_cached_model_path() is not None,
+        "inference_cached_model": get_cached_model_path(),
+    }
+    vram = free_vram_mb()
+    if vram is not None:
+        info["vram_free_mb"] = vram
+    return info
 
 
 @app.get("/")
@@ -502,69 +529,89 @@ async def update_state(request: SessionRequest):
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 # ── LoRA training run state ──────────────────────────────────────────────────
+import threading
+from lora_trainer import validate_inputs, train_lora, sha256_of_file
+
 _lora_runs: Dict[str, Dict[str, Any]] = {}
 
 
 class LoraTrainRequest(BaseModel):
     dataset_dir: str
     output_dir: str
-    script_path: str = "train_dreambooth_lora_flux.py"
+    model_path: str = "runwayml/stable-diffusion-v1-5"
+    script_path: str = "train_dreambooth_lora_flux.py"  # unused by in-process trainer
     rank: int = 16
+    alpha: int = 16
     learning_rate: float = 1e-4
     num_train_epochs: int = 1
-    resolution: int = 1024
-    mixed_precision: str = "bf16"
+    batch_size: int = 1
+    resolution: int = 512
+    mixed_precision: str = "no"
+
+    @property
+    def output_path(self) -> str:
+        return str(Path(self.output_dir) / "lora_output.safetensors")
 
 
 async def _run_training(run_id: str, req: LoraTrainRequest) -> None:
     run = _lora_runs[run_id]
-    cmd = [
-        sys.executable, req.script_path,
-        "--pretrained_model_name_or_path", "black-forest-labs/FLUX.1-dev",
-        "--instance_data_dir", req.dataset_dir,
-        "--output_dir", req.output_dir,
-        "--resolution", str(req.resolution),
-        "--train_batch_size", "1",
-        "--gradient_accumulation_steps", "4",
-        "--num_train_epochs", str(req.num_train_epochs),
-        "--learning_rate", str(req.learning_rate),
-        "--lr_scheduler", "constant",
-        "--mixed_precision", req.mixed_precision,
-        "--rank", str(req.rank),
-    ]
+
+    def log_cb(line: str) -> None:
+        run["logs"].append(line)
+        m = re.search(r"Steps:\s*(\d+)/(\d+)", line)
+        if m:
+            run["current_step"] = int(m.group(1))
+            run["total_steps"] = int(m.group(2))
+
+    def progress_cb(step: int, total: int, loss: float) -> None:
+        run["current_step"] = step
+        run["total_steps"] = total
+
+    cancel_event: threading.Event = run["cancel_event"]
+
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        output_path = await asyncio.to_thread(
+            train_lora,
+            dataset_dir=req.dataset_dir,
+            output_path=req.output_path,
+            model_path=req.model_path,
+            rank=req.rank,
+            alpha=req.alpha,
+            learning_rate=req.learning_rate,
+            num_epochs=req.num_train_epochs,
+            batch_size=req.batch_size,
+            resolution=req.resolution,
+            mixed_precision=req.mixed_precision,
+            log_cb=log_cb,
+            progress_cb=progress_cb,
+            cancelled=cancel_event.is_set,
         )
-        async for raw in proc.stdout:
-            line = raw.decode(errors="replace").rstrip()
-            run["logs"].append(line)
-            m = re.search(r"Steps:\s*(\d+)/(\d+)", line)
-            if m:
-                run["current_step"] = int(m.group(1))
-                run["total_steps"] = int(m.group(2))
-        await proc.wait()
-        if proc.returncode == 0:
-            safetensors = sorted(
-                Path(req.output_dir).glob("**/*.safetensors"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            run["output_path"] = str(safetensors[0]) if safetensors else None
-            run["status"] = "done"
-        else:
-            run["status"] = "failed"
-            run["last_error"] = next(
-                (l for l in reversed(run["logs"]) if l.strip()), "Unknown error"
-            )
+        run["output_path"] = output_path
+        run["output_checksum"] = sha256_of_file(output_path)
+        run["status"] = "done"
+
+    except RuntimeError as exc:
+        run["status"] = "failed"
+        run["last_error"] = str(exc)
+        _cleanup_partial_output(req.output_path)
+
     except Exception as exc:
         run["status"] = "failed"
         run["last_error"] = str(exc)
-        run["logs"].append(f"EXCEPTION: {exc}")
+        run["logs"].append(f"EXCEPTION: {traceback.format_exc()}")
+        _cleanup_partial_output(req.output_path)
+
     finally:
         run["completed_at"] = time.time()
+
+
+def _cleanup_partial_output(output_path: str) -> None:
+    try:
+        p = Path(output_path)
+        if p.exists():
+            p.unlink()
+    except OSError:
+        pass
 
 
 @app.get("/pipeline/lora_train/ready")
@@ -573,7 +620,7 @@ async def lora_train_ready(dataset_dir: str):
     jsonl_path = Path(dataset_dir) / "metadata.jsonl"
     if not jsonl_path.exists():
         return {"ready": False, "image_count": 0, "file_size_bytes": 0}
-    lines = [l for l in jsonl_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    lines = [ln for ln in jsonl_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     return {
         "ready": True,
         "image_count": len(lines),
@@ -583,7 +630,15 @@ async def lora_train_ready(dataset_dir: str):
 
 @app.post("/pipeline/lora_train/run")
 async def lora_train_run(request: LoraTrainRequest):
-    """Launch training as a background subprocess and return a run_id."""
+    """Validate inputs, then launch in-process LoRA training and return a run_id."""
+    error = validate_inputs(
+        dataset_dir=request.dataset_dir,
+        output_path=request.output_path,
+        model_path=request.model_path,
+    )
+    if error:
+        raise HTTPException(status_code=422, detail=error)
+
     run_id = str(uuid.uuid4())
     _lora_runs[run_id] = {
         "status": "running",
@@ -593,15 +648,29 @@ async def lora_train_run(request: LoraTrainRequest):
         "completed_at": None,
         "logs": [],
         "output_path": None,
+        "output_checksum": None,
         "last_error": None,
+        "cancel_event": threading.Event(),
     }
     asyncio.create_task(_run_training(run_id, request))
     return {"run_id": run_id}
 
 
+@app.post("/pipeline/lora_train/cancel/{run_id}")
+async def lora_train_cancel(run_id: str):
+    """Signal the training thread to stop at the next cancellation check."""
+    run = _lora_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] != "running":
+        return {"message": "Run is not active"}
+    run["cancel_event"].set()
+    return {"message": "Cancellation requested"}
+
+
 @app.get("/pipeline/lora_train/status/{run_id}")
 async def lora_train_status(run_id: str):
-    """Return current training status and progress."""
+    """Return current training status, progress, and checksum on completion."""
     run = _lora_runs.get(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -612,13 +681,14 @@ async def lora_train_status(run_id: str):
         "total_steps": run["total_steps"],
         "elapsed_seconds": elapsed,
         "output_path": run["output_path"],
+        "output_checksum": run.get("output_checksum"),
         "last_error": run["last_error"],
     }
 
 
 @app.get("/pipeline/lora_train/logs/{run_id}")
 async def lora_train_logs(run_id: str):
-    """Return all accumulated stdout/stderr lines for a run."""
+    """Return all accumulated log lines for a run."""
     run = _lora_runs.get(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -650,6 +720,202 @@ async def get_lora_count():
         return {"count": 0}
     count = sum(1 for line in jsonl_path.open("r", encoding="utf-8") if line.strip())
     return {"count": count}
+
+
+# ── LoRA inference run state ─────────────────────────────────────────────────
+
+_infer_runs: Dict[str, Dict[str, Any]] = {}
+
+
+class InferenceRequest(BaseModel):
+    lora_path: str
+    model_path: str = "black-forest-labs/FLUX.1-dev"
+    prompt: str
+    lora_strength: float = 0.8
+    steps: int = 28
+    guidance_scale: float = 3.5
+    seed: int = 42
+    output_dir: str = ""
+    continuity_image_b64: Optional[str] = None
+    denoise_strength: float = 0.75
+
+
+def _save_inference_config(model_path: str) -> None:
+    try:
+        INFERENCE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        INFERENCE_CONFIG.write_text(
+            json.dumps({"last_model_path": model_path}), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _maybe_preload_inference_model() -> None:
+    """Background pre-load of the last-used inference model, if recorded."""
+    if not INFERENCE_CONFIG.exists():
+        return
+    try:
+        cfg = json.loads(INFERENCE_CONFIG.read_text(encoding="utf-8"))
+        last_model = cfg.get("last_model_path", "")
+    except Exception:
+        return
+    if not last_model:
+        return
+
+    async def _preload():
+        try:
+            print(f"[startup] pre-loading inference model {last_model!r} …")
+            from lora_inferencer import _ensure_pipeline  # noqa: PLC0415
+            # We need at least one LoRA path — skip if there's no recorded LoRA.
+            last_lora = cfg.get("last_lora_path", "")
+            if not last_lora or not Path(last_lora).exists():
+                print("[startup] no valid last LoRA recorded; skipping pre-load.")
+                return
+            await asyncio.to_thread(
+                _ensure_pipeline, last_model, last_lora, False, print
+            )
+            print(f"[startup] inference model ready: {last_model!r}")
+        except Exception as exc:
+            print(f"[startup] inference pre-load failed (non-fatal): {exc}")
+
+    asyncio.ensure_future(_preload())
+
+
+async def _run_inference_task(run_id: str, req: InferenceRequest, output_path: str) -> None:
+    run = _infer_runs[run_id]
+
+    def log_cb(line: str) -> None:
+        run["logs"].append(line)
+
+    def progress_cb(step: int, total: int) -> None:
+        run["current_step"] = step
+        run["total_steps"] = total
+
+    cancel_event: threading.Event = run["cancel_event"]
+    continuity_bytes: Optional[bytes] = (
+        base64.b64decode(req.continuity_image_b64)
+        if req.continuity_image_b64
+        else None
+    )
+
+    try:
+        result_path = await asyncio.to_thread(
+            _run_inference_fn,
+            lora_path=req.lora_path,
+            model_path=req.model_path,
+            prompt=req.prompt,
+            lora_strength=req.lora_strength,
+            steps=req.steps,
+            guidance_scale=req.guidance_scale,
+            seed=req.seed,
+            output_path=output_path,
+            continuity_image_bytes=continuity_bytes,
+            denoise_strength=req.denoise_strength,
+            log_cb=log_cb,
+            progress_cb=progress_cb,
+            cancelled=cancel_event.is_set,
+        )
+        run["output_path"] = result_path
+        run["output_checksum"] = _infer_sha256(result_path)
+        run["status"] = "done"
+        _save_inference_config(req.model_path)
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        run["status"] = "cancelled" if "cancel" in msg else "failed"
+        run["last_error"] = str(exc)
+    except Exception as exc:
+        run["status"] = "failed"
+        run["last_error"] = str(exc)
+        run["logs"].append(f"EXCEPTION: {traceback.format_exc()}")
+    finally:
+        run["completed_at"] = time.time()
+
+
+@app.post("/inference/generate")
+async def inference_generate(request: InferenceRequest):
+    """Validate inputs, start inference in the background, return a run_id."""
+    error = validate_inference_inputs(
+        lora_path=request.lora_path,
+        model_path=request.model_path,
+        prompt=request.prompt,
+        output_dir=request.output_dir,
+    )
+    if error:
+        raise HTTPException(status_code=422, detail=error)
+
+    out_dir = request.output_dir.strip() or str(INFERENCE_DIR)
+    output_path = str(Path(out_dir) / f"inference_{int(time.time()*1000)}.png")
+
+    run_id = str(uuid.uuid4())
+    _infer_runs[run_id] = {
+        "status": "running",
+        "current_step": 0,
+        "total_steps": request.steps,
+        "started_at": time.time(),
+        "completed_at": None,
+        "logs": [],
+        "output_path": None,
+        "output_checksum": None,
+        "last_error": None,
+        "cancel_event": threading.Event(),
+    }
+    asyncio.create_task(_run_inference_task(run_id, request, output_path))
+    return {"run_id": run_id}
+
+
+@app.get("/inference/status/{run_id}")
+async def inference_status(run_id: str):
+    """Return progress, status, and result path for a generation run."""
+    run = _infer_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    total = run["total_steps"] or 1
+    elapsed = int((run["completed_at"] or time.time()) - run["started_at"])
+    return {
+        "status": run["status"],
+        "progress": min(run["current_step"] / total, 1.0),
+        "current_step": run["current_step"],
+        "total_steps": run["total_steps"],
+        "elapsed_seconds": elapsed,
+        "output_path": run["output_path"],
+        "output_checksum": run.get("output_checksum"),
+        "last_error": run["last_error"],
+    }
+
+
+@app.get("/inference/image/{run_id}")
+async def inference_image(run_id: str):
+    """Return the generated PNG as raw bytes once the run is done."""
+    run = _infer_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] != "done" or not run["output_path"]:
+        raise HTTPException(status_code=404, detail="Image not yet available")
+    path = Path(run["output_path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Image file missing on disk")
+    return FileResponse(str(path), media_type="image/png")
+
+
+@app.post("/inference/cancel/{run_id}")
+async def inference_cancel(run_id: str):
+    """Signal the inference thread to stop at its next cancellation check."""
+    run = _infer_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] != "running":
+        return {"message": "Run is not active"}
+    run["cancel_event"].set()
+    return {"message": "Cancellation requested"}
+
+
+@app.get("/inference/logs/{run_id}")
+async def inference_logs(run_id: str):
+    """Return all accumulated log lines for an inference run."""
+    run = _infer_runs.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run["logs"]
 
 
 app.mount(

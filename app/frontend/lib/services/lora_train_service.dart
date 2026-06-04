@@ -23,20 +23,26 @@ class ReadinessResult {
 class TrainConfig {
   final String datasetDir;
   final String outputDir;
+  final String modelPath;
   final String scriptPath;
   final int rank;
+  final int alpha;
   final double learningRate;
   final int numTrainEpochs;
+  final int batchSize;
   final int resolution;
   final String mixedPrecision;
 
   TrainConfig({
     required this.datasetDir,
     required this.outputDir,
+    this.modelPath = 'black-forest-labs/FLUX.1-dev',
     this.scriptPath = 'train_dreambooth_lora_flux.py',
     this.rank = 16,
+    this.alpha = 16,
     this.learningRate = 1e-4,
     this.numTrainEpochs = 1,
+    this.batchSize = 1,
     this.resolution = 1024,
     this.mixedPrecision = 'bf16',
   });
@@ -44,10 +50,13 @@ class TrainConfig {
   Map<String, dynamic> toJson() => {
         'dataset_dir': datasetDir,
         'output_dir': outputDir,
+        'model_path': modelPath,
         'script_path': scriptPath,
         'rank': rank,
+        'alpha': alpha,
         'learning_rate': learningRate,
         'num_train_epochs': numTrainEpochs,
+        'batch_size': batchSize,
         'resolution': resolution,
         'mixed_precision': mixedPrecision,
       };

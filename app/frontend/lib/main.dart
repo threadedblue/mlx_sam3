@@ -24,6 +24,7 @@ import 'package:provider/provider.dart';
 import 'layered_segmentation_canvas.dart';
 import 'training_data_card.dart';
 import 'lora_train_card.dart';
+import 'lora_inference_card.dart';
 import 'layer_state.dart';
 import 'models/result_datum.dart';
 import 'widgets/result_cell.dart';
@@ -120,6 +121,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<ResultDatum> _loraTrainPrepResult = [];
   bool _loraTrainRunning = false;
   List<ResultDatum> _loraTrainResult = [];
+  String? _loraOutputPath; // forwarded to LoraInferenceCard
   Timer? _healthCheckTimer;
 
   // Layer State
@@ -723,8 +725,14 @@ class _HomeScreenState extends State<HomeScreen> {
                     LoraTrainCard(
                       onRunning: () => setState(() { _loraTrainRunning = true; _loraTrainResult = []; }),
                       onComplete: () => setState(() { _loraTrainRunning = false; _loraTrainResult = [const ResultDatum(label: 'Status', value: 'Done')]; }),
+                      onCompleteWithPath: (path) => setState(() => _loraOutputPath = path),
                     ),
                     ResultCell(isRunning: _loraTrainRunning, data: _loraTrainResult),
+                  ),
+                  const SizedBox(height: 16),
+                  _buildCardRow(
+                    LoraInferenceCard(initialLoraPath: _loraOutputPath),
+                    const ResultCell(isRunning: false, data: []),
                   ),
                   const SizedBox(height: 16),
                   _buildCardRow(_buildPerformanceCard(), const ResultCell(isRunning: false, data: [])),
