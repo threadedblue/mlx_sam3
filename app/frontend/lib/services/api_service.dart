@@ -199,19 +199,6 @@ class ApiService {
     }
   }
 
-  Future<void> createSessionDirs(String sessionId) async {
-    try {
-      final response = await http.post(Uri.parse('$baseUrl/createSessionDirs/$sessionId'),
-          headers: {'Content-Type': 'application/json'});
-      if (response.statusCode != 200) {
-        throw Exception('Failed to create session directories');
-      }
-    } catch (e) {
-      print('Error creating session directories: $e');
-      rethrow;
-    }
-  }
-
   Future<void> deleteSession(String sessionId) async {
     try {
       final response = await http.delete(Uri.parse('$baseUrl/deleteSession/$sessionId'));
@@ -349,6 +336,23 @@ class ApiService {
       }
     } catch (e) {
       print('Error generating caption: $e');
+      rethrow;
+    }
+  }
+
+  Future<Map<String, dynamic>> captionAllSegments(String sessionId, String prompt) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/lora/caption_all'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId, 'prompt': prompt}),
+      );
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      throw Exception('Caption all failed: ${response.body}');
+    } catch (e) {
+      print('Error captioning segments: $e');
       rethrow;
     }
   }

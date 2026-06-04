@@ -6,6 +6,9 @@ Pillow
 google-generativeai
 mlx
 python-dotenv
+jsonschema>=4.0.0
+# LoRA inference (MLX local)
+mflux>=0.9.0
 # LoRA training
 torch
 torchvision

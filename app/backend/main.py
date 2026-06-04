@@ -45,6 +45,10 @@ from lora_inferencer import (
     get_cached_model_path,
     free_vram_mb,
     sha256_of_file as _infer_sha256,
+    load_provider_from_config,
+    list_providers,
+    get_active_provider_name,
+    set_active_provider,
 )
 
 # Global model and processor
@@ -81,6 +85,9 @@ async def lifespan(app: FastAPI):
     else:
         genai.configure(api_key=api_key)
         print("Gemini SDK configured.")
+
+    # Restore last-used inference provider and Cloud Run URL from config.
+    load_provider_from_config()
 
     # Pre-load last-used inference model in background (non-blocking)
     _maybe_preload_inference_model()
@@ -247,7 +254,8 @@ async def segment_with_text(request: TextPromptRequest):
         start = time.perf_counter()
         results = serialize_state(state)
         end = time.perf_counter()
-        print(f"Serialization took {end - start:.4f} seconds")
+        mask_count = len(results.get("masks") or [])
+        print(f"Serialization took {end - start:.4f} seconds | masks={mask_count} | inference={processing_time_ms:.1f}ms")
         
         return {
             "session_id": request.session_id,
@@ -440,7 +448,7 @@ async def list_sessions():
     return sessions_list
 
 
-@app.get("/newSession")
+@app.post("/newSession")
 async def new_session():
     """Creates a new session ID and its storage directories."""
     session_id = service.create_session()
@@ -720,6 +728,57 @@ async def get_lora_count():
         return {"count": 0}
     count = sum(1 for line in jsonl_path.open("r", encoding="utf-8") if line.strip())
     return {"count": count}
+
+
+class LoraCaptionAllRequest(BaseModel):
+    session_id: str
+    prompt: str
+
+
+@app.post("/lora/caption_all")
+async def caption_all_segments(request: LoraCaptionAllRequest):
+    """Caption all segments for a session via Gemini and write to metadata.jsonl."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not set")
+    try:
+        result = await service.caption_all_segments(request.session_id, request.prompt)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error captioning segments: {str(e)}")
+
+
+# ── Inference provider management ────────────────────────────────────────────
+
+class ProviderSwitchRequest(BaseModel):
+    provider: str              # "mlx" | "cloud_run"
+    url: str = ""              # required when provider == "cloud_run"
+
+
+@app.get("/inference/provider")
+async def get_provider():
+    """Return the active provider and status of all registered providers."""
+    return {
+        "active": get_active_provider_name(),
+        "providers": list_providers(),
+    }
+
+
+@app.post("/inference/provider")
+async def switch_provider(request: ProviderSwitchRequest):
+    """Switch the active inference provider (persisted to inference_config.json)."""
+    try:
+        set_active_provider(request.provider, url=request.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {
+        "active": get_active_provider_name(),
+        "providers": list_providers(),
+    }
 
 
 # ── LoRA inference run state ─────────────────────────────────────────────────

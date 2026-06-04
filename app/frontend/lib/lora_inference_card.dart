@@ -62,6 +62,13 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
   String?    _runId;
   StreamSubscription<InferStatus>? _statusSub;
 
+  // ── provider state ────────────────────────────────────────────────────────
+  List<ProviderInfo> _providers = [];
+  String _activeProvider        = 'mlx';
+  bool _switchingProvider       = false;
+  // Cloud Run URL — shown in a dialog when the user selects cloud_run.
+  final _cloudRunUrlCtrl = TextEditingController();
+
   @override
   void initState() {
     super.initState();
@@ -71,6 +78,7 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
     }
     _loadPersistedModel();
     _modelCtrl.addListener(_persistModel);
+    _loadProviders();
   }
 
   @override
@@ -93,6 +101,7 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
     _stepsCtrl.dispose();
     _guidanceCtrl.dispose();
     _seedCtrl.dispose();
+    _cloudRunUrlCtrl.dispose();
     super.dispose();
   }
 
@@ -120,6 +129,72 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
       final file = await _prefsFile;
       await file.writeAsString(json.encode({'model_path': _modelCtrl.text}));
     } catch (_) {}
+  }
+
+  // ── provider management ───────────────────────────────────────────────────
+
+  Future<void> _loadProviders() async {
+    try {
+      final list = await _svc.getProviders();
+      if (!mounted) return;
+      setState(() {
+        _providers = list;
+        final active = list.where((p) => p.active).firstOrNull;
+        if (active != null) _activeProvider = active.name;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _switchProvider(String name) async {
+    if (name == 'cloud_run' && _cloudRunUrlCtrl.text.trim().isEmpty) {
+      // Ask for the URL before switching.
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Cloud Run URL'),
+          content: TextField(
+            controller: _cloudRunUrlCtrl,
+            decoration: const InputDecoration(
+              hintText: 'https://flux-infer-xxxx-uc.a.run.app',
+              border: OutlineInputBorder(),
+            ),
+            autofocus: true,
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Connect'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+    }
+
+    setState(() => _switchingProvider = true);
+    try {
+      final list = await _svc.setProvider(
+        name,
+        url: name == 'cloud_run' ? _cloudRunUrlCtrl.text.trim() : '',
+      );
+      if (!mounted) return;
+      setState(() {
+        _providers = list;
+        _activeProvider = name;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Provider switch failed: $e'),
+            duration: const Duration(seconds: 3)),
+      );
+    } finally {
+      if (mounted) setState(() => _switchingProvider = false);
+    }
   }
 
   // ── trigger word hint (reads metadata.jsonl sibling of the LoRA file) ─────
@@ -410,12 +485,24 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
   // ── sub-widgets ───────────────────────────────────────────────────────────
 
   Widget _header(ColorScheme cs) {
-    final (label, bg, fg) = switch (_state) {
+    final (stateLabel, stateBg, stateFg) = switch (_state) {
       _InferState.idle    => ('Idle',       cs.surfaceContainerHighest,           cs.onSurfaceVariant),
       _InferState.running => ('Generating', Colors.orange.withValues(alpha: 0.2), Colors.orange),
       _InferState.done    => ('Done',       Colors.green.withValues(alpha: 0.15), Colors.green),
       _InferState.failed  => ('Failed',     cs.errorContainer,                    cs.onErrorContainer),
     };
+
+    // Build provider label list for the dropdown.
+    final providerItems = _providers.isEmpty
+        ? [
+            const DropdownMenuItem(value: 'mlx',       child: Text('MLX',        style: TextStyle(fontSize: 11))),
+            const DropdownMenuItem(value: 'cloud_run', child: Text('Cloud Run',  style: TextStyle(fontSize: 11))),
+          ]
+        : _providers.map((p) => DropdownMenuItem(
+              value: p.name,
+              child: Text(p.label, style: const TextStyle(fontSize: 11)),
+            )).toList();
+
     return Row(children: [
       const Icon(Icons.image_outlined, size: 16),
       const SizedBox(width: 8),
@@ -423,11 +510,38 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
         child: Text('LoRA Inference',
             style: TextStyle(fontWeight: FontWeight.bold)),
       ),
+      // ── provider picker ──
+      if (_switchingProvider)
+        const SizedBox(
+          width: 14, height: 14,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        )
+      else
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+          decoration: BoxDecoration(
+            border: Border.all(color: cs.outlineVariant),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: _activeProvider,
+              isDense: true,
+              style: TextStyle(fontSize: 11, color: cs.onSurface),
+              items: providerItems,
+              onChanged: _state == _InferState.running
+                  ? null
+                  : (v) { if (v != null) _switchProvider(v); },
+            ),
+          ),
+        ),
+      const SizedBox(width: 6),
+      // ── state chip ──
       Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-        decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(12)),
-        child: Text(label,
-            style: TextStyle(fontSize: 11, color: fg, fontWeight: FontWeight.w600)),
+        decoration: BoxDecoration(color: stateBg, borderRadius: BorderRadius.circular(12)),
+        child: Text(stateLabel,
+            style: TextStyle(fontSize: 11, color: stateFg, fontWeight: FontWeight.w600)),
       ),
     ]);
   }

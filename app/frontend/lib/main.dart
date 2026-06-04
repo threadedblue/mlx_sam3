@@ -117,6 +117,13 @@ class _HomeScreenState extends State<HomeScreen> {
   List<ResultDatum> _downloadResult = [];
   bool _segmentsRunning = false;
   List<ResultDatum> _segmentsResult = [];
+  bool _captionRunning = false;
+  List<ResultDatum> _captionResult = [];
+  List<String> _segmentUrls = [];
+  int? _selectedSegmentIndex;
+  Set<int> _captionedSegmentIndices = {};
+  Map<String, dynamic>? _lastCaptionEntry;
+  String? _captionRawError;
   bool _loraTrainPrepRunning = false;
   List<ResultDatum> _loraTrainPrepResult = [];
   bool _loraTrainRunning = false;
@@ -464,6 +471,7 @@ class _HomeScreenState extends State<HomeScreen> {
         );
         _addTiming("Create Segments", response['processing_time_ms']);
         setState(() => _segmentsResult = [const ResultDatum(label: 'Status', value: 'Done')]);
+        _loadSegmentUrls();
       }
     } catch (e) {
       if (!mounted) return;
@@ -534,7 +542,6 @@ class _HomeScreenState extends State<HomeScreen> {
         _error = null;
         _textController.clear();
       });
-      await _api.createSessionDirs(_sessionId!);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("New session created: $newId")),
       );
@@ -642,28 +649,50 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _handleGenerateCaption() async {
-    if (_imageBytes == null) return;
-    setState(() => _isLoading = true);
+  Future<void> _loadSegmentUrls() async {
+    if (_sessionId == null) return;
     try {
-      final caption = await _api.generateCaption(
-        _imageBytes!,
-        filename: _imageName ?? 'upload.jpg',
-      );
+      final urls = await _api.showSegments(_sessionId!);
       if (!mounted) return;
       setState(() {
-        _textController.text = caption;
+        _segmentUrls = urls;
+        _selectedSegmentIndex = null;
+        _captionedSegmentIndices = {};
+        _lastCaptionEntry = null;
+        _captionRawError = null;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("AI Caption generated and copied to Text Prompt field.")),
+    } catch (e) {
+      debugPrint('Failed to load segment URLs: $e');
+    }
+  }
+
+  Future<void> _handleGenerateCaption() async {
+    if (_sessionId == null || _selectedSegmentIndex == null || _textController.text.isEmpty) return;
+    setState(() {
+      _isLoading = true;
+      _captionRunning = true;
+      _captionResult = [];
+      _lastCaptionEntry = null;
+      _captionRawError = null;
+    });
+    try {
+      final response = await _api.appendLoraEntry(
+        _sessionId!, _selectedSegmentIndex!, _textController.text,
       );
-      _addTiming("AI Caption", 0); // Just to show it happened
+      if (!mounted) return;
+      final entry = response['entry'] as Map<String, dynamic>?;
+      final count = response['entry_count'] as int? ?? 0;
+      setState(() {
+        _captionedSegmentIndices = {..._captionedSegmentIndices, _selectedSegmentIndex!};
+        _lastCaptionEntry = entry;
+        _captionResult = [ResultDatum(label: 'Entries', value: '$count in metadata.jsonl')];
+      });
     } catch (e) {
       if (!mounted) return;
-      setState(() => _error = e.toString());
+      setState(() => _captionRawError = e.toString());
     } finally {
       if (!mounted) return;
-      setState(() => _isLoading = false);
+      setState(() { _isLoading = false; _captionRunning = false; });
     }
   }
 
@@ -690,17 +719,18 @@ class _HomeScreenState extends State<HomeScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // Sidebar + middle result column (scroll together)
-          SingleChildScrollView(
+          SizedBox(
+            width: 520,
+            child: SingleChildScrollView(
             padding: const EdgeInsets.all(16),
-            child: IntrinsicWidth(
-              child: Column(
+            child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _buildCardRow(_buildSessionCard(),      const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
                   _buildCardRow(_buildUploadCard(),       ResultCell(isRunning: _imageSourceRunning, data: _imageSourceResult)),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildCaptionCard(),      const ResultCell(isRunning: false, data: [])),
+                  _buildCardRow(_buildCaptionCard(),      ResultCell(isRunning: _captionRunning, data: _captionResult)),
                   const SizedBox(height: 16),
                   _buildCardRow(_buildTextPromptCard(),   ResultCell(isRunning: _textPromptRunning, data: _textPromptResult)),
                   const SizedBox(height: 16),
@@ -804,10 +834,7 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           SizedBox(width: 340, child: card),
           const SizedBox(width: 8),
-          ConstrainedBox(
-            constraints: const BoxConstraints(minWidth: 140, maxWidth: 220),
-            child: cell,
-          ),
+          SizedBox(width: 140, child: cell),
         ],
       ),
     );
@@ -955,39 +982,167 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildCaptionCard() {
+    final cs = Theme.of(context).colorScheme;
+    final canCaption = _sessionId != null
+        && _selectedSegmentIndex != null
+        && _textController.text.isNotEmpty
+        && !_isLoading;
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Row(
+            // ── Header ──────────────────────────────────────────────
+            Row(
               children: [
-                Icon(Icons.smart_toy_outlined, size: 16),
-                SizedBox(width: 8),
-                Text("AI Captioning", style: TextStyle(fontWeight: FontWeight.bold)),
+                const Icon(Icons.smart_toy_outlined, size: 16),
+                const SizedBox(width: 8),
+                const Text("AI Captioning", style: TextStyle(fontWeight: FontWeight.bold)),
+                const Spacer(),
+                if (_sessionId != null)
+                  IconButton(
+                    icon: const Icon(Icons.refresh, size: 16),
+                    tooltip: 'Reload segments',
+                    onPressed: _isLoading ? null : _loadSegmentUrls,
+                    visualDensity: VisualDensity.compact,
+                  ),
               ],
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
             Text(
-              "Use AI to generate a descriptive prompt for the uploaded image.",
-              style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+              "Select a segment, then caption it using the current prompt as the training concept.",
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
             ),
             const SizedBox(height: 12),
+
+            // ── Segment gallery ──────────────────────────────────────
+            if (_segmentUrls.isEmpty)
+              Text(
+                _sessionId == null
+                    ? 'Create a session and run segmentation first.'
+                    : 'No segments loaded — create segments, then tap ↺.',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              )
+            else ...[
+              Text('${_segmentUrls.length} segment(s) — tap to select:',
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (int i = 0; i < _segmentUrls.length; i++)
+                    _buildSegmentThumb(i, cs),
+                ],
+              ),
+            ],
+            const SizedBox(height: 12),
+
+            // ── Caption button ───────────────────────────────────────
             SizedBox(
               width: double.infinity,
               child: FilledButton.icon(
-                onPressed: (_imageBytes == null || _isLoading) ? null : _handleGenerateCaption,
+                onPressed: canCaption ? _handleGenerateCaption : null,
                 icon: const Icon(Icons.auto_fix_high, size: 16),
-                label: const Text("Generate Caption"),
+                label: const Text("Caption Selected Segment"),
                 style: FilledButton.styleFrom(
                   backgroundColor: Colors.deepPurple.shade400,
                   foregroundColor: Colors.white,
                 ),
               ),
             ),
+
+            // ── Success: show written entry ──────────────────────────
+            if (_lastCaptionEntry != null) ...[
+              const SizedBox(height: 12),
+              Text('Written to metadata.jsonl:',
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+              const SizedBox(height: 4),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.green.withValues(alpha: 0.08),
+                  border: Border.all(color: Colors.green.withValues(alpha: 0.4)),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: SelectableText(
+                  const JsonEncoder.withIndent('  ').convert(_lastCaptionEntry),
+                  style: const TextStyle(fontSize: 10, fontFamily: 'monospace'),
+                ),
+              ),
+            ],
+
+            // ── Error: show raw Gemini response ──────────────────────
+            if (_captionRawError != null) ...[
+              const SizedBox(height: 12),
+              Text('Schema validation failed — entry not written:',
+                  style: TextStyle(fontSize: 11, color: cs.error)),
+              const SizedBox(height: 4),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: cs.errorContainer.withValues(alpha: 0.3),
+                  border: Border.all(color: cs.error.withValues(alpha: 0.4)),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: SelectableText(
+                  _captionRawError!,
+                  style: TextStyle(fontSize: 10, fontFamily: 'monospace', color: cs.onErrorContainer),
+                ),
+              ),
+            ],
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildSegmentThumb(int index, ColorScheme cs) {
+    final isSelected = _selectedSegmentIndex == index;
+    final isCaptioned = _captionedSegmentIndices.contains(index);
+    final fullUrl = 'http://localhost:8000${_segmentUrls[index]}';
+
+    return GestureDetector(
+      onTap: () => setState(() => _selectedSegmentIndex = index),
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Container(
+            width: 68,
+            height: 68,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: isSelected ? cs.primary : cs.outlineVariant,
+                width: isSelected ? 2.5 : 1,
+              ),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(5),
+              child: Image.network(
+                fullUrl,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => Icon(Icons.broken_image,
+                    size: 28, color: cs.onSurfaceVariant),
+              ),
+            ),
+          ),
+          if (isCaptioned)
+            Positioned(
+              top: -4, right: -4,
+              child: Container(
+                width: 18, height: 18,
+                decoration: const BoxDecoration(
+                  color: Colors.green, shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.check, size: 12, color: Colors.white),
+              ),
+            ),
+        ],
       ),
     );
   }

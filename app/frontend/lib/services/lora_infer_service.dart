@@ -78,6 +78,38 @@ class InferStatus {
       status == 'done' || status == 'failed' || status == 'cancelled';
 }
 
+// ---------------------------------------------------------------------------
+// Provider models
+// ---------------------------------------------------------------------------
+
+class ProviderInfo {
+  final String name;
+  final bool active;
+  final bool available;
+
+  ProviderInfo({
+    required this.name,
+    required this.active,
+    required this.available,
+  });
+
+  factory ProviderInfo.fromJson(Map<String, dynamic> j) => ProviderInfo(
+        name: j['name'] as String,
+        active: j['active'] as bool? ?? false,
+        available: j['available'] as bool? ?? false,
+      );
+
+  String get label => switch (name) {
+        'mlx'       => 'MLX',
+        'cloud_run' => 'Cloud Run',
+        _           => name,
+      };
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
 class LoraInferService {
   final String baseUrl;
   LoraInferService({this.baseUrl = 'http://localhost:8000'});
@@ -127,5 +159,38 @@ class LoraInferService {
     try {
       await http.post(Uri.parse('$baseUrl/inference/cancel/$runId'));
     } catch (_) {}
+  }
+
+  // ── Provider management ─────────────────────────────────────────────────
+
+  Future<List<ProviderInfo>> getProviders() async {
+    final response =
+        await http.get(Uri.parse('$baseUrl/inference/provider'));
+    if (response.statusCode == 200) {
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      return (body['providers'] as List)
+          .map((p) => ProviderInfo.fromJson(p as Map<String, dynamic>))
+          .toList();
+    }
+    return [];
+  }
+
+  Future<List<ProviderInfo>> setProvider(String name, {String url = ''}) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/inference/provider'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'provider': name, 'url': url}),
+    );
+    if (response.statusCode == 200) {
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      return (body['providers'] as List)
+          .map((p) => ProviderInfo.fromJson(p as Map<String, dynamic>))
+          .toList();
+    }
+    String detail = 'Provider switch failed';
+    try {
+      detail = (jsonDecode(response.body) as Map)['detail'] as String? ?? detail;
+    } catch (_) {}
+    throw Exception(detail);
   }
 }

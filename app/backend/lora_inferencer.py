@@ -1,168 +1,130 @@
 """
-In-process LoRA inference for FLUX.1-dev and compatible diffusion models.
+Inference routing layer.
 
-Supports txt2img and img2img with LoRA adapters in safetensors format.
-Caches the base pipeline in memory; swaps LoRA adapters without full reload.
+Reads the active provider from storage/inference_config.json and delegates
+every call to it.  Providers live in inference_providers.py.
 
-Public surface:
+Public surface (unchanged from the original — main.py imports only these):
     validate_inference_inputs(...) -> Optional[str]
-    run_inference(**kwargs) -> str          # returns output_path; raises RuntimeError
-    release_pipeline()                     # free GPU/MPS memory on shutdown
+    run_inference(**kwargs) -> str
+    release_pipeline()
     get_cached_model_path() -> Optional[str]
+    free_vram_mb() -> Optional[float]
+    sha256_of_file(path) -> str
+
+Provider management (new — used by the /inference/provider endpoints):
+    list_providers() -> List[Dict]
+    get_active_provider_name() -> str
+    set_active_provider(name, url="") -> None
 """
 
 from __future__ import annotations
 
 import hashlib
-import io
-import threading
+import json
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-try:
-    import torch
-    from diffusers import FluxPipeline
-    try:
-        from diffusers import FluxImg2ImgPipeline
-        _IMG2IMG_AVAILABLE = True
-    except ImportError:
-        _IMG2IMG_AVAILABLE = False
-    _INFERENCE_DEPS_AVAILABLE = True
-except ImportError:
-    _INFERENCE_DEPS_AVAILABLE = False
-    _IMG2IMG_AVAILABLE = False
+from inference_providers import (
+    InferenceProvider,
+    MlxLocalProvider,
+    CloudRunProvider,
+)
 
 # ---------------------------------------------------------------------------
-# Pipeline cache (module-level singleton; guarded by a threading lock)
+# Provider registry
 # ---------------------------------------------------------------------------
 
-_cache_lock = threading.Lock()
-_cached_model_path: Optional[str] = None
-_cached_txt2img = None       # FluxPipeline instance
-_cached_img2img = None       # FluxImg2ImgPipeline instance (shares components)
-_cached_lora_path: Optional[str] = None
+_mlx_provider   = MlxLocalProvider()
+_cloud_provider = CloudRunProvider()
+
+_REGISTRY: Dict[str, InferenceProvider] = {
+    "mlx":       _mlx_provider,
+    "cloud_run": _cloud_provider,
+}
+
+_active_provider_name: str = "mlx"
+
+# ---------------------------------------------------------------------------
+# Config persistence
+# ---------------------------------------------------------------------------
+
+# Resolved at call-time to avoid import-order issues with main.py's BASE_DIR.
+def _config_path() -> Path:
+    return Path(__file__).resolve().parent.parent.parent / "storage" / "inference_config.json"
 
 
-def get_cached_model_path() -> Optional[str]:
-    return _cached_model_path
+def _load_config() -> Dict[str, Any]:
+    p = _config_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
 
 
-def release_pipeline() -> None:
-    """Move models to CPU and drop references so GC can reclaim memory."""
-    global _cached_txt2img, _cached_img2img, _cached_model_path, _cached_lora_path
-    with _cache_lock:
-        for pipe in (_cached_txt2img, _cached_img2img):
-            if pipe is not None:
-                try:
-                    pipe.to("cpu")
-                except Exception:
-                    pass
-        _cached_txt2img = None
-        _cached_img2img = None
-        _cached_model_path = None
-        _cached_lora_path = None
-        _flush_device_cache()
-
-
-def _flush_device_cache() -> None:
-    if not _INFERENCE_DEPS_AVAILABLE:
-        return
+def _save_config(data: Dict[str, Any]) -> None:
+    p = _config_path()
     try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-    except Exception:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        existing = _load_config()
+        existing.update(data)
+        p.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    except OSError:
         pass
 
 
-# ---------------------------------------------------------------------------
-# Device / dtype helpers
-# ---------------------------------------------------------------------------
-
-def _device() -> str:
-    if not _INFERENCE_DEPS_AVAILABLE:
-        return "cpu"
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def _is_flux(model_path: str) -> bool:
-    return "flux" in model_path.lower()
-
-
-def free_vram_mb() -> Optional[float]:
-    """Return approximate free VRAM in MB, or None if unavailable."""
-    if not _INFERENCE_DEPS_AVAILABLE:
-        return None
-    try:
-        if torch.cuda.is_available():
-            free, _ = torch.cuda.mem_get_info()
-            return round(free / (1024 ** 2), 1)
-    except Exception:
-        pass
-    return None
+def load_provider_from_config() -> None:
+    """Called at startup to restore last-used provider and Cloud Run URL."""
+    global _active_provider_name
+    cfg = _load_config()
+    name = cfg.get("provider", "mlx")
+    url  = cfg.get("cloud_run_url", "")
+    if url:
+        _cloud_provider.url = url
+    if name in _REGISTRY:
+        _active_provider_name = name
 
 
 # ---------------------------------------------------------------------------
-# Pipeline loading / LoRA management
+# Provider management API
 # ---------------------------------------------------------------------------
 
-def _ensure_pipeline(
-    model_path: str,
-    lora_path: str,
-    need_img2img: bool,
-    log_cb: Callable[[str], None],
-):
-    """Return (txt2img_pipe, img2img_pipe_or_None), loading or swapping as needed.
+def list_providers() -> List[Dict[str, Any]]:
+    return [
+        {
+            "name":   name,
+            "active": name == _active_provider_name,
+            **p.status_dict(),
+        }
+        for name, p in _REGISTRY.items()
+    ]
 
-    The lock is held for the duration of any load/swap so concurrent requests
-    queue rather than double-loading.
-    """
-    global _cached_model_path, _cached_txt2img, _cached_img2img, _cached_lora_path
 
-    with _cache_lock:
-        # ── reload base model when path changes ──────────────────────────────
-        if _cached_model_path != model_path:
-            log_cb(f"[inferencer] loading base model {model_path!r}")
-            dtype = torch.bfloat16 if _is_flux(model_path) else torch.float32
-            pipe = FluxPipeline.from_pretrained(model_path, torch_dtype=dtype)
-            device = _device()
-            log_cb(f"[inferencer] moving to {device}")
-            pipe = pipe.to(device)
-            _cached_txt2img = pipe
-            _cached_img2img = None
-            _cached_model_path = model_path
-            _cached_lora_path = None  # force LoRA reload after base change
+def get_active_provider_name() -> str:
+    return _active_provider_name
 
-        # ── swap LoRA when path changes ───────────────────────────────────────
-        if _cached_lora_path != lora_path:
-            if _cached_lora_path is not None:
-                log_cb("[inferencer] unloading previous LoRA")
-                _cached_txt2img.unload_lora_weights()
-                _cached_img2img = None  # img2img must be rebuilt after LoRA swap
-            log_cb(f"[inferencer] loading LoRA {lora_path!r}")
-            _cached_txt2img.load_lora_weights(lora_path)
-            _cached_lora_path = lora_path
-            _cached_img2img = None
 
-        # ── build img2img from shared components (zero extra VRAM) ───────────
-        if need_img2img and _cached_img2img is None:
-            if not _IMG2IMG_AVAILABLE:
-                raise RuntimeError(
-                    "FluxImg2ImgPipeline not available — upgrade diffusers >= 0.28.0"
-                )
-            log_cb("[inferencer] building img2img pipeline from txt2img components")
-            _cached_img2img = FluxImg2ImgPipeline(**_cached_txt2img.components)
+def set_active_provider(name: str, url: str = "") -> None:
+    global _active_provider_name
+    if name not in _REGISTRY:
+        raise ValueError(f"Unknown provider {name!r}. Choose from: {list(_REGISTRY)}")
+    if name == "cloud_run" and url:
+        _cloud_provider.url = url
+    _active_provider_name = name
+    data: Dict[str, Any] = {"provider": name}
+    if name == "cloud_run" and url:
+        data["cloud_run_url"] = url
+    _save_config(data)
 
-        return _cached_txt2img, _cached_img2img
+
+def _active() -> InferenceProvider:
+    return _REGISTRY[_active_provider_name]
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Public surface — unchanged API used by main.py
 # ---------------------------------------------------------------------------
 
 def validate_inference_inputs(
@@ -171,7 +133,7 @@ def validate_inference_inputs(
     prompt: str,
     output_dir: str = "",
 ) -> Optional[str]:
-    """Return an error string on failure, None on success. Does not load models."""
+    """Provider-agnostic pre-flight checks."""
     if not prompt.strip():
         return "Prompt must not be empty"
 
@@ -198,10 +160,6 @@ def validate_inference_inputs(
     return None
 
 
-# ---------------------------------------------------------------------------
-# Inference — blocking, intended to run via asyncio.to_thread
-# ---------------------------------------------------------------------------
-
 def run_inference(
     *,
     lora_path: str,
@@ -218,99 +176,50 @@ def run_inference(
     progress_cb: Callable[[int, int], None] = lambda *_: None,
     cancelled: Callable[[], bool] = lambda: False,
 ) -> str:
-    """
-    Run txt2img (no continuity_image_bytes) or img2img (with continuity_image_bytes).
-    Saves the result to output_path and returns it.
-    Raises RuntimeError on failure, cancellation, or OOM.
-    """
-    if not _INFERENCE_DEPS_AVAILABLE:
-        raise RuntimeError(
-            "Inference dependencies not installed. "
-            "Run: pip install diffusers transformers torch accelerate safetensors"
-        )
+    """Delegate to the active provider. Blocking — run via asyncio.to_thread."""
+    provider = _active()
+    log_cb(f"[inferencer] provider={provider.name!r}")
+    return provider.run_inference(
+        lora_path=lora_path,
+        model_path=model_path,
+        prompt=prompt,
+        lora_strength=lora_strength,
+        steps=steps,
+        guidance_scale=guidance_scale,
+        seed=seed,
+        output_path=output_path,
+        continuity_image_bytes=continuity_image_bytes,
+        denoise_strength=denoise_strength,
+        log_cb=log_cb,
+        progress_cb=progress_cb,
+        cancelled=cancelled,
+    )
 
-    need_img2img = continuity_image_bytes is not None
-    mode = "img2img" if need_img2img else "txt2img"
-    log_cb(f"[inferencer] mode={mode} model={model_path!r} lora={lora_path!r}")
-    log_cb(f"[inferencer] steps={steps} guidance={guidance_scale} "
-           f"lora_strength={lora_strength} seed={seed}")
 
+def release_pipeline() -> None:
+    """Release resources for all providers."""
+    for p in _REGISTRY.values():
+        try:
+            p.release()
+        except Exception:
+            pass
+
+
+def get_cached_model_path() -> Optional[str]:
+    return _active().cached_model()
+
+
+def free_vram_mb() -> Optional[float]:
+    """Best-effort free VRAM estimate (CUDA only)."""
     try:
-        txt2img_pipe, img2img_pipe = _ensure_pipeline(
-            model_path, lora_path, need_img2img, log_cb
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load model: {exc}") from exc
+        import torch
+        if torch.cuda.is_available():
+            free, _ = torch.cuda.mem_get_info()
+            return round(free / (1024 ** 2), 1)
+    except Exception:
+        pass
+    return None
 
-    generator = torch.Generator(_device()).manual_seed(seed)
-    _steps_done = [0]
-    _interrupted = [False]
-
-    def _step_cb(pipeline, step_index: int, timestep, callback_kwargs: dict):
-        _steps_done[0] = step_index + 1
-        progress_cb(_steps_done[0], steps)
-        log_cb(f"[inferencer] step {_steps_done[0]}/{steps}")
-        if cancelled():
-            _interrupted[0] = True
-            pipeline._interrupt = True
-        return callback_kwargs
-
-    try:
-        if not need_img2img:
-            # ── txt2img ──────────────────────────────────────────────────────
-            output = txt2img_pipe(
-                prompt=prompt,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                joint_attention_kwargs={"scale": lora_strength},
-                callback_on_step_end=_step_cb,
-                callback_on_step_end_tensor_inputs=[],
-            )
-        else:
-            # ── img2img ──────────────────────────────────────────────────────
-            if img2img_pipe is None:
-                raise RuntimeError("img2img pipeline is unavailable")
-            init_image = _bytes_to_pil(continuity_image_bytes)
-            output = img2img_pipe(
-                prompt=prompt,
-                image=init_image,
-                strength=denoise_strength,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                joint_attention_kwargs={"scale": lora_strength},
-                callback_on_step_end=_step_cb,
-                callback_on_step_end_tensor_inputs=[],
-            )
-    except Exception as exc:
-        if _interrupted[0]:
-            raise RuntimeError("Generation cancelled.") from exc
-        msg = str(exc).lower()
-        if "out of memory" in msg or "mps backend" in msg or "oom" in msg:
-            raise RuntimeError(
-                f"Out of memory — try reducing steps or image size. Details: {exc}"
-            ) from exc
-        raise RuntimeError(f"Generation failed: {exc}") from exc
-
-    if _interrupted[0]:
-        raise RuntimeError("Generation cancelled.")
-
-    image = output.images[0]
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path, format="PNG")
-    log_cb(f"[inferencer] saved → {output_path}")
-    return output_path
-
-
-def _bytes_to_pil(data: bytes):
-    from PIL import Image
-    return Image.open(io.BytesIO(data)).convert("RGB")
-
-
-# ---------------------------------------------------------------------------
-# Checksum helper (mirrors lora_trainer.sha256_of_file)
-# ---------------------------------------------------------------------------
 
 def sha256_of_file(path: str) -> str:
     h = hashlib.sha256()

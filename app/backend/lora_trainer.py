@@ -31,7 +31,9 @@ try:
     from transformers import CLIPTextModel, CLIPTokenizer
     from safetensors.torch import save_file as sf_save
     _TRAINING_DEPS_AVAILABLE = True
-except ImportError:
+except Exception:
+    # diffusers and its dependencies can raise RuntimeError (not just ImportError)
+    # when a transitive dependency is missing or version-mismatched.
     _TRAINING_DEPS_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
