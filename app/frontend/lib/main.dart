@@ -131,6 +131,10 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _loraOutputPath; // forwarded to LoraInferenceCard
   Timer? _healthCheckTimer;
 
+  // Segment preview overlay
+  OverlayEntry? _segmentPreviewOverlay;
+  Timer? _previewDismissTimer;
+
   // Layer State
   LayerState? _layerState;
   bool _isRestoringState = false;
@@ -166,7 +170,82 @@ class _HomeScreenState extends State<HomeScreen> {
     _healthCheckTimer?.cancel();
     _textController.dispose();
     _layerState?.removeListener(_onLayerStateChanged);
+    _dismissSegmentPreview();
     super.dispose();
+  }
+
+  void _showSegmentPreview(BuildContext thumbContext, int index) {
+    _dismissSegmentPreview();
+
+    final box = thumbContext.findRenderObject() as RenderBox?;
+    if (box == null) return;
+
+    final offset = box.localToGlobal(Offset.zero);
+    final thumbSize = box.size;
+    final screenHeight = MediaQuery.of(thumbContext).size.height;
+
+    const previewSize = 220.0;
+    final double left = 540; // just right of the 520px sidebar
+    final double top = (offset.dy + thumbSize.height / 2 - previewSize / 2)
+        .clamp(8.0, screenHeight - previewSize - 8);
+
+    final url = _segmentUrls[index];
+
+    _segmentPreviewOverlay = OverlayEntry(
+      builder: (ctx) => Positioned(
+        left: left,
+        top: top,
+        child: IgnorePointer(
+          child: Material(
+            elevation: 12,
+            borderRadius: BorderRadius.circular(12),
+            color: Colors.transparent,
+            child: Container(
+              width: previewSize,
+              height: previewSize,
+              decoration: BoxDecoration(
+                color: Colors.grey.shade900,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: Theme.of(thumbContext).colorScheme.primary,
+                  width: 2,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    blurRadius: 20,
+                    offset: const Offset(4, 6),
+                  ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Image.network(
+                  url,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => const Icon(
+                    Icons.broken_image,
+                    size: 48,
+                    color: Colors.white54,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    Overlay.of(thumbContext).insert(_segmentPreviewOverlay!);
+    _previewDismissTimer =
+        Timer(const Duration(seconds: 3), _dismissSegmentPreview);
+  }
+
+  void _dismissSegmentPreview() {
+    _previewDismissTimer?.cancel();
+    _previewDismissTimer = null;
+    _segmentPreviewOverlay?.remove();
+    _segmentPreviewOverlay = null;
   }
 
   Future<void> _checkHealth() async {
@@ -312,19 +391,29 @@ class _HomeScreenState extends State<HomeScreen> {
       _imageBytes = bytes;
       _imageName = picked?.name;
       _uiImage = decodedImage;
-      _sessionId = null;
       _result = null;
       _imageSize = null;
       _segments = [];
+      _segmentUrls = [];
+      _selectedSegmentIndex = null;
+      _captionedSegmentIndices = {};
+      _lastCaptionEntry = null;
+      _captionRawError = null;
     });
 
     try {
-      final response = await _api.uploadImageBytes(bytes, filename: _imageName ?? "upload.png");
+      final response = await _api.uploadImageBytes(
+        bytes,
+        filename: _imageName ?? "upload.png",
+        sessionId: _sessionId,
+      );
 
       if (response != null) {
         if (!mounted) return;
         setState(() {
-          _sessionId = response['session_id'] as String?;
+          // Keep existing session if we had one; only take the new ID if we
+          // didn't have a session yet (first upload after clicking New).
+          _sessionId ??= response['session_id'] as String?;
           _imageSize = Size(
             (response['width'] as num).toDouble(),
             (response['height'] as num).toDouble(),
@@ -542,6 +631,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _error = null;
         _textController.clear();
       });
+      _loadSavedSessions();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text("New session created: $newId")),
       );
@@ -607,6 +697,12 @@ class _HomeScreenState extends State<HomeScreen> {
         _segments = [];
         _updateSegmentsFromResult();
         _textController.clear();
+        // Reset segment/caption state for the newly selected session
+        _segmentUrls = [];
+        _selectedSegmentIndex = null;
+        _captionedSegmentIndices = {};
+        _lastCaptionEntry = null;
+        _captionRawError = null;
 
         // Restore layer state if provided by backend
         if (sessionData['view_layers'] != null) {
@@ -622,6 +718,7 @@ class _HomeScreenState extends State<HomeScreen> {
           }
         }
       });
+      _loadSegmentUrls();
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = "Failed to load session: $e");
@@ -753,6 +850,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   const SizedBox(height: 16),
                   _buildCardRow(
                     LoraTrainCard(
+                      sessionId: _sessionId,
                       onRunning: () => setState(() { _loraTrainRunning = true; _loraTrainResult = []; }),
                       onComplete: () => setState(() { _loraTrainRunning = false; _loraTrainResult = [const ResultDatum(label: 'Status', value: 'Done')]; }),
                       onCompleteWithPath: (path) => setState(() => _loraOutputPath = path),
@@ -1104,45 +1202,50 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildSegmentThumb(int index, ColorScheme cs) {
     final isSelected = _selectedSegmentIndex == index;
     final isCaptioned = _captionedSegmentIndices.contains(index);
-    final fullUrl = 'http://localhost:8000${_segmentUrls[index]}';
+    final url = _segmentUrls[index]; // already a full URL from ApiService
 
-    return GestureDetector(
-      onTap: () => setState(() => _selectedSegmentIndex = index),
-      child: Stack(
-        clipBehavior: Clip.none,
-        children: [
-          Container(
-            width: 68,
-            height: 68,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(
-                color: isSelected ? cs.primary : cs.outlineVariant,
-                width: isSelected ? 2.5 : 1,
-              ),
-            ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(5),
-              child: Image.network(
-                fullUrl,
-                fit: BoxFit.cover,
-                errorBuilder: (_, __, ___) => Icon(Icons.broken_image,
-                    size: 28, color: cs.onSurfaceVariant),
-              ),
-            ),
-          ),
-          if (isCaptioned)
-            Positioned(
-              top: -4, right: -4,
-              child: Container(
-                width: 18, height: 18,
-                decoration: const BoxDecoration(
-                  color: Colors.green, shape: BoxShape.circle,
+    return Builder(
+      builder: (thumbContext) => GestureDetector(
+        onTap: () {
+          setState(() => _selectedSegmentIndex = index);
+          _showSegmentPreview(thumbContext, index);
+        },
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Container(
+              width: 68,
+              height: 68,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(
+                  color: isSelected ? cs.primary : cs.outlineVariant,
+                  width: isSelected ? 2.5 : 1,
                 ),
-                child: const Icon(Icons.check, size: 12, color: Colors.white),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(5),
+                child: Image.network(
+                  url,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Icon(Icons.broken_image,
+                      size: 28, color: cs.onSurfaceVariant),
+                ),
               ),
             ),
-        ],
+            if (isCaptioned)
+              Positioned(
+                top: -4, right: -4,
+                child: Container(
+                  width: 18, height: 18,
+                  decoration: const BoxDecoration(
+                    color: Colors.green, shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.check, size: 12, color: Colors.white),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -1422,7 +1525,8 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildTrainingDataCard() {
     return TrainingDataCard(
       sessionId: _sessionId,
-      segmentCount: _segments.length,
+      segmentCount: _segmentUrls.length,
+      segmentUrls: _segmentUrls,
       currentPrompt: _textController.text,
       onRunning: () => setState(() { _loraTrainPrepRunning = true; _loraTrainPrepResult = []; }),
       onComplete: () => setState(() { _loraTrainPrepRunning = false; _loraTrainPrepResult = [const ResultDatum(label: 'Status', value: 'Done')]; }),

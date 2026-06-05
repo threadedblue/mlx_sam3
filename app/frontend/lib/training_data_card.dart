@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'services/api_service.dart';
 
@@ -5,6 +6,7 @@ class TrainingDataCard extends StatefulWidget {
   final String? sessionId;
   final int segmentCount;
   final String currentPrompt;
+  final List<String> segmentUrls;
   final VoidCallback? onRunning;
   final VoidCallback? onComplete;
 
@@ -13,6 +15,7 @@ class TrainingDataCard extends StatefulWidget {
     required this.sessionId,
     required this.segmentCount,
     required this.currentPrompt,
+    this.segmentUrls = const [],
     this.onRunning,
     this.onComplete,
   });
@@ -23,6 +26,7 @@ class TrainingDataCard extends StatefulWidget {
 
 class _TrainingDataCardState extends State<TrainingDataCard> {
   final ApiService _api = ApiService();
+  final _dropdownRowKey = GlobalKey();
   int _selectedIndex = 0;
   String? _refinedCaption;
   String? _savedFilename;
@@ -30,12 +34,92 @@ class _TrainingDataCardState extends State<TrainingDataCard> {
   bool _isLoading = false;
   String? _error;
 
+  OverlayEntry? _previewOverlay;
+  Timer? _previewTimer;
+
   @override
   void didUpdateWidget(TrainingDataCard oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.segmentCount != oldWidget.segmentCount && _selectedIndex >= widget.segmentCount) {
       setState(() => _selectedIndex = 0);
     }
+  }
+
+  @override
+  void dispose() {
+    _dismissPreview();
+    super.dispose();
+  }
+
+  void _showPreview(int index) {
+    _dismissPreview();
+    if (index >= widget.segmentUrls.length) return;
+
+    final box = _dropdownRowKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return;
+
+    final offset = box.localToGlobal(Offset.zero);
+    final rowSize = box.size;
+    final screenHeight = MediaQuery.of(context).size.height;
+
+    const previewSize = 220.0;
+    final double left = 540.0;
+    final double top = (offset.dy + rowSize.height / 2 - previewSize / 2)
+        .clamp(8.0, screenHeight - previewSize - 8);
+
+    final url = widget.segmentUrls[index];
+
+    _previewOverlay = OverlayEntry(
+      builder: (ctx) => Positioned(
+        left: left,
+        top: top,
+        child: IgnorePointer(
+          child: Material(
+            elevation: 12,
+            borderRadius: BorderRadius.circular(12),
+            color: Colors.transparent,
+            child: Container(
+              width: previewSize,
+              height: previewSize,
+              decoration: BoxDecoration(
+                color: Colors.grey.shade900,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.indigo, width: 2),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    blurRadius: 20,
+                    offset: const Offset(4, 6),
+                  ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Image.network(
+                  url,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => const Icon(
+                    Icons.broken_image,
+                    size: 48,
+                    color: Colors.white54,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    Overlay.of(context).insert(_previewOverlay!);
+    _previewTimer = Timer(const Duration(seconds: 3), _dismissPreview);
+  }
+
+  void _dismissPreview() {
+    _previewTimer?.cancel();
+    _previewTimer = null;
+    _previewOverlay?.remove();
+    _previewOverlay = null;
   }
 
   Future<void> _run() async {
@@ -54,9 +138,10 @@ class _TrainingDataCardState extends State<TrainingDataCard> {
         widget.currentPrompt,
       );
       if (!mounted) return;
+      final entry = result['entry'] as Map?;
       setState(() {
-        _refinedCaption = result['refined_prompt'] as String?;
-        _savedFilename = result['jsonl_filename'] as String?;
+        _refinedCaption = entry?['text'] as String?;
+        _savedFilename = result['metadata_path'] as String?;
         _entryCount = result['entry_count'] as int? ?? _entryCount + 1;
       });
       widget.onComplete?.call();
@@ -99,6 +184,7 @@ class _TrainingDataCardState extends State<TrainingDataCard> {
             if (hasSegments) ...[
               const SizedBox(height: 10),
               Row(
+                key: _dropdownRowKey,
                 children: [
                   Text("Segment:", style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
                   const SizedBox(width: 8),
@@ -119,7 +205,12 @@ class _TrainingDataCardState extends State<TrainingDataCard> {
                       ),
                       onChanged: _isLoading
                           ? null
-                          : (v) { if (v != null) setState(() => _selectedIndex = v); },
+                          : (v) {
+                              if (v != null) {
+                                setState(() => _selectedIndex = v);
+                                _showPreview(v);
+                              }
+                            },
                     ),
                   ),
                 ],

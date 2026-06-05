@@ -22,18 +22,22 @@ class ApiService {
   Future<Map<String, dynamic>?> uploadImageBytes(
     Uint8List bytes, {
     required String filename,
+    String? sessionId,
   }) async {
-    final uri = Uri.parse("$baseUrl/upload"); // adjust endpoint if needed
+    final uri = Uri.parse("$baseUrl/upload");
 
     final request = http.MultipartRequest("POST", uri);
 
     request.files.add(
       http.MultipartFile.fromBytes(
-        "file",        // must match your FastAPI field name
+        "file",
         bytes,
         filename: filename,
       ),
     );
+    if (sessionId != null) {
+      request.fields['session_id'] = sessionId;
+    }
 
     final streamed = await request.send();
     final response = await http.Response.fromStream(streamed);

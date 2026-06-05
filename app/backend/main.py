@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 
 import mlx.core as mx
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
@@ -34,7 +34,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
-import google.generativeai as genai
 from dotenv import load_dotenv
 
 from services import SegmentationService, serialize_state
@@ -78,13 +77,10 @@ async def lifespan(app: FastAPI):
     global service
     service = SegmentationService(STORAGE_DIR, processor)
 
-    # Configure Gemini
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        print("Warning: GEMINI_API_KEY not set. AI captioning will be disabled.")
+    if not os.getenv("CHATGPT_API_KEY"):
+        print("Warning: CHATGPT_API_KEY not set. AI captioning will be disabled.")
     else:
-        genai.configure(api_key=api_key)
-        print("Gemini SDK configured.")
+        print("ChatGPT API key loaded.")
 
     # Restore last-used inference provider and Cloud Run URL from config.
     load_provider_from_config()
@@ -134,6 +130,12 @@ class BoxPromptRequest(BaseModel):
     label: bool  # True for positive, False for negative
 
 
+class PointPromptRequest(BaseModel):
+    session_id: str
+    point: list[float]  # [x, y] normalized
+    label: bool  # True for positive, False for negative
+
+
 class ConfidenceRequest(BaseModel):
     session_id: str
     threshold: float
@@ -173,25 +175,28 @@ async def root():
     return {"message": "SAM3 Segmentation API", "status": "running"}
     
 @app.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
-    """Upload an image and initialize a session."""
+async def upload_image(file: UploadFile = File(...), session_id: Optional[str] = Form(None)):
+    """Upload an image into an existing session or create a new one."""
     if processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
-    
+
     try:
-        # Read and validate image
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
-        
-        # Create session
-        session_id = str(uuid.uuid4())
-        
-        # Process image through model (timed)
+
+        # Reuse the supplied session or allocate a new one
+        if session_id:
+            # Ensure subdirectories exist in case this session was created
+            # before the backend last restarted
+            for sub in ("masks", "segments_raw", "segments_work", "segments_final"):
+                (STORAGE_DIR / session_id / sub).mkdir(parents=True, exist_ok=True)
+        else:
+            session_id = service.create_session()
+
         start_time = time.perf_counter()
         state = processor.set_image(image)
         processing_time_ms = (time.perf_counter() - start_time) * 1000
-        
-        # Register session in service
+
         service.register_session_data(session_id, {
             "state": state,
             "original_image_bytes": contents,
@@ -218,8 +223,8 @@ async def process_image(file: UploadFile = File(...)):
     """Generate a descriptive caption for an image and save both."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not available")
-    if not os.getenv("GEMINI_API_KEY"):
-        raise HTTPException(status_code=503, detail="AI captioning is not configured on the server (GEMINI_API_KEY is missing).")
+    if not os.getenv("CHATGPT_API_KEY"):
+        raise HTTPException(status_code=503, detail="AI captioning is not configured on the server (CHATGPT_API_KEY is missing).")
 
     try:
         # The service method will handle reading the file and calling the AI model
@@ -322,6 +327,56 @@ async def add_box_prompt(request: BoxPromptRequest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error adding box prompt: {str(e)}")
+
+
+@app.post("/segment/point")
+async def add_point_prompt(request: PointPromptRequest):
+    """Add a point prompt by encoding it as a zero-size box."""
+    if processor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
+
+    session = service.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        state = session["state"]
+        x, y = request.point
+
+        # Store for display alongside box prompts
+        if "prompted_boxes" not in state:
+            state["prompted_boxes"] = []
+        img_w = state["original_width"]
+        img_h = state["original_height"]
+        state["prompted_boxes"].append({
+            "box": [x * img_w, y * img_h, x * img_w, y * img_h],
+            "label": request.label,
+            "is_point": True,
+        })
+
+        session.setdefault("prompts", []).append({
+            "type": "point",
+            "point": request.point,
+            "label": "positive" if request.label else "negative",
+        })
+
+        # Encode as degenerate box [cx, cy, 0, 0]
+        start_time = time.perf_counter()
+        state = processor.add_geometric_prompt([x, y, 0.0, 0.0], request.label, state)
+        processing_time_ms = (time.perf_counter() - start_time) * 1000
+        session["state"] = state
+        service.save_session_to_disk(request.session_id)
+
+        return {
+            "session_id": request.session_id,
+            "point_type": "positive" if request.label else "negative",
+            "results": serialize_state(state),
+            "processing_time_ms": round(processing_time_ms, 2),
+            "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2),
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error adding point prompt: {str(e)}")
 
 
 @app.post("/reset")
@@ -490,14 +545,19 @@ async def create_segments(request: SessionRequest):
 
 @app.get("/showSegments/{session_id}")
 async def show_segments(session_id: str):
-    """Returns a list of URLs for the generated segments."""
+    """Returns a list of URLs for the generated segments, grouped by source image subdir."""
     segments_dir = service.storage_dir / session_id / "segments_raw"
     if not segments_dir.exists():
         return []
 
-    segment_files = sorted(segments_dir.glob("*.png"))
-    base_path = f"/storage/sessions/{session_id}/segments_raw" # This path is for the static mount
-    urls = [f"{base_path}/{f.name}" for f in segment_files]
+    # Collect segment files from all image-named subdirectories
+    segment_files = []
+    for subdir in sorted(segments_dir.iterdir()):
+        if subdir.is_dir():
+            segment_files.extend(sorted(subdir.glob("segment_*.png")))
+
+    base_path = f"/storage/sessions/{session_id}/segments_raw"
+    urls = [f"{base_path}/{f.parent.name}/{f.name}" for f in segment_files]
     return urls
 
 @app.get("/loadSession/{session_id}", response_model=Dict[str, Any])
@@ -544,10 +604,11 @@ _lora_runs: Dict[str, Dict[str, Any]] = {}
 
 
 class LoraTrainRequest(BaseModel):
-    dataset_dir: str
-    output_dir: str
+    session_id: str
+    dataset_dir: str = ""   # auto-derived from session_id if empty
+    output_dir: str = ""    # auto-derived from session_id if empty
     model_path: str = "runwayml/stable-diffusion-v1-5"
-    script_path: str = "train_dreambooth_lora_flux.py"  # unused by in-process trainer
+    script_path: str = "train_dreambooth_lora_flux.py"
     rank: int = 16
     alpha: int = 16
     learning_rate: float = 1e-4
@@ -555,6 +616,16 @@ class LoraTrainRequest(BaseModel):
     batch_size: int = 1
     resolution: int = 512
     mixed_precision: str = "no"
+
+    def resolve_paths(self, storage_dir: Path) -> "LoraTrainRequest":
+        updates: dict = {}
+        if not self.dataset_dir:
+            updates["dataset_dir"] = str(storage_dir / self.session_id)
+        if not self.output_dir:
+            updates["output_dir"] = str(storage_dir / self.session_id / "lora_output")
+        resolved = self.model_copy(update=updates) if updates else self
+        Path(resolved.output_dir).mkdir(parents=True, exist_ok=True)
+        return resolved
 
     @property
     def output_path(self) -> str:
@@ -623,9 +694,9 @@ def _cleanup_partial_output(output_path: str) -> None:
 
 
 @app.get("/pipeline/lora_train/ready")
-async def lora_train_ready(dataset_dir: str):
-    """Check whether metadata.jsonl exists in dataset_dir."""
-    jsonl_path = Path(dataset_dir) / "metadata.jsonl"
+async def lora_train_ready(session_id: str):
+    """Check whether metadata.jsonl exists for the session."""
+    jsonl_path = STORAGE_DIR / session_id / "metadata.jsonl"
     if not jsonl_path.exists():
         return {"ready": False, "image_count": 0, "file_size_bytes": 0}
     lines = [ln for ln in jsonl_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
@@ -639,6 +710,7 @@ async def lora_train_ready(dataset_dir: str):
 @app.post("/pipeline/lora_train/run")
 async def lora_train_run(request: LoraTrainRequest):
     """Validate inputs, then launch in-process LoRA training and return a run_id."""
+    request = request.resolve_paths(STORAGE_DIR)
     error = validate_inputs(
         dataset_dir=request.dataset_dir,
         output_path=request.output_path,
@@ -708,8 +780,8 @@ async def append_lora_entry(request: LoraAppendRequest):
     """Refine a segment caption via Gemini and append it to the LoRA JSONL dataset."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not available")
-    if not os.getenv("GEMINI_API_KEY"):
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not set")
+    if not os.getenv("CHATGPT_API_KEY"):
+        raise HTTPException(status_code=503, detail="CHATGPT_API_KEY not set")
     try:
         result = await service.append_lora_entry(request.session_id, request.segment_index, request.prompt)
         return result
@@ -740,8 +812,8 @@ async def caption_all_segments(request: LoraCaptionAllRequest):
     """Caption all segments for a session via Gemini and write to metadata.jsonl."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not available")
-    if not os.getenv("GEMINI_API_KEY"):
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not set")
+    if not os.getenv("CHATGPT_API_KEY"):
+        raise HTTPException(status_code=503, detail="CHATGPT_API_KEY not set")
     try:
         result = await service.caption_all_segments(request.session_id, request.prompt)
         return result

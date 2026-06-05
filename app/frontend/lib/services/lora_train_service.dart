@@ -21,8 +21,7 @@ class ReadinessResult {
 }
 
 class TrainConfig {
-  final String datasetDir;
-  final String outputDir;
+  final String sessionId;
   final String modelPath;
   final String scriptPath;
   final int rank;
@@ -34,8 +33,7 @@ class TrainConfig {
   final String mixedPrecision;
 
   TrainConfig({
-    required this.datasetDir,
-    required this.outputDir,
+    required this.sessionId,
     this.modelPath = 'black-forest-labs/FLUX.1-dev',
     this.scriptPath = 'train_dreambooth_lora_flux.py',
     this.rank = 16,
@@ -48,8 +46,7 @@ class TrainConfig {
   });
 
   Map<String, dynamic> toJson() => {
-        'dataset_dir': datasetDir,
-        'output_dir': outputDir,
+        'session_id': sessionId,
         'model_path': modelPath,
         'script_path': scriptPath,
         'rank': rank,
@@ -95,9 +92,9 @@ class LoraTrainService {
   final String baseUrl;
   LoraTrainService({this.baseUrl = 'http://localhost:8000'});
 
-  Future<ReadinessResult> checkReadiness(String datasetDir) async {
+  Future<ReadinessResult> checkReadiness(String sessionId) async {
     final uri = Uri.parse('$baseUrl/pipeline/lora_train/ready')
-        .replace(queryParameters: {'dataset_dir': datasetDir});
+        .replace(queryParameters: {'session_id': sessionId});
     final response = await http.get(uri);
     if (response.statusCode == 200) {
       return ReadinessResult.fromJson(

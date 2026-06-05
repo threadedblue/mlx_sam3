@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import re
 import shutil
 import base64
@@ -12,11 +13,19 @@ from typing import List, Dict, Any, Optional
 import jsonschema
 
 from fastapi import UploadFile
-import google.generativeai as genai
+from openai import AsyncOpenAI
 
 import numpy as np
 from PIL import Image
 from sam3.model.sam3_image_processor import Sam3Processor
+
+
+def _img_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    mime = "image/png" if fmt == "PNG" else "image/jpeg"
+    return f"data:{mime};base64,{b64}"
 
 
 def mask_to_rle(mask: np.ndarray) -> dict:
@@ -361,47 +370,54 @@ class SegmentationService:
         session = self.get_session(session_id)
         if not session:
             raise ValueError("Session not found")
-            
+
         if "original_image_bytes" not in session or "state" not in session or session["state"].get("masks") is None:
             raise ValueError("Image or masks not available")
 
         start_time = time.perf_counter()
-        
+
         original_image = Image.open(io.BytesIO(session["original_image_bytes"])).convert("RGBA")
         masks = session["state"]["masks"]
-        print("1==")
-        segments_dir = self.storage_dir / session_id / "segments_raw"
-        # Clear old segments
+
+        # Each original image gets its own subdir named after the file (no extension)
+        original_filename = session.get("original_filename") or "image"
+        image_stem = Path(original_filename).stem
+
+        segments_dir = self.storage_dir / session_id / "segments_raw" / image_stem
+        segments_dir.mkdir(parents=True, exist_ok=True)
+        # Clear only this image's previous segments, preserving other images' subdirs
         for f in segments_dir.glob('*.png'):
             f.unlink()
-        print("2==")
+
         for i, mask_mx in enumerate(masks):
             mask_np = np.array(mask_mx)
             mask_binary = (mask_np > 0.5).astype(np.uint8)
             if mask_binary.ndim == 3:
                 mask_binary = mask_binary[0]
-            print("2.5==")
             mask_image = Image.fromarray(mask_binary * 255, 'L')
-            print("2.6==")
             segment_image = Image.new("RGBA", original_image.size, (0, 0, 0, 0))
-            print("2.7==")
             segment_image.paste(original_image, (0, 0), mask_image)
-            print("2.8==", segments_dir, f"segment_{i:03d}.png")
-            segments_dir.mkdir(parents=True, exist_ok=True)
             segment_image.save(segments_dir / f"segment_{i:03d}.png")
-            print("2.9==", segments_dir, f"segment_{i:03d}.png")
-        print("3==")
+
         return {
             "count": len(masks),
             "path": str(segments_dir),
+            "image_stem": image_stem,
             "processing_time_ms": (time.perf_counter() - start_time) * 1000
         }
 
     async def append_lora_entry(self, session_id: str, segment_index: int, original_prompt: str) -> Dict[str, Any]:
-        """Call Gemini to caption one segment, validate against schema, append to metadata.jsonl."""
-        segment_path = self.storage_dir / session_id / "segments_raw" / f"segment_{segment_index:03d}.png"
+        """Call OpenAI to caption one segment, validate against schema, append to metadata.jsonl."""
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+
+        original_filename = session.get("original_filename") or "image"
+        image_stem = Path(original_filename).stem
+
+        segment_path = self.storage_dir / session_id / "segments_raw" / image_stem / f"segment_{segment_index:03d}.png"
         if not segment_path.exists():
-            raise ValueError(f"Segment {segment_index} not found. Run 'Create Segments' first.")
+            raise ValueError(f"Segment {segment_index} not found under '{image_stem}'. Run 'Create Segments' first.")
 
         original_image_path = self.storage_dir / session_id / self.ORIGINAL_IMAGE_FILENAME
         if not original_image_path.exists():
@@ -411,9 +427,9 @@ class SegmentationService:
         segment_img = Image.open(segment_path).convert("RGBA")
         seg_w, seg_h = segment_img.size
 
-        file_name = f"segments_raw/segment_{segment_index:03d}.png"
+        file_name = f"segments_raw/{image_stem}/segment_{segment_index:03d}.png"
 
-        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        client = AsyncOpenAI(api_key=os.getenv("CHATGPT_API_KEY"))
         instruction = (
             f"The concept being trained is: '{original_prompt}'. "
             "Using the original image for context and the segment cutout as the subject, "
@@ -425,9 +441,17 @@ class SegmentationService:
             "  tags (array of strings): 3–8 semantic tags.\n"
             "  flip_augmentation (boolean): false only if the subject is clearly asymmetric.\n"
         )
-        response = await gemini_model.generate_content_async([instruction, original_img, segment_img])
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": _img_to_data_url(original_img)}},
+                {"type": "image_url", "image_url": {"url": _img_to_data_url(segment_img)}},
+            ]}],
+            max_tokens=512,
+        )
 
-        raw = response.text.strip()
+        raw = response.choices[0].message.content.strip()
         raw_clean = re.sub(r'^```[a-zA-Z]*\n?', '', raw)
         raw_clean = re.sub(r'\n?```$', '', raw_clean.strip())
 
@@ -471,7 +495,13 @@ class SegmentationService:
 
     async def caption_all_segments(self, session_id: str, prompt: str) -> Dict[str, Any]:
         """Caption every segment in a session and write all entries to metadata.jsonl."""
-        segments_dir = self.storage_dir / session_id / "segments_raw"
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+
+        original_filename = session.get("original_filename") or "image"
+        image_stem = Path(original_filename).stem
+        segments_dir = self.storage_dir / session_id / "segments_raw" / image_stem
         segment_files = sorted(segments_dir.glob("segment_*.png"))
         if not segment_files:
             raise ValueError("No segments found. Run 'Create Segments' first.")
@@ -486,7 +516,7 @@ class SegmentationService:
             "entries_added": len(results),
             "metadata_path": str(self.storage_dir / session_id / "metadata.jsonl"),
             "dataset_dir": str(self.storage_dir / session_id),
-            "refined_prompts": [r["refined_prompt"] for r in results],
+            "refined_prompts": [r["entry"]["text"] for r in results],
         }
 
     async def generate_caption(self, file: UploadFile) -> str:
@@ -504,10 +534,8 @@ class SegmentationService:
         image_path = self.segment_prompt_dir / filename
         image_path.write_bytes(contents)
 
-        # Prepare for Gemini
         img = Image.open(io.BytesIO(contents))
-        model = genai.GenerativeModel('gemini-1.5-flash')
-
+        client = AsyncOpenAI(api_key=os.getenv("CHATGPT_API_KEY"))
         prompt_text = (
             "Generate a detailed, descriptive caption for this image, suitable for training a Stable Diffusion LoRA. "
             "The caption should be a series of comma-separated keywords and phrases. "
@@ -515,10 +543,15 @@ class SegmentationService:
             "Mention the style of the image (e.g., photo, illustration, 3d render) and any notable lighting or color schemes. "
             "Be concise but comprehensive."
         )
-
-        # Generate content
-        response = await model.generate_content_async([prompt_text, img])
-        caption = response.text
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": _img_to_data_url(img, fmt="JPEG")}},
+            ]}],
+            max_tokens=256,
+        )
+        caption = response.choices[0].message.content.strip()
 
         # Save the generated prompt as a text file
         prompt_path = self.segment_prompt_dir / Path(filename).with_suffix('.txt')

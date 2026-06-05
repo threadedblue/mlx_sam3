@@ -1,18 +1,20 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:file_picker/file_picker.dart';
+
 import 'services/lora_train_service.dart';
 
 enum _TrainState { idle, running, done, failed }
 
 class LoraTrainCard extends StatefulWidget {
+  final String? sessionId;
   final VoidCallback? onRunning;
   final VoidCallback? onComplete;
   final void Function(String? path)? onCompleteWithPath;
 
   const LoraTrainCard({
     super.key,
+    this.sessionId,
     this.onRunning,
     this.onComplete,
     this.onCompleteWithPath,
@@ -24,10 +26,6 @@ class LoraTrainCard extends StatefulWidget {
 
 class _LoraTrainCardState extends State<LoraTrainCard> {
   final _svc = LoraTrainService();
-
-  // Path controllers
-  final _metaCtrl   = TextEditingController();   // metadata.jsonl full path
-  final _outDirCtrl = TextEditingController();   // output directory
 
   // Hyperparameter controllers
   final _modelCtrl  = TextEditingController(text: 'black-forest-labs/FLUX.1-dev');
@@ -57,42 +55,16 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
     _statusSub?.cancel();
     _logTimer?.cancel();
     for (final c in [
-      _metaCtrl, _outDirCtrl, _modelCtrl, _scriptCtrl,
+      _modelCtrl, _scriptCtrl,
       _lrCtrl, _epochsCtrl, _batchCtrl, _rankCtrl, _alphaCtrl, _resCtrl,
     ]) { c.dispose(); }
     super.dispose();
   }
 
-  // ── file pickers ──────────────────────────────────────────────────────────
-
-  Future<void> _pickMetadataFile() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.any,
-      dialogTitle: 'Select metadata.jsonl',
-    );
-    final path = result?.files.single.path;
-    if (path != null) setState(() => _metaCtrl.text = path);
-  }
-
-  Future<void> _pickOutputDir() async {
-    final dir = await FilePicker.platform.getDirectoryPath(
-      dialogTitle: 'Select output directory',
-    );
-    if (dir != null) setState(() => _outDirCtrl.text = dir);
-  }
-
   // ── training ──────────────────────────────────────────────────────────────
 
   Future<void> _train() async {
-    final metaPath = _metaCtrl.text.trim();
-    final outDir   = _outDirCtrl.text.trim();
-    if (metaPath.isEmpty || outDir.isEmpty) return;
-
-    // Derive dataset_dir from the metadata.jsonl path
-    final datasetDir = metaPath.contains('/')
-        ? metaPath.substring(0, metaPath.lastIndexOf('/'))
-        : '.';
-
+    if (widget.sessionId == null) return;
     widget.onRunning?.call();
     setState(() {
       _state = _TrainState.running;
@@ -103,8 +75,7 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
 
     try {
       final config = TrainConfig(
-        datasetDir: datasetDir,
-        outputDir: outDir,
+        sessionId: widget.sessionId!,
         modelPath: _modelCtrl.text.trim(),
         scriptPath: _scriptCtrl.text.trim(),
         rank: int.tryParse(_rankCtrl.text) ?? 16,
@@ -167,8 +138,7 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
   }
 
   bool get _canTrain =>
-      _metaCtrl.text.trim().isNotEmpty &&
-      _outDirCtrl.text.trim().isNotEmpty &&
+      widget.sessionId != null &&
       _state != _TrainState.running;
 
   // ── build ─────────────────────────────────────────────────────────────────
@@ -202,40 +172,17 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
             ),
             const SizedBox(height: 14),
 
-            // ── metadata.jsonl path ──
-            Text('metadata.jsonl',
-                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-            const SizedBox(height: 4),
-            Row(children: [
-              Expanded(
-                child: TextField(
-                  controller: _metaCtrl,
-                  decoration: deco.copyWith(hintText: '/path/to/metadata.jsonl'),
-                  style: const TextStyle(fontSize: 12),
-                  onChanged: (_) => setState(() {}),
-                ),
+            // ── session info ──
+            if (widget.sessionId != null)
+              Text(
+                'Session: ${widget.sessionId!.substring(0, 8)}…',
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+              )
+            else
+              Text(
+                'No active session — upload an image first.',
+                style: TextStyle(fontSize: 11, color: cs.error),
               ),
-              const SizedBox(width: 6),
-              _browseButton(_pickMetadataFile),
-            ]),
-            const SizedBox(height: 10),
-
-            // ── output directory ──
-            Text('Output directory',
-                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-            const SizedBox(height: 4),
-            Row(children: [
-              Expanded(
-                child: TextField(
-                  controller: _outDirCtrl,
-                  decoration: deco.copyWith(hintText: '/path/to/output'),
-                  style: const TextStyle(fontSize: 12),
-                  onChanged: (_) => setState(() {}),
-                ),
-              ),
-              const SizedBox(width: 6),
-              _browseButton(_pickOutputDir),
-            ]),
             const SizedBox(height: 12),
 
             // ── config toggle ──
@@ -353,16 +300,6 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
       child: Text(label, style: TextStyle(fontSize: 11, color: fg, fontWeight: FontWeight.w600)),
     );
   }
-
-  Widget _browseButton(VoidCallback onTap) => IconButton.outlined(
-        icon: const Icon(Icons.folder_open, size: 16),
-        onPressed: onTap,
-        tooltip: 'Browse',
-        style: IconButton.styleFrom(
-          padding: const EdgeInsets.all(8),
-          minimumSize: const Size(36, 36),
-        ),
-      );
 
   Widget _configField(String label, TextEditingController ctrl,
       InputDecoration base, {TextInputType? type}) {
