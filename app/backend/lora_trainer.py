@@ -188,16 +188,27 @@ def train_lora(
     dtype = _dtype(mixed_precision, device)
     log_cb(f"[trainer] device={device} dtype={dtype} rank={rank} alpha={alpha}")
 
+    # Release any MLX/MPS cached memory before loading PyTorch models so both
+    # frameworks don't compete for the same unified memory budget.
+    try:
+        import mlx.core as mx
+        mx.metal.clear_cache()
+        log_cb("[trainer] MLX metal cache cleared")
+    except Exception:
+        pass
+
     # ── load components ────────────────────────────────────────────────────
     log_cb(f"[trainer] loading tokenizer from {model_path!r}")
     tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
 
-    log_cb("[trainer] loading text_encoder")
-    text_enc = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder").to(device, dtype)
+    # Keep text_encoder and VAE on CPU — they are frozen and only need a
+    # forward pass; moving results to `device` per-batch saves ~1.3 GiB MPS.
+    log_cb("[trainer] loading text_encoder (cpu)")
+    text_enc = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder").to(dtype)
     text_enc.requires_grad_(False)
 
-    log_cb("[trainer] loading vae")
-    vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae").to(device, dtype)
+    log_cb("[trainer] loading vae (cpu)")
+    vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae").to(dtype)
     vae.requires_grad_(False)
 
     log_cb("[trainer] loading unet")
@@ -240,11 +251,13 @@ def train_lora(
             if cancelled():
                 raise RuntimeError("Training cancelled.")
 
-            pixels   = batch["pixel_values"].to(device, dtype)
+            pixels   = batch["pixel_values"].to(dtype)  # CPU for VAE encode
             captions = batch["caption"]
 
             with torch.no_grad():
-                latents = vae.encode(pixels).latent_dist.sample() * vae.config.scaling_factor
+                # Encode on CPU then move result to MPS (saves ~1.3 GiB)
+                latents = (vae.encode(pixels).latent_dist.sample()
+                           * vae.config.scaling_factor).to(device)
                 tok_out = tokenizer(
                     captions,
                     padding="max_length",
@@ -252,7 +265,7 @@ def train_lora(
                     truncation=True,
                     return_tensors="pt",
                 )
-                cond = text_enc(tok_out.input_ids.to(device))[0]
+                cond = text_enc(tok_out.input_ids)[0].to(device)
 
             noise     = torch.randn_like(latents)
             t         = torch.randint(0, noise_sched.config.num_train_timesteps, (latents.shape[0],), device=device)
@@ -303,8 +316,8 @@ def _device() -> str:
         import torch
         if torch.cuda.is_available():
             return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
+        # MPS is skipped: it conflicts with MLX unified memory and has known
+        # MPSGraph bugs (tensor dims > INT_MAX) with gradient checkpointing.
     except ImportError:
         pass
     return "cpu"

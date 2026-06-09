@@ -129,6 +129,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _loraTrainRunning = false;
   List<ResultDatum> _loraTrainResult = [];
   String? _loraOutputPath; // forwarded to LoraInferenceCard
+  Uint8List? _inferenceImageBytes; // last generated LoRA inference image
+  ui.Image? _inferenceUiImage;
   Timer? _healthCheckTimer;
 
   // Segment preview overlay
@@ -239,6 +241,15 @@ class _HomeScreenState extends State<HomeScreen> {
     Overlay.of(thumbContext).insert(_segmentPreviewOverlay!);
     _previewDismissTimer =
         Timer(const Duration(seconds: 3), _dismissSegmentPreview);
+  }
+
+  Future<void> _onInferenceImageGenerated(Uint8List bytes) async {
+    final uiImg = await _decodeImage(bytes);
+    if (!mounted) return;
+    setState(() {
+      _inferenceImageBytes = bytes;
+      _inferenceUiImage = uiImg;
+    });
   }
 
   void _dismissSegmentPreview() {
@@ -859,7 +870,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   const SizedBox(height: 16),
                   _buildCardRow(
-                    LoraInferenceCard(initialLoraPath: _loraOutputPath),
+                    LoraInferenceCard(
+                      initialLoraPath: _loraOutputPath,
+                      onImageGenerated: _onInferenceImageGenerated,
+                    ),
                     const ResultCell(isRunning: false, data: []),
                   ),
                   const SizedBox(height: 16),
@@ -897,31 +911,62 @@ class _HomeScreenState extends State<HomeScreen> {
                 border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
               ),
               clipBehavior: Clip.antiAlias,
-              child: (_imageBytes == null)
-                  ? Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.image_outlined, size: 64, color: Theme.of(context).colorScheme.onSurfaceVariant),
-                          const SizedBox(height: 16),
-                          Text("Upload an image to start", style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant)),
-                        ],
-                      ),
-                    )
-                  : (_uiImage == null)
-                      ? const Center(child: CircularProgressIndicator())
-                      : SegmentationCanvas(
-                          uiImage: _uiImage!,
-                          segments: _segments,
-                          result: _result,
-                          isLoading: _isLoading,
-                          onBoxDrawn: _sendBoxPrompt,
-                          onPointDrawn: _sendPointPrompt,
-                        ),
+              child: _inferenceImageBytes != null
+                  ? _buildInferenceCanvas()
+                  : (_imageBytes == null)
+                      ? Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.image_outlined, size: 64, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                              const SizedBox(height: 16),
+                              Text("Upload an image to start", style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                            ],
+                          ),
+                        )
+                      : (_uiImage == null)
+                          ? const Center(child: CircularProgressIndicator())
+                          : SegmentationCanvas(
+                              uiImage: _uiImage!,
+                              segments: _segments,
+                              result: _result,
+                              isLoading: _isLoading,
+                              onBoxDrawn: _sendBoxPrompt,
+                              onPointDrawn: _sendPointPrompt,
+                            ),
             ),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildInferenceCanvas() {
+    final cs = Theme.of(context).colorScheme;
+    return Stack(
+      children: [
+        Center(
+          child: Image.memory(_inferenceImageBytes!, fit: BoxFit.contain),
+        ),
+        Positioned(
+          top: 8,
+          right: 8,
+          child: Tooltip(
+            message: 'Back to segmentation view',
+            child: IconButton.filled(
+              onPressed: () => setState(() {
+                _inferenceImageBytes = null;
+                _inferenceUiImage = null;
+              }),
+              icon: const Icon(Icons.close, size: 16),
+              style: IconButton.styleFrom(
+                backgroundColor: cs.surfaceContainerHighest.withValues(alpha: 0.85),
+                foregroundColor: cs.onSurface,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 

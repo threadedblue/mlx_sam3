@@ -28,14 +28,14 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
   final _svc = LoraTrainService();
 
   // Hyperparameter controllers
-  final _modelCtrl  = TextEditingController(text: 'black-forest-labs/FLUX.1-dev');
+  final _modelCtrl  = TextEditingController(text: 'runwayml/stable-diffusion-v1-5');
   final _scriptCtrl = TextEditingController(text: 'train_dreambooth_lora_flux.py');
   final _lrCtrl     = TextEditingController(text: '0.0001');
   final _epochsCtrl = TextEditingController(text: '1');
   final _batchCtrl  = TextEditingController(text: '1');
   final _rankCtrl   = TextEditingController(text: '16');
   final _alphaCtrl  = TextEditingController(text: '16');
-  final _resCtrl    = TextEditingController(text: '1024');
+  final _resCtrl    = TextEditingController(text: '512');
   String _mixedPrecision = 'bf16';
 
   _TrainState _state = _TrainState.idle;
@@ -199,8 +199,6 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
             if (_showConfig) ...[
               const SizedBox(height: 10),
               _configField('Base model', _modelCtrl, deco),
-              const SizedBox(height: 6),
-              _configField('Script path', _scriptCtrl, deco),
               const SizedBox(height: 6),
               Row(children: [
                 Expanded(child: _configField('Learning rate', _lrCtrl, deco,

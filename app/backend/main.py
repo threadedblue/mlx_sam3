@@ -608,7 +608,7 @@ class LoraTrainRequest(BaseModel):
     dataset_dir: str = ""   # auto-derived from session_id if empty
     output_dir: str = ""    # auto-derived from session_id if empty
     model_path: str = "runwayml/stable-diffusion-v1-5"
-    script_path: str = "train_dreambooth_lora_flux.py"
+    script_path: str = ""
     rank: int = 16
     alpha: int = 16
     learning_rate: float = 1e-4

@@ -18,12 +18,14 @@ class LoraInferenceCard extends StatefulWidget {
   final String? initialLoraPath;  // pre-populated from training card
   final VoidCallback? onRunning;
   final VoidCallback? onComplete;
+  final void Function(Uint8List bytes)? onImageGenerated;
 
   const LoraInferenceCard({
     super.key,
     this.initialLoraPath,
     this.onRunning,
     this.onComplete,
+    this.onImageGenerated,
   });
 
   @override
@@ -35,14 +37,14 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
 
   // ── path / model ──────────────────────────────────────────────────────────
   final _loraCtrl   = TextEditingController();
-  final _modelCtrl  = TextEditingController(text: 'black-forest-labs/FLUX.1-dev');
+  final _modelCtrl  = TextEditingController(text: 'runwayml/stable-diffusion-v1-5');
   final _promptCtrl = TextEditingController();
   final _outDirCtrl = TextEditingController();
 
   // ── inference params ──────────────────────────────────────────────────────
   double _loraStrength  = 0.8;
-  final _stepsCtrl      = TextEditingController(text: '28');
-  final _guidanceCtrl   = TextEditingController(text: '3.5');
+  final _stepsCtrl      = TextEditingController(text: '20');
+  final _guidanceCtrl   = TextEditingController(text: '7.5');
   final _seedCtrl       = TextEditingController(text: '42');
   bool _showParams      = false;
 
@@ -331,6 +333,7 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
                 _imagePath  = status.outputPath;
                 _state      = _InferState.done;
               });
+              widget.onImageGenerated?.call(bytes);
               widget.onComplete?.call();
             } catch (e) {
               if (!mounted) return;
@@ -393,7 +396,7 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
             const SizedBox(height: 4),
             TextField(
               controller: _modelCtrl,
-              decoration: deco.copyWith(hintText: 'black-forest-labs/FLUX.1-dev'),
+              decoration: deco.copyWith(hintText: 'runwayml/stable-diffusion-v1-5'),
               style: const TextStyle(fontSize: 12),
             ),
             const SizedBox(height: 10),
@@ -465,10 +468,13 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
               ),
             ],
 
-            // ── Output image ──
+            // ── Output image (inline only when no external canvas is wired up) ──
             if (_state == _InferState.done && _imageBytes != null) ...[
               const SizedBox(height: 14),
-              _outputSection(cs),
+              if (widget.onImageGenerated == null)
+                _outputSection(cs)
+              else
+                _outputDoneRow(cs),
             ],
 
             // ── Error ──
@@ -735,6 +741,31 @@ class _LoraInferenceCardState extends State<LoraInferenceCard> {
         ),
       ),
     ]);
+  }
+
+  Widget _outputDoneRow(ColorScheme cs) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.green.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.green.withValues(alpha: 0.3)),
+      ),
+      child: Row(children: [
+        const Icon(Icons.check_circle_outline, size: 14, color: Colors.green),
+        const SizedBox(width: 8),
+        const Expanded(
+          child: Text('Image generated — see canvas',
+              style: TextStyle(fontSize: 11, color: Colors.green)),
+        ),
+        IconButton(
+          icon: const Icon(Icons.save_alt, size: 14),
+          tooltip: 'Save image',
+          visualDensity: VisualDensity.compact,
+          onPressed: _saveAs,
+        ),
+      ]),
+    );
   }
 
   Widget _outputSection(ColorScheme cs) {

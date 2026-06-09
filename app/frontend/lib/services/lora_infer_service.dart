@@ -100,9 +100,10 @@ class ProviderInfo {
       );
 
   String get label => switch (name) {
-        'mlx'       => 'MLX',
-        'cloud_run' => 'Cloud Run',
-        _           => name,
+        'mlx'           => 'MLX (FLUX)',
+        'cloud_run'     => 'Cloud Run',
+        'pytorch_sd15'  => 'SD 1.5 (MPS)',
+        _               => name,
       };
 }
 

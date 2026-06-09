@@ -29,21 +29,24 @@ from inference_providers import (
     InferenceProvider,
     MlxLocalProvider,
     CloudRunProvider,
+    PytorchSd15Provider,
 )
 
 # ---------------------------------------------------------------------------
 # Provider registry
 # ---------------------------------------------------------------------------
 
-_mlx_provider   = MlxLocalProvider()
-_cloud_provider = CloudRunProvider()
+_mlx_provider    = MlxLocalProvider()
+_cloud_provider  = CloudRunProvider()
+_sd15_provider   = PytorchSd15Provider()
 
 _REGISTRY: Dict[str, InferenceProvider] = {
-    "mlx":       _mlx_provider,
-    "cloud_run": _cloud_provider,
+    "mlx":           _mlx_provider,
+    "cloud_run":     _cloud_provider,
+    "pytorch_sd15":  _sd15_provider,
 }
 
-_active_provider_name: str = "mlx"
+_active_provider_name: str = "pytorch_sd15"
 
 # ---------------------------------------------------------------------------
 # Config persistence
@@ -79,7 +82,7 @@ def load_provider_from_config() -> None:
     """Called at startup to restore last-used provider and Cloud Run URL."""
     global _active_provider_name
     cfg = _load_config()
-    name = cfg.get("provider", "mlx")
+    name = cfg.get("provider", "pytorch_sd15")
     url  = cfg.get("cloud_run_url", "")
     if url:
         _cloud_provider.url = url

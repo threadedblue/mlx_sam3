@@ -35,6 +35,19 @@ except Exception:
     _MFLUX_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
+# PyTorch + diffusers — SD 1.5 LoRA inference on CPU
+# ---------------------------------------------------------------------------
+
+try:
+    import torch as _torch
+    from diffusers import StableDiffusionPipeline as _SDPipeline
+    from peft import LoraConfig as _LoraConfig, get_peft_model as _get_peft_model
+    from safetensors.torch import load_file as _sf_load
+    _PYTORCH_SD15_AVAILABLE = True
+except Exception:
+    _PYTORCH_SD15_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
 # httpx — used by CloudRunProvider for blocking HTTP calls inside a thread
 # ---------------------------------------------------------------------------
 
@@ -406,3 +419,179 @@ class CloudRunProvider:
                     )
 
         raise RuntimeError(f"Timed out waiting for Cloud Run after {self._TIMEOUT}s")
+
+
+# ---------------------------------------------------------------------------
+# PytorchSd15Provider
+# ---------------------------------------------------------------------------
+
+def _sd15_device() -> str:
+    if not _PYTORCH_SD15_AVAILABLE:
+        return "cpu"
+    if _torch.cuda.is_available():
+        return "cuda"
+    if hasattr(_torch.backends, "mps") and _torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+class PytorchSd15Provider:
+    """
+    Runs SD 1.5 UNet-LoRA inference on CPU via PyTorch + diffusers + PEFT.
+
+    The LoRA adapter was saved by lora_trainer.py as a flat safetensors file
+    with PEFT-format keys (base_model.model.{...}.lora_A/B.default.weight).
+    We re-apply the same LoRA config, load the weights, and merge before
+    running inference so each forward pass is a standard UNet call.
+
+    Caching: the merged pipeline is cached by (model_path, lora_path,
+    lora_strength) — any change triggers a reload.
+    """
+
+    name = "pytorch_sd15"
+
+    def __init__(self) -> None:
+        self._pipe: Any = None
+        self._cached_key: Optional[tuple] = None
+
+    def is_available(self) -> bool:
+        return _PYTORCH_SD15_AVAILABLE
+
+    def cached_model(self) -> Optional[str]:
+        return self._cached_key[0] if self._cached_key else None
+
+    def release(self) -> None:
+        self._pipe = None
+        self._cached_key = None
+
+    def status_dict(self) -> Dict[str, Any]:
+        return {
+            "available": self.is_available(),
+            "model_loaded": self._pipe is not None,
+            "cached_model": self.cached_model(),
+        }
+
+    def run_inference(
+        self,
+        *,
+        lora_path: str,
+        model_path: str,
+        prompt: str,
+        lora_strength: float = 1.0,
+        steps: int = 20,
+        guidance_scale: float = 7.5,
+        seed: int = 42,
+        output_path: str,
+        continuity_image_bytes: Optional[bytes] = None,
+        denoise_strength: float = 0.75,
+        log_cb: Callable[[str], None] = print,
+        progress_cb: Callable[[int, int], None] = lambda *_: None,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> str:
+        if not _PYTORCH_SD15_AVAILABLE:
+            raise RuntimeError(
+                "SD 1.5 inference requires: pip install diffusers peft safetensors torch"
+            )
+
+        cache_key = (model_path, lora_path, lora_strength)
+        if self._pipe is None or self._cached_key != cache_key:
+            self._pipe = None  # release previous before loading new
+            device = _sd15_device()
+            dtype = _torch.float16 if device == "mps" else _torch.float32
+            log_cb(f"[sd15] loading pipeline from {model_path!r} device={device} dtype={dtype}")
+            pipe = _SDPipeline.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                safety_checker=None,
+                requires_safety_checker=False,
+            )
+            pipe = pipe.to(device)
+            pipe.set_progress_bar_config(disable=True)
+
+            log_cb(f"[sd15] applying LoRA from {lora_path!r} (strength={lora_strength})")
+            lora_sd = _sf_load(lora_path)
+
+            # Infer rank from first lora_A tensor
+            rank = 16
+            for k, v in lora_sd.items():
+                if "lora_A" in k:
+                    rank = int(v.shape[0])
+                    break
+
+            # Scale lora_B weights by lora_strength so merged UNet reflects
+            # the desired contribution magnitude. Cast to pipeline dtype.
+            lora_sd = {
+                k: (v * lora_strength if "lora_B" in k else v).to(dtype)
+                for k, v in lora_sd.items()
+            }
+
+            lora_cfg = _LoraConfig(
+                r=rank,
+                lora_alpha=rank,
+                target_modules=["to_q", "to_v", "to_k", "to_out.0"],
+                lora_dropout=0.0,
+                bias="none",
+            )
+            pipe.unet = _get_peft_model(pipe.unet, lora_cfg)
+            missing, unexpected = pipe.unet.load_state_dict(lora_sd, strict=False)
+            log_cb(f"[sd15] LoRA state: {len(missing)} missing, {len(unexpected)} unexpected")
+
+            # Merge LoRA into base UNet weights and unwrap PEFT for fast inference.
+            pipe.unet.merge_adapter()
+            pipe.unet = pipe.unet.base_model.model
+            log_cb("[sd15] LoRA merged into UNet")
+
+            self._pipe = pipe
+            self._cached_key = cache_key
+
+        pipe = self._pipe
+        # MPS doesn't support on-device generators; CPU generator works for seeding.
+        generator = _torch.Generator("cpu").manual_seed(seed)
+
+        def _on_step_end(pipeline, step: int, timestep, callback_kwargs):
+            progress_cb(step + 1, steps)
+            log_cb(f"[sd15] step {step + 1}/{steps}")
+            if cancelled():
+                raise RuntimeError("Generation cancelled.")
+            return callback_kwargs
+
+        log_cb(f"[sd15] generating: steps={steps} guidance={guidance_scale} seed={seed}")
+
+        if continuity_image_bytes:
+            from PIL import Image as _PIL_Image
+            import io as _io
+            from diffusers import StableDiffusionImg2ImgPipeline as _Img2Img
+            img2img = _Img2Img(
+                vae=pipe.vae,
+                text_encoder=pipe.text_encoder,
+                tokenizer=pipe.tokenizer,
+                unet=pipe.unet,
+                scheduler=pipe.scheduler,
+                safety_checker=None,
+                feature_extractor=None,
+                requires_safety_checker=False,
+            )
+            init_image = _PIL_Image.open(_io.BytesIO(continuity_image_bytes)).convert("RGB")
+            result = img2img(
+                prompt=prompt,
+                image=init_image,
+                strength=denoise_strength,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                callback_on_step_end=_on_step_end,
+            )
+        else:
+            result = pipe(
+                prompt,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                callback_on_step_end=_on_step_end,
+            )
+
+        image = result.images[0]
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        image.save(output_path)
+        log_cb(f"[sd15] saved → {output_path}")
+        return output_path
