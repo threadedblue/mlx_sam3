@@ -285,6 +285,9 @@ def train_lora(
                 loss = F.mse_loss(pred.float(), noise.float())
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in unet.parameters() if p.requires_grad], max_norm=1.0
+            )
             optimizer.step()
             optimizer.zero_grad()
 
@@ -338,6 +341,6 @@ def _dtype(mixed_precision: str, device: str):
         if mixed_precision == "fp16":
             return torch.float16
     if device == "mps":
-        # MPS supports fp16 but not bf16; use fp16 regardless of mixed_precision setting.
-        return torch.float16
+        # float16 causes NaN loss on MPS during backward pass; use float32.
+        return torch.float32
     return torch.float32

@@ -38,7 +38,7 @@ class TrainConfig {
     this.scriptPath = '',
     this.rank = 16,
     this.alpha = 16,
-    this.learningRate = 1e-4,
+    this.learningRate = 5e-5,
     this.numTrainEpochs = 3,
     this.batchSize = 1,
     this.resolution = 512,
