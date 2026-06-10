@@ -212,11 +212,13 @@ def train_lora(
     vae.requires_grad_(False)
 
     log_cb("[trainer] loading unet")
-    unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet").to(device, dtype)
+    unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet")
 
     noise_sched = DDPMScheduler.from_pretrained(model_path, subfolder="scheduler")
 
     # ── apply LoRA ─────────────────────────────────────────────────────────
+    # Wrap with PEFT *before* moving to device so LoRA layers land on the
+    # same device as the base weights (moving after ensures all params move).
     log_cb(f"[trainer] applying LoRA r={rank} alpha={alpha}")
     lora_cfg = LoraConfig(
         r=rank,
@@ -226,8 +228,11 @@ def train_lora(
         bias="none",
     )
     unet = get_peft_model(unet, lora_cfg)
+    unet = unet.to(device, dtype)
     trainable = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    actual_device = next(unet.parameters()).device
     log_cb(f"[trainer] trainable parameters: {trainable:,}")
+    log_cb(f"[trainer] UNet confirmed on: {actual_device}  (target: {device})")
 
     # ── dataset & optimizer ────────────────────────────────────────────────
     dataset = MetadataDataset(dataset_dir, resolution)
@@ -271,8 +276,10 @@ def train_lora(
             t         = torch.randint(0, noise_sched.config.num_train_timesteps, (latents.shape[0],), device=device)
             noisy_lat = noise_sched.add_noise(latents, noise, t)
 
-            with torch.autocast(device_type=device if device != "cpu" else "cpu",
-                                 enabled=mixed_precision != "no",
+            # autocast device_type must be "cuda" or "cpu" — MPS uses "cpu" path.
+            ac_device = "cuda" if device == "cuda" else "cpu"
+            with torch.autocast(device_type=ac_device,
+                                 enabled=(mixed_precision != "no" and device == "cuda"),
                                  dtype=dtype):
                 pred = unet(noisy_lat, t, cond).sample
                 loss = F.mse_loss(pred.float(), noise.float())
@@ -316,8 +323,8 @@ def _device() -> str:
         import torch
         if torch.cuda.is_available():
             return "cuda"
-        # MPS is skipped: it conflicts with MLX unified memory and has known
-        # MPSGraph bugs (tensor dims > INT_MAX) with gradient checkpointing.
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
     except ImportError:
         pass
     return "cpu"
@@ -325,8 +332,12 @@ def _device() -> str:
 
 def _dtype(mixed_precision: str, device: str):
     import torch
-    if mixed_precision == "bf16" and device != "cpu":
-        return torch.bfloat16
-    if mixed_precision == "fp16" and device == "cuda":
+    if device == "cuda":
+        if mixed_precision == "bf16":
+            return torch.bfloat16
+        if mixed_precision == "fp16":
+            return torch.float16
+    if device == "mps":
+        # MPS supports fp16 but not bf16; use fp16 regardless of mixed_precision setting.
         return torch.float16
     return torch.float32

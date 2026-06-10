@@ -34,15 +34,15 @@ class TrainConfig {
 
   TrainConfig({
     required this.sessionId,
-    this.modelPath = 'black-forest-labs/FLUX.1-dev',
-    this.scriptPath = 'train_dreambooth_lora_flux.py',
+    this.modelPath = 'runwayml/stable-diffusion-v1-5',
+    this.scriptPath = '',
     this.rank = 16,
     this.alpha = 16,
     this.learningRate = 1e-4,
-    this.numTrainEpochs = 1,
+    this.numTrainEpochs = 3,
     this.batchSize = 1,
-    this.resolution = 1024,
-    this.mixedPrecision = 'bf16',
+    this.resolution = 512,
+    this.mixedPrecision = 'no',
   });
 
   Map<String, dynamic> toJson() => {
@@ -60,7 +60,7 @@ class TrainConfig {
 }
 
 class TrainStatus {
-  final String status; // running | done | failed
+  final String status; // running | done | failed | cancelled
   final int currentStep;
   final int totalSteps;
   final int elapsedSeconds;
@@ -85,7 +85,7 @@ class TrainStatus {
         lastError: j['last_error'] as String?,
       );
 
-  bool get isTerminal => status == 'done' || status == 'failed';
+  bool get isTerminal => status == 'done' || status == 'failed' || status == 'cancelled';
 }
 
 class LoraTrainService {
@@ -121,18 +121,54 @@ class LoraTrainService {
   }
 
   Stream<TrainStatus> watchStatus(String runId) async* {
+    // Allow up to this many consecutive network failures before giving up.
+    const maxConsecutiveFailures = 5;
+    int consecutiveFailures = 0;
+
     while (true) {
       await Future.delayed(const Duration(seconds: 2));
       try {
         final response = await http.get(
             Uri.parse('$baseUrl/pipeline/lora_train/status/$runId'));
+
         if (response.statusCode == 200) {
+          consecutiveFailures = 0;
           final status = TrainStatus.fromJson(
               jsonDecode(response.body) as Map<String, dynamic>);
           yield status;
           if (status.isTerminal) break;
+        } else if (response.statusCode == 404) {
+          // Run no longer exists — backend restarted or process was killed.
+          throw Exception(
+              'Training process stopped unexpectedly. '
+              'The backend may have restarted.');
+        } else {
+          consecutiveFailures++;
+          if (consecutiveFailures >= maxConsecutiveFailures) {
+            throw Exception(
+                'Lost connection to backend after $maxConsecutiveFailures retries '
+                '(HTTP ${response.statusCode}).');
+          }
         }
-      } catch (_) {}
+      } on Exception {
+        rethrow;
+      } catch (_) {
+        consecutiveFailures++;
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          throw Exception(
+              'Lost connection to backend after $maxConsecutiveFailures retries.');
+        }
+      }
+    }
+  }
+
+  Future<bool> cancelTraining(String runId) async {
+    try {
+      final response = await http.post(
+          Uri.parse('$baseUrl/pipeline/lora_train/cancel/$runId'));
+      return response.statusCode == 200;
+    } catch (_) {
+      return false;
     }
   }
 

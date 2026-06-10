@@ -4,7 +4,7 @@ import 'package:flutter/services.dart';
 
 import 'services/lora_train_service.dart';
 
-enum _TrainState { idle, running, done, failed }
+enum _TrainState { idle, running, done, failed, cancelled }
 
 class LoraTrainCard extends StatefulWidget {
   final String? sessionId;
@@ -31,7 +31,7 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
   final _modelCtrl  = TextEditingController(text: 'runwayml/stable-diffusion-v1-5');
   final _scriptCtrl = TextEditingController(text: 'train_dreambooth_lora_flux.py');
   final _lrCtrl     = TextEditingController(text: '0.0001');
-  final _epochsCtrl = TextEditingController(text: '1');
+  final _epochsCtrl = TextEditingController(text: '3');
   final _batchCtrl  = TextEditingController(text: '1');
   final _rankCtrl   = TextEditingController(text: '16');
   final _alphaCtrl  = TextEditingController(text: '16');
@@ -101,14 +101,24 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
             widget.onComplete?.call();
             widget.onCompleteWithPath?.call(_outputPath);
           } else if (status.status == 'failed') {
-            _error = status.lastError;
+            _error = status.lastError ?? 'Training failed';
             setState(() => _state = _TrainState.failed);
+            _stopPolling();
+          } else if (status.status == 'cancelled') {
+            setState(() => _state = _TrainState.cancelled);
             _stopPolling();
           }
         },
         onError: (e) {
           if (!mounted) return;
-          setState(() { _state = _TrainState.failed; _error = e.toString(); });
+          // Distinguish external kills (404 → process stopped) from other errors.
+          final msg = e.toString();
+          final stopped = msg.contains('stopped unexpectedly') ||
+              msg.contains('Lost connection');
+          setState(() {
+            _state = stopped ? _TrainState.cancelled : _TrainState.failed;
+            _error = msg;
+          });
           _stopPolling();
         },
       );
@@ -128,6 +138,17 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
   void _stopPolling() {
     _logTimer?.cancel();
     _statusSub?.cancel();
+  }
+
+  Future<void> _cancel() async {
+    if (_runId == null) return;
+    await _svc.cancelTraining(_runId!);
+    // State will update via watchStatus stream; if that's already gone,
+    // set cancelled immediately.
+    if (mounted && _state == _TrainState.running) {
+      setState(() { _state = _TrainState.cancelled; _error = 'Cancelled by user.'; });
+      _stopPolling();
+    }
   }
 
   // ── helpers ───────────────────────────────────────────────────────────────
@@ -254,10 +275,47 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
               ),
             ),
 
-            // ── progress ──
+            // ── progress + cancel ──
             if (_state == _TrainState.running) ...[
               const SizedBox(height: 10),
               _progressSection(cs),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _cancel,
+                  icon: const Icon(Icons.stop_circle_outlined, size: 14),
+                  label: const Text('Cancel', style: TextStyle(fontSize: 12)),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.red,
+                    side: const BorderSide(color: Colors.red),
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                  ),
+                ),
+              ),
+            ],
+
+            // ── cancelled ──
+            if (_state == _TrainState.cancelled) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.grey.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.grey.withValues(alpha: 0.3)),
+                ),
+                child: Row(children: [
+                  const Icon(Icons.stop_circle_outlined, size: 14, color: Colors.grey),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _error ?? 'Training stopped.',
+                      style: const TextStyle(fontSize: 11, color: Colors.grey),
+                    ),
+                  ),
+                ]),
+              ),
             ],
 
             // ── success ──
@@ -287,10 +345,11 @@ class _LoraTrainCardState extends State<LoraTrainCard> {
 
   Widget _stateChip(ColorScheme cs) {
     final (label, bg, fg) = switch (_state) {
-      _TrainState.idle    => ('Idle',     cs.surfaceContainerHighest, cs.onSurfaceVariant),
-      _TrainState.running => ('Running',  Colors.orange.withValues(alpha: 0.2), Colors.orange),
-      _TrainState.done    => ('Done',     Colors.green.withValues(alpha: 0.15), Colors.green),
-      _TrainState.failed  => ('Failed',   cs.errorContainer, cs.onErrorContainer),
+      _TrainState.idle      => ('Idle',       cs.surfaceContainerHighest,           cs.onSurfaceVariant),
+      _TrainState.running   => ('Running',    Colors.orange.withValues(alpha: 0.2), Colors.orange),
+      _TrainState.done      => ('Done',       Colors.green.withValues(alpha: 0.15), Colors.green),
+      _TrainState.failed    => ('Failed',     cs.errorContainer,                    cs.onErrorContainer),
+      _TrainState.cancelled => ('Cancelled',  Colors.grey.withValues(alpha: 0.2),   Colors.grey),
     };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
