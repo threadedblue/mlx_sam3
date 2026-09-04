@@ -44,6 +44,9 @@ case "$MODE" in
     echo -e "${YELLOW}Hot reload: r   Hot restart: R   Quit: q${NC}"
     echo ""
     cd "$FRONTEND_DIR"
+    flutter clean
+    flutter pub get
+    dart run flutter_launcher_icons 2>/dev/null || true
     exec flutter run -d macos
     ;;
 
