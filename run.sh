@@ -33,10 +33,8 @@ case "$MODE" in
     echo -e "${YELLOW}API docs: http://localhost:8000/docs${NC}"
     echo ""
     cd "$PROJECT_ROOT"
-    unset VIRTUAL_ENV
-    export VIRTUAL_ENV="$PROJECT_ROOT/.venv"
-    source "$VIRTUAL_ENV/bin/activate"
-    pip install -q -r "$BACKEND_DIR/requirements.txt"
+    source "$PROJECT_ROOT/.venv/bin/activate"
+    pip install -q -r "$BACKEND_DIR/requirements.txt" 2>&1 | grep -v "already satisfied"
     cd "$BACKEND_DIR"
     exec uvicorn main:app --reload
     ;;
