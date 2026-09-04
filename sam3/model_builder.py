@@ -2,6 +2,7 @@ import os
 
 import mlx.core as mx
 import mlx.nn as nn
+from safetensors.numpy import load_file as load_safetensors
 
 from sam3.convert import load_from_hub, download_and_convert, MLX_COMMUNITY_REPO
 from sam3.model.sam3_image import Sam3Image
@@ -273,18 +274,23 @@ def _create_sam3_transformer(has_presence_token: bool = True):
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
 def load_checkpoint(model, checkpoint_path):
-    weights = mx.load(checkpoint_path)
+    if str(checkpoint_path).endswith('.safetensors'):
+        weights_np = load_safetensors(checkpoint_path)
+        weights = {k: mx.array(v) for k, v in weights_np.items()}
+    else:
+        weights = mx.load(checkpoint_path)
+
     try:
         model.load_weights(weights, strict=False)
         mx.eval(model.parameters())
     except ValueError as e:
         msg = str(e)
-        
+
         expected_missing = [
-            "attn_mask", 
+            "attn_mask",
             "position_encoding.cache"
         ]
-        
+
         if all(key in msg for key in expected_missing) or "Missing" in msg:
             print(f"Expected Missing Buffers: {e}")
             model.load_weights(weights, strict=False)

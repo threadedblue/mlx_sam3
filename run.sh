@@ -33,9 +33,12 @@ case "$MODE" in
     echo -e "${YELLOW}API docs: http://localhost:8000/docs${NC}"
     echo ""
     cd "$PROJECT_ROOT"
-    uv pip install -r "$BACKEND_DIR/requirements.txt" --quiet
+    unset VIRTUAL_ENV
+    export VIRTUAL_ENV="$PROJECT_ROOT/.venv"
+    source "$VIRTUAL_ENV/bin/activate"
+    pip install -q -r "$BACKEND_DIR/requirements.txt"
     cd "$BACKEND_DIR"
-    exec uv run uvicorn main:app --reload
+    exec uvicorn main:app --reload
     ;;
 
   FE)

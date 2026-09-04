@@ -3,7 +3,7 @@ name = "segforge"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "ftfy>=6.3.1",
     "huggingface-hub>=1.18.0",
