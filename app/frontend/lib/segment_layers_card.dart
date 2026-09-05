@@ -23,13 +23,18 @@ class SegmentLayersCard extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         Text(
-          'Segment Layers',
+          'Display Layers',
           style: Theme.of(context).textTheme.titleMedium,
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 12),
         Consumer<LayerState>(builder: (context, layerState, child) {
-          return Column(
-            mainAxisSize: MainAxisSize.min,
+          return GridView.count(
+            crossAxisCount: 2,
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            childAspectRatio: 3,
+            crossAxisSpacing: 4,
+            mainAxisSpacing: 4,
             children: [
               _buildLayerCheckbox('Original', layerState.showOriginal, layerState.setOriginal),
               _buildLayerCheckbox('Masks', layerState.showMasks, layerState.setMasks),

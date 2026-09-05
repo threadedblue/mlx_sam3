@@ -13,21 +13,18 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:http/http.dart' as http;
 
 import 'package:flutter/material.dart';
-// import 'package:flutter/foundation.dart' show kIsWeb;
-import 'package:file_picker/file_picker.dart';
 
 import 'services/api_service.dart';
 import 'segment_layers_card.dart';
 import 'package:provider/provider.dart';
 import 'layered_segmentation_canvas.dart';
-import 'training_data_card.dart';
-import 'lora_train_card.dart';
-import 'lora_inference_card.dart';
 import 'layer_state.dart';
 import 'models/result_datum.dart';
 import 'widgets/result_cell.dart';
+import 'widgets/include_exclude_toggle.dart';
 
 void main() {
   runApp(const SamApp());
@@ -43,7 +40,7 @@ class SamApp extends StatelessWidget {
         ChangeNotifierProvider(create: (context) => LayerState()),
       ],
       child: MaterialApp(
-        title: 'SAM3 Studio',
+        title: 'SegForge Studio',
         debugShowCheckedModeBanner: false,
         theme: ThemeData(
           colorScheme: ColorScheme.fromSeed(
@@ -82,25 +79,25 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // State
   String? _sessionId;
-  
+
   Uint8List? _imageBytes; // Web-safe image data
-  String? _imageName; // Optional, useful for upload filename
   ui.Image? _uiImage; // Decoded image for canvas
   Size? _imageSize; // Original size
+
+  final TextEditingController _imageUrlController = TextEditingController();
 
   Map<String, dynamic>? _result;
   List<Segment> _segments = [];
   bool _isLoading = false;
   String? _error;
   String _backendStatus = "checking";
-    String _boxMode = "positive"; // "positive" or "negative"
+  bool _boxSelectEnabled = false;
+  String _boxMode = "positive"; // "positive" or "negative"
+  bool _pointSelectEnabled = false;
   String _pointMode = "positive"; // "positive" or "negative"
 
-    List<String> _savedSessions = [];
+  List<String> _savedSessions = [];
   String? _selectedSavedSession;
-
-  // Timing
-  final List<Map<String, dynamic>> _timings = [];
 
   // Per-card result state
   bool _imageSourceRunning = false;
@@ -113,29 +110,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<ResultDatum> _pointResult = [];
   bool _resultsRunning = false;
   List<ResultDatum> _resultsResult = [];
-  bool _downloadRunning = false;
-  List<ResultDatum> _downloadResult = [];
-  bool _segmentsRunning = false;
-  List<ResultDatum> _segmentsResult = [];
-  bool _captionRunning = false;
-  List<ResultDatum> _captionResult = [];
-  List<String> _segmentUrls = [];
-  int? _selectedSegmentIndex;
-  Set<int> _captionedSegmentIndices = {};
-  Map<String, dynamic>? _lastCaptionEntry;
-  String? _captionRawError;
-  bool _loraTrainPrepRunning = false;
-  List<ResultDatum> _loraTrainPrepResult = [];
-  bool _loraTrainRunning = false;
-  List<ResultDatum> _loraTrainResult = [];
-  String? _loraOutputPath; // forwarded to LoraInferenceCard
-  Uint8List? _inferenceImageBytes; // last generated LoRA inference image
-  ui.Image? _inferenceUiImage;
   Timer? _healthCheckTimer;
-
-  // Segment preview overlay
-  OverlayEntry? _segmentPreviewOverlay;
-  Timer? _previewDismissTimer;
 
   // Layer State
   LayerState? _layerState;
@@ -171,93 +146,11 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _healthCheckTimer?.cancel();
     _textController.dispose();
+    _imageUrlController.dispose();
     _layerState?.removeListener(_onLayerStateChanged);
-    _dismissSegmentPreview();
     super.dispose();
   }
 
-  void _showSegmentPreview(BuildContext thumbContext, int index) {
-    _dismissSegmentPreview();
-
-    final box = thumbContext.findRenderObject() as RenderBox?;
-    if (box == null) return;
-
-    final offset = box.localToGlobal(Offset.zero);
-    final thumbSize = box.size;
-    final screenHeight = MediaQuery.of(thumbContext).size.height;
-
-    const previewSize = 220.0;
-    final double left = 540; // just right of the 520px sidebar
-    final double top = (offset.dy + thumbSize.height / 2 - previewSize / 2)
-        .clamp(8.0, screenHeight - previewSize - 8);
-
-    final url = _segmentUrls[index];
-
-    _segmentPreviewOverlay = OverlayEntry(
-      builder: (ctx) => Positioned(
-        left: left,
-        top: top,
-        child: IgnorePointer(
-          child: Material(
-            elevation: 12,
-            borderRadius: BorderRadius.circular(12),
-            color: Colors.transparent,
-            child: Container(
-              width: previewSize,
-              height: previewSize,
-              decoration: BoxDecoration(
-                color: Colors.grey.shade900,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: Theme.of(thumbContext).colorScheme.primary,
-                  width: 2,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.5),
-                    blurRadius: 20,
-                    offset: const Offset(4, 6),
-                  ),
-                ],
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(10),
-                child: Image.network(
-                  url,
-                  fit: BoxFit.contain,
-                  errorBuilder: (_, __, ___) => const Icon(
-                    Icons.broken_image,
-                    size: 48,
-                    color: Colors.white54,
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-
-    Overlay.of(thumbContext).insert(_segmentPreviewOverlay!);
-    _previewDismissTimer =
-        Timer(const Duration(seconds: 3), _dismissSegmentPreview);
-  }
-
-  Future<void> _onInferenceImageGenerated(Uint8List bytes) async {
-    final uiImg = await _decodeImage(bytes);
-    if (!mounted) return;
-    setState(() {
-      _inferenceImageBytes = bytes;
-      _inferenceUiImage = uiImg;
-    });
-  }
-
-  void _dismissSegmentPreview() {
-    _previewDismissTimer?.cancel();
-    _previewDismissTimer = null;
-    _segmentPreviewOverlay?.remove();
-    _segmentPreviewOverlay = null;
-  }
 
   Future<void> _checkHealth() async {
     try {
@@ -289,17 +182,6 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  void _addTiming(String label, dynamic duration) {
-    if (duration == null) return;
-    setState(() {
-      _timings.insert(0, {
-        'label': label,
-        'duration': duration,
-        'timestamp': DateTime.now(),
-      });
-      if (_timings.length > 10) _timings.removeLast();
-    });
-  }
 
   Future<ui.Image> _decodeImage(Uint8List bytes) {
     final completer = Completer<ui.Image>();
@@ -381,64 +263,52 @@ class _HomeScreenState extends State<HomeScreen> {
     debugPrint('Finished updating segments. Found ${newSegments.length} segments.');
   }
 
-  Future<void> _pickImage() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles(
-      type: FileType.image,
-      withData: true, // IMPORTANT: web needs bytes
-    );
-
-    final picked = result?.files.single;
-    final bytes = picked?.bytes;
-
-    if (bytes == null) return;
-
-    final decodedImage = await _decodeImage(bytes);
+  Future<void> _loadImageFromUrl() async {
+    final url = _imageUrlController.text.trim();
+    if (url.isEmpty) return;
 
     setState(() {
       _isLoading = true;
       _imageSourceRunning = true;
       _imageSourceResult = [];
       _error = null;
-      _imageBytes = bytes;
-      _imageName = picked?.name;
-      _uiImage = decodedImage;
-      _result = null;
-      _imageSize = null;
-      _segments = [];
-      _segmentUrls = [];
-      _selectedSegmentIndex = null;
-      _captionedSegmentIndices = {};
-      _lastCaptionEntry = null;
-      _captionRawError = null;
     });
 
     try {
-      final response = await _api.uploadImageBytes(
-        bytes,
-        filename: _imageName ?? "upload.png",
+      // Download image from URL
+      final response = await http.get(Uri.parse(url));
+      if (response.statusCode != 200) {
+        throw Exception("Failed to download image: ${response.statusCode}");
+      }
+
+      final imageBytes = response.bodyBytes;
+      final decodedImage = await _decodeImage(imageBytes);
+
+      // Upload to backend
+      final uploadResponse = await _api.uploadImageBytes(
+        imageBytes,
+        filename: url.split('/').last.isEmpty ? "image.png" : url.split('/').last,
         sessionId: _sessionId,
       );
 
-      if (response != null) {
-        if (!mounted) return;
+      if (uploadResponse != null && mounted) {
         setState(() {
-          // Keep existing session if we had one; only take the new ID if we
-          // didn't have a session yet (first upload after clicking New).
-          _sessionId ??= response['session_id'] as String?;
+          _sessionId ??= uploadResponse['session_id'] as String?;
+          _imageBytes = imageBytes;
+          _uiImage = decodedImage;
           _imageSize = Size(
-            (response['width'] as num).toDouble(),
-            (response['height'] as num).toDouble(),
+            (uploadResponse['width'] as num).toDouble(),
+            (uploadResponse['height'] as num).toDouble(),
           );
-          _imageSourceResult = [ResultDatum(label: 'Path', value: _imageName ?? '')];
+          _result = null;
+          _segments = [];
+          _imageSourceResult = [ResultDatum(label: 'URL', value: url)];
         });
-        _addTiming("Image Encoding", response['processing_time_ms']);
       }
     } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = e.toString());
+      if (mounted) setState(() => _error = e.toString());
     } finally {
-      if (!mounted) return;
-      setState(() { _isLoading = false; _imageSourceRunning = false; });
+      if (mounted) setState(() { _isLoading = false; _imageSourceRunning = false; });
     }
   }
 
@@ -454,7 +324,6 @@ class _HomeScreenState extends State<HomeScreen> {
           _updateSegmentsFromResult();
           _textPromptResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
-        _addTiming("Text: ${_textController.text}", response['processing_time_ms']);
       }
     } catch (e) {
       if (!mounted) return;
@@ -477,7 +346,6 @@ class _HomeScreenState extends State<HomeScreen> {
           _updateSegmentsFromResult();
           _boxResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
-        _addTiming("Box ($_boxMode)", response['processing_time_ms']);
       }
     } catch (e) {
       if (!mounted) return;
@@ -500,7 +368,6 @@ class _HomeScreenState extends State<HomeScreen> {
           _updateSegmentsFromResult();
           _pointResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
-        _addTiming("Point ($_pointMode)", response['processing_time_ms']);
       }
     } catch (e) {
       if (!mounted) return;
@@ -524,7 +391,6 @@ class _HomeScreenState extends State<HomeScreen> {
           _updateSegmentsFromResult();
           _resultsResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
-        _addTiming("Reset Prompts", response['processing_time_ms']);
       }
     } catch (e) {
       if (!mounted) return;
@@ -537,7 +403,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _saveMasks() async {
     if (_sessionId == null) return;
-    setState(() { _isLoading = true; _downloadRunning = true; _downloadResult = []; });
+    setState(() { _isLoading = true; });
     try {
       final response = await _api.saveMasks(_sessionId!);
       if (!mounted) return;
@@ -546,87 +412,16 @@ class _HomeScreenState extends State<HomeScreen> {
           const SnackBar(content: Text("Masks saved successfully")),
         );
         _loadSavedSessions();
-        _addTiming("Save Masks", response['processing_time_ms']);
-        setState(() => _downloadResult = [const ResultDatum(label: 'Status', value: 'Done')]);
       }
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
     } finally {
       if (!mounted) return;
-      setState(() { _isLoading = false; _downloadRunning = false; });
+      setState(() { _isLoading = false; });
     }
   }
 
-  Future<void> _handleCreateSegments() async {
-    if (_sessionId == null) return;
-    setState(() { _isLoading = true; _segmentsRunning = true; _segmentsResult = []; });
-    try {
-      final response = await _api.createSegments(_sessionId!);
-      if (!mounted) return;
-      if (response != null) {
-        final count = response['segment_count'];
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("$count segments created successfully")),
-        );
-        _addTiming("Create Segments", response['processing_time_ms']);
-        setState(() => _segmentsResult = [const ResultDatum(label: 'Status', value: 'Done')]);
-        _loadSegmentUrls();
-      }
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = e.toString());
-    } finally {
-      if (!mounted) return;
-      setState(() { _isLoading = false; _segmentsRunning = false; });
-    }
-  }
-
-  Future<void> _handleShowSegments() async {
-    if (_sessionId == null) return;
-    setState(() => _isLoading = true);
-    List<String> segmentUrls = [];
-    try {
-      segmentUrls = await _api.showSegments(_sessionId!);
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = e.toString());
-    } finally {
-      if (!mounted) return;
-      setState(() => _isLoading = false);
-    }
-
-    if (!mounted) return;
-    if (segmentUrls.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("No segments found. Please create them first.")),
-      );
-      return;
-    }
-
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text("Generated Segments"),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: GridView.builder(
-            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-              maxCrossAxisExtent: 150,
-              childAspectRatio: 1,
-              crossAxisSpacing: 10,
-              mainAxisSpacing: 10,
-            ),
-            itemCount: segmentUrls.length,
-            itemBuilder: (context, index) {
-              return Image.network(segmentUrls[index], fit: BoxFit.cover);
-            },
-          ),
-        ),
-        actions: [TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text("Close"))],
-      ),
-    );
-  }
 
   Future<void> _handleNewSession() async {
     setState(() => _isLoading = true);
@@ -708,12 +503,6 @@ class _HomeScreenState extends State<HomeScreen> {
         _segments = [];
         _updateSegmentsFromResult();
         _textController.clear();
-        // Reset segment/caption state for the newly selected session
-        _segmentUrls = [];
-        _selectedSegmentIndex = null;
-        _captionedSegmentIndices = {};
-        _lastCaptionEntry = null;
-        _captionRawError = null;
 
         // Restore layer state if provided by backend
         if (sessionData['view_layers'] != null) {
@@ -729,7 +518,6 @@ class _HomeScreenState extends State<HomeScreen> {
           }
         }
       });
-      _loadSegmentUrls();
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = "Failed to load session: $e");
@@ -757,52 +545,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _loadSegmentUrls() async {
-    if (_sessionId == null) return;
-    try {
-      final urls = await _api.showSegments(_sessionId!);
-      if (!mounted) return;
-      setState(() {
-        _segmentUrls = urls;
-        _selectedSegmentIndex = null;
-        _captionedSegmentIndices = {};
-        _lastCaptionEntry = null;
-        _captionRawError = null;
-      });
-    } catch (e) {
-      debugPrint('Failed to load segment URLs: $e');
-    }
-  }
-
-  Future<void> _handleGenerateCaption() async {
-    if (_sessionId == null || _selectedSegmentIndex == null || _textController.text.isEmpty) return;
-    setState(() {
-      _isLoading = true;
-      _captionRunning = true;
-      _captionResult = [];
-      _lastCaptionEntry = null;
-      _captionRawError = null;
-    });
-    try {
-      final response = await _api.appendLoraEntry(
-        _sessionId!, _selectedSegmentIndex!, _textController.text,
-      );
-      if (!mounted) return;
-      final entry = response['entry'] as Map<String, dynamic>?;
-      final count = response['entry_count'] as int? ?? 0;
-      setState(() {
-        _captionedSegmentIndices = {..._captionedSegmentIndices, _selectedSegmentIndex!};
-        _lastCaptionEntry = entry;
-        _captionResult = [ResultDatum(label: 'Entries', value: '$count in metadata.jsonl')];
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _captionRawError = e.toString());
-    } finally {
-      if (!mounted) return;
-      setState(() { _isLoading = false; _captionRunning = false; });
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -815,7 +557,7 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Icon(Icons.auto_awesome, color: Colors.indigo),
             SizedBox(width: 10),
-            Text('SAM3 MLX Studio', style: TextStyle(fontWeight: FontWeight.bold)),
+            Text('SegForge Studio', style: TextStyle(fontWeight: FontWeight.bold)),
           ],
         ),
         actions: [
@@ -834,50 +576,21 @@ class _HomeScreenState extends State<HomeScreen> {
             child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _buildCardRow(_buildSessionCard(),      const ResultCell(isRunning: false, data: [])),
+                  _buildCardRow(_buildSessionCard(),       const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildUploadCard(),       ResultCell(isRunning: _imageSourceRunning, data: _imageSourceResult)),
+                  _buildCardRow(_buildUploadCard(),        ResultCell(isRunning: _imageSourceRunning, data: _imageSourceResult)),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildCaptionCard(),      ResultCell(isRunning: _captionRunning, data: _captionResult)),
+                  _buildCardRow(_buildTextPromptCard(),    ResultCell(isRunning: _textPromptRunning, data: _textPromptResult)),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildTextPromptCard(),   ResultCell(isRunning: _textPromptRunning, data: _textPromptResult)),
+                  _buildCardRow(_buildBoxPromptCard(),     ResultCell(isRunning: _boxRunning, data: _boxResult)),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildBoxPromptCard(),    ResultCell(isRunning: _boxRunning, data: _boxResult)),
+                  _buildCardRow(_buildPointPromptCard(),   ResultCell(isRunning: _pointRunning, data: _pointResult)),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildPointPromptCard(),  ResultCell(isRunning: _pointRunning, data: _pointResult)),
-                  const SizedBox(height: 16),
-                  _buildCardRow(_buildResultsCard(),      ResultCell(isRunning: _resultsRunning, data: _resultsResult)),
-                  const SizedBox(height: 16),
-                  _buildCardRow(_buildDownloadCard(),     ResultCell(isRunning: _downloadRunning, data: _downloadResult)),
-                  const SizedBox(height: 16),
-                  _buildCardRow(_buildSegmentsCard(),     ResultCell(isRunning: _segmentsRunning, data: _segmentsResult)),
+                  _buildCardRow(_buildResultsCard(),       ResultCell(isRunning: _resultsRunning, data: _resultsResult)),
                   const SizedBox(height: 16),
                   _buildCardRow(_buildSegmentLayersCard(), const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
-                  _buildCardRow(
-                    _buildTrainingDataCard(),
-                    ResultCell(isRunning: _loraTrainPrepRunning, data: _loraTrainPrepResult),
-                  ),
-                  const SizedBox(height: 16),
-                  _buildCardRow(
-                    LoraTrainCard(
-                      sessionId: _sessionId,
-                      onRunning: () => setState(() { _loraTrainRunning = true; _loraTrainResult = []; }),
-                      onComplete: () => setState(() { _loraTrainRunning = false; _loraTrainResult = [const ResultDatum(label: 'Status', value: 'Done')]; }),
-                      onCompleteWithPath: (path) => setState(() => _loraOutputPath = path),
-                    ),
-                    ResultCell(isRunning: _loraTrainRunning, data: _loraTrainResult),
-                  ),
-                  const SizedBox(height: 16),
-                  _buildCardRow(
-                    LoraInferenceCard(
-                      initialLoraPath: _loraOutputPath,
-                      onImageGenerated: _onInferenceImageGenerated,
-                    ),
-                    const ResultCell(isRunning: false, data: []),
-                  ),
-                  const SizedBox(height: 16),
-                  _buildCardRow(_buildPerformanceCard(), const ResultCell(isRunning: false, data: [])),
+                  _buildCardRow(_buildSaveCard(),          const ResultCell(isRunning: false, data: [])),
                   if (_error != null) ...[
                     const SizedBox(height: 16),
                     SizedBox(
@@ -911,16 +624,14 @@ class _HomeScreenState extends State<HomeScreen> {
                 border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
               ),
               clipBehavior: Clip.antiAlias,
-              child: _inferenceImageBytes != null
-                  ? _buildInferenceCanvas()
-                  : (_imageBytes == null)
+              child: (_imageBytes == null)
                       ? Center(
                           child: Column(
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               Icon(Icons.image_outlined, size: 64, color: Theme.of(context).colorScheme.onSurfaceVariant),
                               const SizedBox(height: 16),
-                              Text("Upload an image to start", style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                              Text("Enter an Image URL to start", style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant)),
                             ],
                           ),
                         )
@@ -938,35 +649,6 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _buildInferenceCanvas() {
-    final cs = Theme.of(context).colorScheme;
-    return Stack(
-      children: [
-        Center(
-          child: Image.memory(_inferenceImageBytes!, fit: BoxFit.contain),
-        ),
-        Positioned(
-          top: 8,
-          right: 8,
-          child: Tooltip(
-            message: 'Back to segmentation view',
-            child: IconButton.filled(
-              onPressed: () => setState(() {
-                _inferenceImageBytes = null;
-                _inferenceUiImage = null;
-              }),
-              icon: const Icon(Icons.close, size: 16),
-              style: IconButton.styleFrom(
-                backgroundColor: cs.surfaceContainerHighest.withValues(alpha: 0.85),
-                foregroundColor: cs.onSurface,
-              ),
-            ),
-          ),
-        ),
-      ],
     );
   }
 
@@ -1084,30 +766,36 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             const Row(
               children: [
-                Icon(Icons.upload_file, size: 16),
+                Icon(Icons.image, size: 16),
                 SizedBox(width: 8),
                 Text("Image Source", style: TextStyle(fontWeight: FontWeight.bold)),
               ],
             ),
             const SizedBox(height: 12),
-            InkWell(
-              onTap: _isLoading ? null : _pickImage,
-              borderRadius: BorderRadius.circular(8),
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(24),
-                decoration: BoxDecoration(
-                  border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-                  borderRadius: BorderRadius.circular(8),
-                  color: Theme.of(context).colorScheme.surfaceContainerLow,
+            TextField(
+              controller: _imageUrlController,
+              decoration: const InputDecoration(
+                labelText: "Image URL",
+                hintText: "https://example.com/image.jpg",
+                border: OutlineInputBorder(),
+                isDense: true,
+                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+              ),
+              enabled: !_isLoading,
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _isLoading || _imageUrlController.text.isEmpty ? null : _loadImageFromUrl,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF007F00),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(24),
+                  ),
                 ),
-                child: Column(
-                  children: [
-                    Icon(Icons.add_photo_alternate, size: 32, color: Theme.of(context).colorScheme.onSurfaceVariant),
-                    const SizedBox(height: 8),
-                    Text("Click to upload", style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant, fontSize: 12)),
-                  ],
-                ),
+                child: const Text("Load Image"),
               ),
             ),
             if (_imageSize != null)
@@ -1116,177 +804,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Text(
                   "${_imageSize!.width.toInt()} × ${_imageSize!.height.toInt()} px",
                   style: TextStyle(fontSize: 11, color: Theme.of(context).colorScheme.onSurfaceVariant),
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildCaptionCard() {
-    final cs = Theme.of(context).colorScheme;
-    final canCaption = _sessionId != null
-        && _selectedSegmentIndex != null
-        && _textController.text.isNotEmpty
-        && !_isLoading;
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // ── Header ──────────────────────────────────────────────
-            Row(
-              children: [
-                const Icon(Icons.smart_toy_outlined, size: 16),
-                const SizedBox(width: 8),
-                const Text("AI Captioning", style: TextStyle(fontWeight: FontWeight.bold)),
-                const Spacer(),
-                if (_sessionId != null)
-                  IconButton(
-                    icon: const Icon(Icons.refresh, size: 16),
-                    tooltip: 'Reload segments',
-                    onPressed: _isLoading ? null : _loadSegmentUrls,
-                    visualDensity: VisualDensity.compact,
-                  ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              "Select a segment, then caption it using the current prompt as the training concept.",
-              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-            ),
-            const SizedBox(height: 12),
-
-            // ── Segment gallery ──────────────────────────────────────
-            if (_segmentUrls.isEmpty)
-              Text(
-                _sessionId == null
-                    ? 'Create a session and run segmentation first.'
-                    : 'No segments loaded — create segments, then tap ↺.',
-                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-              )
-            else ...[
-              Text('${_segmentUrls.length} segment(s) — tap to select:',
-                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 6,
-                runSpacing: 6,
-                children: [
-                  for (int i = 0; i < _segmentUrls.length; i++)
-                    _buildSegmentThumb(i, cs),
-                ],
-              ),
-            ],
-            const SizedBox(height: 12),
-
-            // ── Caption button ───────────────────────────────────────
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: canCaption ? _handleGenerateCaption : null,
-                icon: const Icon(Icons.auto_fix_high, size: 16),
-                label: const Text("Caption Selected Segment"),
-                style: FilledButton.styleFrom(
-                  backgroundColor: Colors.deepPurple.shade400,
-                  foregroundColor: Colors.white,
-                ),
-              ),
-            ),
-
-            // ── Success: show written entry ──────────────────────────
-            if (_lastCaptionEntry != null) ...[
-              const SizedBox(height: 12),
-              Text('Written to metadata.jsonl:',
-                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-              const SizedBox(height: 4),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.green.withValues(alpha: 0.08),
-                  border: Border.all(color: Colors.green.withValues(alpha: 0.4)),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: SelectableText(
-                  const JsonEncoder.withIndent('  ').convert(_lastCaptionEntry),
-                  style: const TextStyle(fontSize: 10, fontFamily: 'monospace'),
-                ),
-              ),
-            ],
-
-            // ── Error: show raw Gemini response ──────────────────────
-            if (_captionRawError != null) ...[
-              const SizedBox(height: 12),
-              Text('Schema validation failed — entry not written:',
-                  style: TextStyle(fontSize: 11, color: cs.error)),
-              const SizedBox(height: 4),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: cs.errorContainer.withValues(alpha: 0.3),
-                  border: Border.all(color: cs.error.withValues(alpha: 0.4)),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: SelectableText(
-                  _captionRawError!,
-                  style: TextStyle(fontSize: 10, fontFamily: 'monospace', color: cs.onErrorContainer),
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSegmentThumb(int index, ColorScheme cs) {
-    final isSelected = _selectedSegmentIndex == index;
-    final isCaptioned = _captionedSegmentIndices.contains(index);
-    final url = _segmentUrls[index]; // already a full URL from ApiService
-
-    return Builder(
-      builder: (thumbContext) => GestureDetector(
-        onTap: () {
-          setState(() => _selectedSegmentIndex = index);
-          _showSegmentPreview(thumbContext, index);
-        },
-        child: Stack(
-          clipBehavior: Clip.none,
-          children: [
-            Container(
-              width: 68,
-              height: 68,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(
-                  color: isSelected ? cs.primary : cs.outlineVariant,
-                  width: isSelected ? 2.5 : 1,
-                ),
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(5),
-                child: Image.network(
-                  url,
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, __, ___) => Icon(Icons.broken_image,
-                      size: 28, color: cs.onSurfaceVariant),
-                ),
-              ),
-            ),
-            if (isCaptioned)
-              Positioned(
-                top: -4, right: -4,
-                child: Container(
-                  width: 18, height: 18,
-                  decoration: const BoxDecoration(
-                    color: Colors.green, shape: BoxShape.circle,
-                  ),
-                  child: const Icon(Icons.check, size: 12, color: Colors.white),
                 ),
               ),
           ],
@@ -1306,38 +823,36 @@ class _HomeScreenState extends State<HomeScreen> {
               children: [
                 Icon(Icons.text_fields, size: 16),
                 SizedBox(width: 8),
-                Text("Text Prompt", style: TextStyle(fontWeight: FontWeight.bold)),
+                Text("Prompt", style: TextStyle(fontWeight: FontWeight.bold)),
               ],
             ),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _textController,
-                    decoration: const InputDecoration(
-                      hintText: 'e.g. "cat", "wheel"',
-                      isDense: true,
-                      border: OutlineInputBorder(),
-                      contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                    ),
-                    enabled: _sessionId != null && !_isLoading,
-                    onSubmitted: (_) => _sendTextPrompt(),
+            TextField(
+              controller: _textController,
+              maxLines: null,
+              decoration: const InputDecoration(
+                hintText: 'e.g. "cat", "wheel"',
+                isDense: true,
+                border: OutlineInputBorder(),
+                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+              ),
+              enabled: _sessionId != null && !_isLoading,
+              onSubmitted: (_) => _sendTextPrompt(),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: (_sessionId == null || _textController.text.isEmpty || _isLoading) ? null : _sendTextPrompt,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF007F00),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(24),
                   ),
                 ),
-                const SizedBox(width: 8),
-                IconButton.filled(
-                  onPressed: (_sessionId == null || _isLoading) ? null : _sendTextPrompt,
-                  icon: _isLoading
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                        )
-                      : const Icon(Icons.send, size: 18),
-                  style: IconButton.styleFrom(shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
-                ),
-              ],
+                child: const Text("Select"),
+              ),
             ),
           ],
         ),
@@ -1352,43 +867,22 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Row(
+            Row(
               children: [
-                Icon(Icons.crop_free, size: 16),
-                SizedBox(width: 8),
-                Text("Box Prompts", style: TextStyle(fontWeight: FontWeight.bold)),
+                const Icon(Icons.crop_free, size: 16),
+                const SizedBox(width: 8),
+                const Text("Box Select", style: TextStyle(fontWeight: FontWeight.bold)),
+                const Spacer(),
+                Checkbox(
+                  value: _boxSelectEnabled,
+                  onChanged: (v) => setState(() => _boxSelectEnabled = v ?? false),
+                ),
               ],
             ),
             const SizedBox(height: 12),
-            Text("Draw boxes to include/exclude regions", style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: SegmentedButton<String>(
-                    segments: const [
-                      ButtonSegment(
-                        value: "positive",
-                        label: Text("Include"),
-                        icon: Icon(Icons.add_box_outlined, size: 16),
-                      ),
-                      ButtonSegment(
-                        value: "negative",
-                        label: Text("Exclude"),
-                        icon: Icon(Icons.indeterminate_check_box_outlined, size: 16),
-                      ),
-                    ],
-                    selected: {_boxMode},
-                    onSelectionChanged: (Set<String> newSelection) {
-                      setState(() => _boxMode = newSelection.first);
-                    },
-                    style: const ButtonStyle(
-                      visualDensity: VisualDensity.compact,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                  ),
-                ),
-              ],
+            IncludeExcludeToggle(
+              value: _boxMode == "positive",
+              onChanged: (isPositive) => setState(() => _boxMode = isPositive ? "positive" : "negative"),
             ),
           ],
         ),
@@ -1403,43 +897,22 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Row(
+            Row(
               children: [
-                Icon(Icons.touch_app, size: 16),
-                SizedBox(width: 8),
-                Text("Point Prompts", style: TextStyle(fontWeight: FontWeight.bold)),
+                const Icon(Icons.touch_app, size: 16),
+                const SizedBox(width: 8),
+                const Text("Point Select", style: TextStyle(fontWeight: FontWeight.bold)),
+                const Spacer(),
+                Checkbox(
+                  value: _pointSelectEnabled,
+                  onChanged: (v) => setState(() => _pointSelectEnabled = v ?? false),
+                ),
               ],
             ),
             const SizedBox(height: 12),
-            Text("Click on the image to select specific points", style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: SegmentedButton<String>(
-                    segments: const [
-                      ButtonSegment(
-                        value: "positive",
-                        label: Text("Include"),
-                        icon: Icon(Icons.add_circle_outline, size: 16),
-                      ),
-                      ButtonSegment(
-                        value: "negative",
-                        label: Text("Exclude"),
-                        icon: Icon(Icons.remove_circle_outline, size: 16),
-                      ),
-                    ],
-                    selected: {_pointMode},
-                    onSelectionChanged: (Set<String> newSelection) {
-                      setState(() => _pointMode = newSelection.first);
-                    },
-                    style: const ButtonStyle(
-                      visualDensity: VisualDensity.compact,
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    ),
-                  ),
-                ),
-              ],
+            IncludeExcludeToggle(
+              value: _pointMode == "positive",
+              onChanged: (isPositive) => setState(() => _pointMode = isPositive ? "positive" : "negative"),
             ),
           ],
         ),
@@ -1449,7 +922,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildResultsCard() {
     final maskCount = (_result?['masks'] as List?)?.length ?? 0;
-    final boxCount = (_result?['prompted_boxes'] as List?)?.length ?? 0;
 
     return Card(
       child: Padding(
@@ -1461,20 +933,24 @@ class _HomeScreenState extends State<HomeScreen> {
               children: [
                 Icon(Icons.data_usage, size: 16),
                 SizedBox(width: 8),
-                Text("Results", style: TextStyle(fontWeight: FontWeight.bold)),
+                Text("Objects Selected", style: TextStyle(fontWeight: FontWeight.bold)),
               ],
             ),
             const SizedBox(height: 12),
-            _buildResultRow("Objects found", maskCount.toString()),
-            _buildResultRow("Box prompts", boxCount.toString()),
+            _buildResultRow("Object count", maskCount.toString()),
             const SizedBox(height: 12),
             SizedBox(
               width: double.infinity,
-              child: OutlinedButton.icon(
+              child: OutlinedButton(
                 onPressed: (_sessionId == null || _isLoading) ? null : _reset,
-                icon: const Icon(Icons.delete_outline, size: 16),
-                label: const Text("Clear All Prompts"),
-                style: OutlinedButton.styleFrom(foregroundColor: Colors.red),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFFF0000),
+                  side: const BorderSide(color: Color(0xFFFF0000)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(24),
+                  ),
+                ),
+                child: const Text("Clear Prompts"),
               ),
             ),
           ],
@@ -1483,98 +959,44 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildDownloadCard() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Row(
-              children: [
-                Icon(Icons.download, size: 16),
-                SizedBox(width: 8),
-                Text("Download", style: TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Text(
-              "Save the image and generated masks.",
-              style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: (_sessionId == null || _isLoading) ? null : _saveMasks,
-                icon: const Icon(Icons.save_alt, size: 16),
-                label: const Text("Save Masks"),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSegmentsCard() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Row(
-              children: [
-                Icon(Icons.category_outlined, size: 16),
-                SizedBox(width: 8),
-                Text("Segments", style: TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Text(
-              "Create and view individual segment images.",
-              style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: (_sessionId == null || _isLoading) ? null : _handleCreateSegments,
-                    icon: const Icon(Icons.cut, size: 16),
-                    label: const Text("Create Segments"),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: (_sessionId == null || _isLoading) ? null : _handleShowSegments,
-                    icon: const Icon(Icons.image_search, size: 16),
-                    label: const Text("Show Segments"),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 
   Widget _buildSegmentLayersCard() {
     // This widget now manages its own state via a Consumer<LayerState>
     return const SegmentLayersCard();
   }
 
-  Widget _buildTrainingDataCard() {
-    return TrainingDataCard(
-      sessionId: _sessionId,
-      segmentCount: _segmentUrls.length,
-      segmentUrls: _segmentUrls,
-      currentPrompt: _textController.text,
-      onRunning: () => setState(() { _loraTrainPrepRunning = true; _loraTrainPrepResult = []; }),
-      onComplete: () => setState(() { _loraTrainPrepRunning = false; _loraTrainPrepResult = [const ResultDatum(label: 'Status', value: 'Done')]; }),
+  Widget _buildSaveCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.save, size: 16),
+                SizedBox(width: 8),
+                Text("Save", style: TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: (_sessionId == null || _isLoading) ? null : _saveMasks,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF007F00),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(24),
+                  ),
+                ),
+                child: const Text("Save"),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1591,56 +1013,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildPerformanceCard() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Row(
-              children: [
-                Icon(Icons.timer_outlined, size: 16),
-                SizedBox(width: 8),
-                Text("Performance", style: TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            if (_timings.isEmpty)
-              Text("No requests yet", style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant))
-            else
-              ListView.builder(
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                itemCount: _timings.length,
-                itemBuilder: (context, index) {
-                  final t = _timings[index];
-                  final dur = t['duration'];
-                  final durStr = (dur is num) ? dur.toStringAsFixed(1) : dur.toString();
-
-                  return Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Expanded(
-                          child: Text(
-                            t['label'].toString(),
-                            style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        Text("$durStr ms", style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
-                      ],
-                    ),
-                  );
-                },
-              ),
-          ],
-        ),
-      ),
-    );
-  }
 }
 
 class SegmentationCanvas extends StatefulWidget {
