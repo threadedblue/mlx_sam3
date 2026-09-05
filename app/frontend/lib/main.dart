@@ -703,7 +703,7 @@ class _HomeScreenState extends State<HomeScreen> {
     return Container(
       decoration: BoxDecoration(
         border: Border.all(
-          color: Colors.white.withValues(alpha: 0.3),
+          color: Colors.white.withValues(alpha: 0.6),
           width: 1,
         ),
         borderRadius: BorderRadius.circular(12),
