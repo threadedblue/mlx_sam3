@@ -31,48 +31,39 @@ class IncludeExcludeToggle extends StatelessWidget {
         children: [
           // Include (left half)
           Expanded(
-            child: Stack(
-              children: [
-                // Translucent fill background
-                if (value)
-                  Positioned.fill(
-                    child: ClipRRect(
-                      borderRadius: const BorderRadius.only(
-                        topLeft: Radius.circular(height / 2),
-                        bottomLeft: Radius.circular(height / 2),
+            child: Container(
+              decoration: BoxDecoration(
+                color: value ? greenFill.withValues(alpha: 0.25) : Colors.transparent,
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(height / 2),
+                  bottomLeft: Radius.circular(height / 2),
+                ),
+              ),
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onTap: () => onChanged(true),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.check,
+                        size: 18,
+                        color: value ? Colors.black : Colors.grey,
                       ),
-                      child: Container(
-                        color: greenFill.withValues(alpha: 0.25),
-                      ),
-                    ),
-                  ),
-                // Interactive button on top
-                Material(
-                  color: Colors.transparent,
-                  child: InkWell(
-                    onTap: () => onChanged(true),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.check,
-                          size: 18,
+                      const SizedBox(width: 4),
+                      Text(
+                        'Include',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
                           color: value ? Colors.black : Colors.grey,
                         ),
-                        const SizedBox(width: 4),
-                        Text(
-                          'Include',
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w500,
-                            color: value ? Colors.black : Colors.grey,
-                          ),
-                        ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                 ),
-              ],
+              ),
             ),
           ),
           // Divider
@@ -82,48 +73,39 @@ class IncludeExcludeToggle extends StatelessWidget {
           ),
           // Exclude (right half)
           Expanded(
-            child: Stack(
-              children: [
-                // Translucent fill background
-                if (!value)
-                  Positioned.fill(
-                    child: ClipRRect(
-                      borderRadius: const BorderRadius.only(
-                        topRight: Radius.circular(height / 2),
-                        bottomRight: Radius.circular(height / 2),
+            child: Container(
+              decoration: BoxDecoration(
+                color: !value ? redColor.withValues(alpha: 0.25) : Colors.transparent,
+                borderRadius: const BorderRadius.only(
+                  topRight: Radius.circular(height / 2),
+                  bottomRight: Radius.circular(height / 2),
+                ),
+              ),
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onTap: () => onChanged(false),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.indeterminate_check_box_outlined,
+                        size: 18,
+                        color: !value ? redColor : Colors.grey,
                       ),
-                      child: Container(
-                        color: redColor.withValues(alpha: 0.25),
-                      ),
-                    ),
-                  ),
-                // Interactive button on top
-                Material(
-                  color: Colors.transparent,
-                  child: InkWell(
-                    onTap: () => onChanged(false),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.indeterminate_check_box_outlined,
-                          size: 18,
+                      const SizedBox(width: 4),
+                      Text(
+                        'Exclude',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
                           color: !value ? redColor : Colors.grey,
                         ),
-                        const SizedBox(width: 4),
-                        Text(
-                          'Exclude',
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w500,
-                            color: !value ? redColor : Colors.grey,
-                          ),
-                        ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                 ),
-              ],
+              ),
             ),
           ),
         ],
