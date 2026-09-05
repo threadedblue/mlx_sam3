@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import '../launch_config.dart';
+
 /// Client for the SegForge FastAPI backend.
 ///
 /// Only the endpoints the current UI uses are exposed here. The backend still
@@ -11,8 +13,9 @@ import 'package:http/http.dart' as http;
 /// and `/inference/*`); they lost their last caller when the corresponding
 /// cards were removed from the UI.
 class ApiService {
-  // Set the base URL for the backend API.  Make sure this matches your backend.
-  final String baseUrl = "http://localhost:8000";
+  /// Backend address, overridable at launch with
+  /// `--dart-define=SEGFORGE_BACKEND_URL=...`. See [LaunchConfig.backendUrl].
+  final String baseUrl = LaunchConfig.backendUrl;
 
   Future<Map<String, dynamic>> checkHealth() async {
     try {

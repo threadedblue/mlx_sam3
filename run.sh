@@ -7,6 +7,9 @@
 # The frontend takes the image URL and session id as launch-time inputs. Supply
 # them with the flags above, or export SEGFORGE_IMAGE_URL / SEGFORGE_SESSION_ID.
 # The session id is optional: the backend allocates one on the first upload.
+#
+# Ports: SegForge uses 8401, DoubleNaught uses 8400, so both can run at once.
+# Override with SEGFORGE_PORT; FE follows BE automatically.
 
 set -e
 
@@ -21,6 +24,11 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# SegForge serves on 8401 so it can run alongside DoubleNaught, which uses 8400.
+# The frontend default is in frontend/lib/launch_config.dart; keep the two in
+# step, or override both with SEGFORGE_PORT and --dart-define=SEGFORGE_BACKEND_URL.
+SF_PORT="${SEGFORGE_PORT:-8401}"
+
 MODE=$1
 
 case "$MODE" in
@@ -34,14 +42,14 @@ case "$MODE" in
       fi
     done
 
-    echo -e "${BLUE}Starting backend on http://localhost:8000${NC}"
-    echo -e "${YELLOW}API docs: http://localhost:8000/docs${NC}"
+    echo -e "${BLUE}Starting backend on http://127.0.0.1:${SF_PORT}${NC}"
+    echo -e "${YELLOW}API docs: http://127.0.0.1:${SF_PORT}/docs${NC}"
     echo ""
     cd "$PROJECT_ROOT"
     source "$PROJECT_ROOT/.venv/bin/activate"
     pip install -q -r "$BACKEND_DIR/requirements.txt" 2>&1 | grep -v "already satisfied"
     cd "$BACKEND_DIR"
-    exec uvicorn main:app --reload
+    exec uvicorn main:app --reload --host 127.0.0.1 --port "$SF_PORT"
     ;;
 
   FE)
@@ -56,7 +64,9 @@ case "$MODE" in
       esac
     done
 
-    DEFINES=()
+    # Always pin the frontend to the port the backend was told to use, so the
+    # two cannot drift when SEGFORGE_PORT is overridden.
+    DEFINES=(--dart-define=SEGFORGE_BACKEND_URL="${SEGFORGE_BACKEND_URL:-http://127.0.0.1:$SF_PORT}")
     if [ -n "$IMAGE_URL" ]; then
       DEFINES+=(--dart-define=SEGFORGE_IMAGE_URL="$IMAGE_URL")
     fi

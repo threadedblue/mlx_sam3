@@ -23,4 +23,18 @@ class LaunchConfig {
 
   /// Session to work in, or null to let the backend allocate one on upload.
   static String? get sessionId => _sessionId.isEmpty ? null : _sessionId;
+
+  /// Where the SegForge backend lives.
+  ///
+  /// 8401 keeps SegForge clear of DoubleNaught, which serves its own FastAPI
+  /// backend on 8400, so the two can run side by side. `run.sh BE` passes the
+  /// matching `--port`; keep the two in step.
+  ///
+  /// `127.0.0.1` rather than `localhost` on purpose: on macOS `localhost` can
+  /// resolve to the IPv6 `::1` while uvicorn is bound to IPv4, which surfaces
+  /// as a connection refusal.
+  static const String backendUrl = String.fromEnvironment(
+    'SEGFORGE_BACKEND_URL',
+    defaultValue: 'http://127.0.0.1:8401',
+  );
 }
