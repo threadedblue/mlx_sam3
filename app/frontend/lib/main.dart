@@ -699,9 +699,25 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _buildBorderedCard(Widget child) {
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.3),
+          width: 1,
+        ),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Card(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: child,
+      ),
+    );
+  }
+
   Widget _buildSessionCard() {
-    return Card(
-      child: Padding(
+    return _buildBorderedCard(
+      Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -732,8 +748,8 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildUploadCard() {
     const greenColor = Color(0xFF007F00);
 
-    return Card(
-      child: Padding(
+    return _buildBorderedCard(
+      Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -794,8 +810,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildTextPromptCard() {
-    return Card(
-      child: Padding(
+    return _buildBorderedCard(
+      Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -842,8 +858,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildBoxPromptCard() {
-    return Card(
-      child: Padding(
+    return _buildBorderedCard(
+      Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -872,8 +888,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildPointPromptCard() {
-    return Card(
-      child: Padding(
+    return _buildBorderedCard(
+      Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -904,8 +920,8 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildResultsCard() {
     final maskCount = (_result?['masks'] as List?)?.length ?? 0;
 
-    return Card(
-      child: Padding(
+    return _buildBorderedCard(
+      Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -947,8 +963,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildSaveCard() {
-    return Card(
-      child: Padding(
+    return _buildBorderedCard(
+      Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
