@@ -77,14 +77,13 @@ class _HomeScreenState extends State<HomeScreen> {
   final ApiService _api = ApiService();
   final TextEditingController _textController = TextEditingController();
 
-  // State
+  // State (supplied at launch, not user-entered)
   String? _sessionId;
+  String? _imageUrl; // Supplied at launch, non-editable
 
   Uint8List? _imageBytes; // Web-safe image data
   ui.Image? _uiImage; // Decoded image for canvas
   Size? _imageSize; // Original size
-
-  final TextEditingController _imageUrlController = TextEditingController();
 
   Map<String, dynamic>? _result;
   List<Segment> _segments = [];
@@ -146,7 +145,6 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _healthCheckTimer?.cancel();
     _textController.dispose();
-    _imageUrlController.dispose();
     _layerState?.removeListener(_onLayerStateChanged);
     super.dispose();
   }
@@ -264,8 +262,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _loadImageFromUrl() async {
-    final url = _imageUrlController.text.trim();
-    if (url.isEmpty) return;
+    if (_imageUrl == null || _imageUrl!.isEmpty) return;
+    final url = _imageUrl!;
 
     setState(() {
       _isLoading = true;
@@ -709,45 +707,22 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Row(
-              children: [
-                Icon(Icons.folder_shared, size: 16),
-                SizedBox(width: 8),
-                Text("Session Management", style: TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            DropdownButtonFormField<String>(
-              initialValue: _selectedSavedSession,
-              isExpanded: true,
-              decoration: const InputDecoration(
-                labelText: "Saved Sessions",
-                border: OutlineInputBorder(),
-                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            const Text("Session ID", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+                borderRadius: BorderRadius.circular(6),
               ),
-              items: _savedSessions.map((s) {
-                return DropdownMenuItem(value: s, child: Text(s, overflow: TextOverflow.ellipsis));
-              }).toList(),
-              onChanged: _isLoading ? null : _handleSessionChange,
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: FilledButton.tonal(
-                    onPressed: _isLoading ? null : _handleNewSession,
-                    child: const Text("New"),
-                  ),
+              child: Text(
+                _sessionId ?? "(none)",
+                style: TextStyle(
+                  fontSize: 13,
+                  color: _sessionId != null ? Theme.of(context).colorScheme.onSurface : Theme.of(context).colorScheme.onSurfaceVariant,
                 ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton(
-                    onPressed: (_selectedSavedSession == null || _isLoading) ? null : _handleDeleteSession,
-                    style: OutlinedButton.styleFrom(foregroundColor: Colors.red),
-                    child: const Text("Delete"),
-                  ),
-                ),
-              ],
+              ),
             ),
           ],
         ),
@@ -756,46 +731,55 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildUploadCard() {
+    const greenColor = Color(0xFF007F00);
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Row(
-              children: [
-                Icon(Icons.image, size: 16),
-                SizedBox(width: 8),
-                Text("Image Source", style: TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _imageUrlController,
-              decoration: const InputDecoration(
-                labelText: "Image URL",
-                hintText: "https://example.com/image.jpg",
-                border: OutlineInputBorder(),
-                isDense: true,
-                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-              ),
-              enabled: !_isLoading,
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: _isLoading || _imageUrlController.text.isEmpty ? null : _loadImageFromUrl,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF007F00),
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
+            const Text("Image URL", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+            const SizedBox(height: 8),
+            if (_imageUrl != null && _imageUrl!.isNotEmpty)
+              GestureDetector(
+                onTap: _isLoading ? null : _loadImageFromUrl,
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: greenColor, width: 1.5),
                     borderRadius: BorderRadius.circular(24),
+                    color: Colors.transparent,
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.link, size: 14, color: greenColor),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          _imageUrl!,
+                          style: const TextStyle(fontSize: 12, color: greenColor),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                child: const Text("Load Image"),
+              )
+            else
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  "(no image URL)",
+                  style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                ),
               ),
-            ),
             if (_imageSize != null)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
