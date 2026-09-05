@@ -39,6 +39,7 @@ class IncludeExcludeToggle extends StatelessWidget {
                   bottomLeft: Radius.circular(height / 2),
                 ),
               ),
+              constraints: const BoxConstraints.expand(),
               child: Material(
                 color: Colors.transparent,
                 child: InkWell(
@@ -81,6 +82,7 @@ class IncludeExcludeToggle extends StatelessWidget {
                   bottomRight: Radius.circular(height / 2),
                 ),
               ),
+              constraints: const BoxConstraints.expand(),
               child: Material(
                 color: Colors.transparent,
                 child: InkWell(

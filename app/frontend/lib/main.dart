@@ -844,11 +844,11 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 12),
             SizedBox(
               width: double.infinity,
-              child: ElevatedButton(
+              child: OutlinedButton(
                 onPressed: (_sessionId == null || _textController.text.isEmpty || _isLoading) ? null : _sendTextPrompt,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF007F00),
+                style: OutlinedButton.styleFrom(
                   foregroundColor: Colors.white,
+                  side: const BorderSide(color: Colors.white),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(24),
                   ),
@@ -948,8 +948,8 @@ class _HomeScreenState extends State<HomeScreen> {
               child: OutlinedButton(
                 onPressed: (_sessionId == null || _isLoading) ? null : _reset,
                 style: OutlinedButton.styleFrom(
-                  foregroundColor: const Color(0xFFFF0000),
-                  side: const BorderSide(color: Color(0xFFFF0000)),
+                  foregroundColor: Colors.white,
+                  side: const BorderSide(color: Colors.white),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(24),
                   ),
