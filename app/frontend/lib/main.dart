@@ -90,9 +90,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isLoading = false;
   String? _error;
   String _backendStatus = "checking";
-  bool _boxSelectEnabled = false;
+  String _selectedMode = ""; // "prompt", "box", "point", or ""
   String _boxMode = "positive"; // "positive" or "negative"
-  bool _pointSelectEnabled = false;
   String _pointMode = "positive"; // "positive" or "negative"
 
   List<String> _savedSessions = [];
@@ -816,11 +815,17 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Row(
+            Row(
               children: [
-                Icon(Icons.text_fields, size: 16),
-                SizedBox(width: 8),
-                Text("Prompt", style: TextStyle(fontWeight: FontWeight.bold)),
+                const Icon(Icons.text_fields, size: 16),
+                const SizedBox(width: 8),
+                const Text("Prompt", style: TextStyle(fontWeight: FontWeight.bold)),
+                const Spacer(),
+                Radio<String>(
+                  value: "prompt",
+                  groupValue: _selectedMode,
+                  onChanged: (v) => setState(() => _selectedMode = _selectedMode == "prompt" ? "" : "prompt"),
+                ),
               ],
             ),
             const SizedBox(height: 12),
@@ -870,10 +875,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(width: 8),
                 const Text("Box Select", style: TextStyle(fontWeight: FontWeight.bold)),
                 const Spacer(),
-                Radio<bool>(
-                  value: true,
-                  groupValue: _boxSelectEnabled,
-                  onChanged: (v) => setState(() => _boxSelectEnabled = !_boxSelectEnabled),
+                Radio<String>(
+                  value: "box",
+                  groupValue: _selectedMode,
+                  onChanged: (v) => setState(() => _selectedMode = _selectedMode == "box" ? "" : "box"),
                 ),
               ],
             ),
@@ -901,10 +906,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(width: 8),
                 const Text("Point Select", style: TextStyle(fontWeight: FontWeight.bold)),
                 const Spacer(),
-                Radio<bool>(
-                  value: true,
-                  groupValue: _pointSelectEnabled,
-                  onChanged: (v) => setState(() => _pointSelectEnabled = !_pointSelectEnabled),
+                Radio<String>(
+                  value: "point",
+                  groupValue: _selectedMode,
+                  onChanged: (v) => setState(() => _selectedMode = _selectedMode == "point" ? "" : "point"),
                 ),
               ],
             ),
