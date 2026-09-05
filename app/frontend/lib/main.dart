@@ -653,15 +653,13 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildCardRow(Widget card, Widget cell) {
-    return IntrinsicHeight(
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          SizedBox(width: 340, child: card),
-          const SizedBox(width: 8),
-          SizedBox(width: 140, child: cell),
-        ],
-      ),
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(width: 340, child: card),
+        const SizedBox(width: 8),
+        SizedBox(width: 140, child: cell),
+      ],
     );
   }
 
