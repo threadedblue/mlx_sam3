@@ -15,7 +15,16 @@ flutter pub get
 
 echo "🏗️ Building for Web (CanvasKit)..."
 
-flutter build web --debug --base-href /web/
+# Launch-time inputs are baked in at build time for web (see lib/launch_config.dart).
+DEFINES=()
+if [ -n "${SEGFORGE_IMAGE_URL:-}" ]; then
+  DEFINES+=(--dart-define=SEGFORGE_IMAGE_URL="$SEGFORGE_IMAGE_URL")
+fi
+if [ -n "${SEGFORGE_SESSION_ID:-}" ]; then
+  DEFINES+=(--dart-define=SEGFORGE_SESSION_ID="$SEGFORGE_SESSION_ID")
+fi
+
+flutter build web --debug --base-href /web/ "${DEFINES[@]}"
 
 echo "✅ Build complete! Files are in frontend/build/web"
 cd "$ROOT_DIR"

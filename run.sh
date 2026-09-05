@@ -1,7 +1,12 @@
 #!/bin/bash
 # Usage:
 #   ./run.sh BE [--clear-storage]   — start FastAPI backend
-#   ./run.sh FE                     — start Flutter macOS app (hot reload available)
+#   ./run.sh FE [--url=URL] [--session=ID]
+#                                   — start Flutter macOS app (hot reload available)
+#
+# The frontend takes the image URL and session id as launch-time inputs. Supply
+# them with the flags above, or export SEGFORGE_IMAGE_URL / SEGFORGE_SESSION_ID.
+# The session id is optional: the backend allocates one on the first upload.
 
 set -e
 
@@ -40,20 +45,52 @@ case "$MODE" in
     ;;
 
   FE)
+    # Session id and image URL are launch-time inputs to the app. Take them from
+    # the environment, overridable with --url= / --session= flags.
+    IMAGE_URL="${SEGFORGE_IMAGE_URL:-}"
+    SESSION_ID="${SEGFORGE_SESSION_ID:-}"
+    for arg in "$@"; do
+      case "$arg" in
+        --url=*)     IMAGE_URL="${arg#--url=}" ;;
+        --session=*) SESSION_ID="${arg#--session=}" ;;
+      esac
+    done
+
+    DEFINES=()
+    if [ -n "$IMAGE_URL" ]; then
+      DEFINES+=(--dart-define=SEGFORGE_IMAGE_URL="$IMAGE_URL")
+    fi
+    if [ -n "$SESSION_ID" ]; then
+      DEFINES+=(--dart-define=SEGFORGE_SESSION_ID="$SESSION_ID")
+    fi
+
     echo -e "${BLUE}Starting Flutter macOS app${NC}"
+    if [ -n "$IMAGE_URL" ]; then
+      echo -e "${GREEN}Image URL: $IMAGE_URL${NC}"
+    else
+      echo -e "${YELLOW}No image URL: pass --url=... or export SEGFORGE_IMAGE_URL${NC}"
+    fi
+    if [ -n "$SESSION_ID" ]; then
+      echo -e "${GREEN}Session:   $SESSION_ID${NC}"
+    else
+      echo -e "${YELLOW}No session id: the backend will allocate one on upload${NC}"
+    fi
     echo -e "${YELLOW}Hot reload: r   Hot restart: R   Quit: q${NC}"
     echo ""
     cd "$FRONTEND_DIR"
     flutter clean
     flutter pub get
     dart run flutter_launcher_icons 2>/dev/null || true
-    exec flutter run -d macos
+    exec flutter run -d macos "${DEFINES[@]}"
     ;;
 
   *)
     echo -e "${RED}Usage:${NC}"
-    echo "  ./run.sh BE [--clear-storage]   start FastAPI backend"
-    echo "  ./run.sh FE                     start Flutter macOS app"
+    echo "  ./run.sh BE [--clear-storage]              start FastAPI backend"
+    echo "  ./run.sh FE [--url=URL] [--session=ID]     start Flutter macOS app"
+    echo ""
+    echo "  --url / --session may also be given as SEGFORGE_IMAGE_URL /"
+    echo "  SEGFORGE_SESSION_ID environment variables."
     exit 1
     ;;
 

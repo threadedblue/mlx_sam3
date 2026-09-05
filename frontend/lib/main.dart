@@ -10,7 +10,6 @@
 // If your current ApiService only accepts File, update it to accept bytes, or create an overload.
 
 import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:http/http.dart' as http;
@@ -25,10 +24,18 @@ import 'layer_state.dart';
 import 'models/result_datum.dart';
 import 'widgets/result_cell.dart';
 import 'widgets/include_exclude_toggle.dart';
+import 'launch_config.dart';
 
 void main() {
   runApp(const SamApp());
 }
+
+/// Which of the three prompt cards currently owns canvas interaction.
+///
+/// The radio buttons on the Prompt, Box Select and Point Select cards form one
+/// mutually exclusive group over this enum; `null` means no mode is active and
+/// the canvas ignores taps and drags.
+enum SelectionMode { prompt, box, point }
 
 class SamApp extends StatelessWidget {
   const SamApp({super.key});
@@ -90,12 +97,12 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isLoading = false;
   String? _error;
   String _backendStatus = "checking";
-  String _selectedMode = ""; // "prompt", "box", "point", or ""
+  SelectionMode? _selectedMode;
   String _boxMode = "positive"; // "positive" or "negative"
   String _pointMode = "positive"; // "positive" or "negative"
 
-  List<String> _savedSessions = [];
-  String? _selectedSavedSession;
+  /// Guards the one-shot auto-load of the launch-supplied image URL.
+  bool _autoLoadStarted = false;
 
   // Per-card result state
   bool _imageSourceRunning = false;
@@ -112,11 +119,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // Layer State
   LayerState? _layerState;
-  bool _isRestoringState = false;
 
   @override
   void initState() {
     super.initState();
+    // Session id and image URL are launch-time inputs, not user-entered.
+    // A null session id is fine: /upload allocates one and returns it.
+    _sessionId = LaunchConfig.sessionId;
+    _imageUrl = LaunchConfig.imageUrl;
+    // The Select button is disabled while the prompt is empty, so the field has
+    // to trigger a rebuild as it is typed into.
+    _textController.addListener(_onPromptTextChanged);
     _checkHealth();
     _healthCheckTimer = Timer.periodic(
       const Duration(seconds: 10),
@@ -136,12 +149,17 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _onLayerStateChanged() {
-    if (!_isRestoringState) _saveLayerState();
+    _saveLayerState();
+  }
+
+  void _onPromptTextChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
     _healthCheckTimer?.cancel();
+    _textController.removeListener(_onPromptTextChanged);
     _textController.dispose();
     _layerState?.removeListener(_onLayerStateChanged);
     super.dispose();
@@ -163,19 +181,19 @@ class _HomeScreenState extends State<HomeScreen> {
         _error ??= "Health check failed: $e";
       });
     }
+    _maybeAutoLoadImage();
   }
 
-  Future<void> _loadSavedSessions() async {
-    final sessions = await _api.listSessions();
-    if (!mounted) return;
-    setState(() {
-      _savedSessions = sessions;
-      if (_savedSessions.isNotEmpty && _selectedSavedSession == null) {
-        _selectedSavedSession = _savedSessions.first;
-      } else if (!_savedSessions.contains(_selectedSavedSession)) {
-        _selectedSavedSession = _savedSessions.isNotEmpty ? _savedSessions.first : null;
-      }
-    });
+  /// Uploads the launch-supplied image once the model is ready.
+  ///
+  /// /upload answers 503 until the model finishes loading, so this waits for
+  /// the first "online" health check rather than firing from initState.
+  void _maybeAutoLoadImage() {
+    if (_autoLoadStarted) return;
+    if (_backendStatus != "online") return;
+    if (_imageUrl == null || _imageUrl!.isEmpty) return;
+    _autoLoadStarted = true;
+    _loadImageFromUrl();
   }
 
 
@@ -325,8 +343,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() => _error = e.toString());
     } finally {
-      if (!mounted) return;
-      setState(() { _isLoading = false; _textPromptRunning = false; });
+      if (mounted) setState(() { _isLoading = false; _textPromptRunning = false; });
     }
   }
 
@@ -347,8 +364,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() => _error = e.toString());
     } finally {
-      if (!mounted) return;
-      setState(() { _isLoading = false; _boxRunning = false; });
+      if (mounted) setState(() { _isLoading = false; _boxRunning = false; });
     }
   }
 
@@ -369,8 +385,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() => _error = e.toString());
     } finally {
-      if (!mounted) return;
-      setState(() { _isLoading = false; _pointRunning = false; });
+      if (mounted) setState(() { _isLoading = false; _pointRunning = false; });
     }
   }
 
@@ -392,8 +407,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() => _error = e.toString());
     } finally {
-      if (!mounted) return;
-      setState(() { _isLoading = false; _resultsRunning = false; });
+      if (mounted) setState(() { _isLoading = false; _resultsRunning = false; });
     }
   }
 
@@ -407,121 +421,15 @@ class _HomeScreenState extends State<HomeScreen> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Masks saved successfully")),
         );
-        _loadSavedSessions();
       }
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
     } finally {
-      if (!mounted) return;
-      setState(() { _isLoading = false; });
+      if (mounted) setState(() { _isLoading = false; });
     }
   }
 
-
-  Future<void> _handleNewSession() async {
-    setState(() => _isLoading = true);
-    try {
-      final newId = await _api.newSession();
-      if (!mounted) return;
-      setState(() {
-        _sessionId = newId;
-        _imageBytes = null;
-        _uiImage = null;
-        _imageSize = null;
-        _result = null;
-        _error = null;
-        _textController.clear();
-      });
-      _loadSavedSessions();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("New session created: $newId")),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = e.toString());
-    } finally {
-      if (!mounted) return;
-      setState(() => _isLoading = false);
-    }
-  }
-
-  Future<void> _handleDeleteSession() async {
-    if (_selectedSavedSession == null) return;
-    setState(() => _isLoading = true);
-    try {
-      await _api.deleteSession(_selectedSavedSession!);
-      await _loadSavedSessions();
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Session deleted")),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = e.toString());
-    } finally {
-      if (!mounted) return;
-      setState(() => _isLoading = false);
-    }
-  }
-
-  Future<void> _handleSessionChange(String? newSessionId) async {
-    if (newSessionId == null || newSessionId == _sessionId) return;
-
-    setState(() {
-      _isLoading = true;
-      _error = null;
-      _selectedSavedSession = newSessionId; // Update dropdown selection immediately
-    });
-
-    try {
-      final sessionData = await _api.updateState(newSessionId);
-      if (!mounted) return;
-
-      // Assumes backend returns image as base64 string.
-      final imageB64 = sessionData['image_b64'] as String?;
-      if (imageB64 == null) {
-        throw Exception("Backend response did not include 'image_b64'.");
-      }
-
-      final imageBytes = base64Decode(imageB64);
-      final decodedImage = await _decodeImage(imageBytes);
-
-      setState(() {
-        _sessionId = newSessionId;
-        _imageBytes = imageBytes;
-        _uiImage = decodedImage;
-        _imageSize = Size(
-          (sessionData['width'] as num).toDouble(),
-          (sessionData['height'] as num).toDouble(),
-        );
-        _result = sessionData['results'] as Map<String, dynamic>?;
-        _segments = [];
-        _updateSegmentsFromResult();
-        _textController.clear();
-
-        // Restore layer state if provided by backend
-        if (sessionData['view_layers'] != null) {
-          _isRestoringState = true;
-          try {
-            final Map<String, dynamic> layers = Map<String, dynamic>.from(sessionData['view_layers']);
-            _layerState?.setOriginal(layers['original'] ?? true);
-            _layerState?.setMasks(layers['masks'] ?? true);
-            _layerState?.setRaw(layers['raw'] ?? false);
-            _layerState?.setFinal(layers['final'] ?? false);
-          } finally {
-            _isRestoringState = false;
-          }
-        }
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _error = "Failed to load session: $e");
-    } finally {
-      if (!mounted) return;
-      setState(() => _isLoading = false);
-    }
-  }
 
   Future<void> _saveLayerState() async {
     if (_sessionId == null || _layerState == null) return;
@@ -567,7 +475,14 @@ class _HomeScreenState extends State<HomeScreen> {
           // Sidebar + middle result column (scroll together)
           SizedBox(
             width: 520,
-            child: SingleChildScrollView(
+            // One group spanning the Prompt, Box Select and Point Select cards,
+            // so their radios are mutually exclusive. `toggleable: true` on each
+            // radio reports null when the selected one is tapped again, which is
+            // what clears the mode.
+            child: RadioGroup<SelectionMode>(
+              groupValue: _selectedMode,
+              onChanged: (mode) => setState(() => _selectedMode = mode),
+              child: SingleChildScrollView(
             padding: const EdgeInsets.all(16),
             child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -607,6 +522,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ],
               ),
+              ),
             ),
           ),
 
@@ -638,6 +554,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               segments: _segments,
                               result: _result,
                               isLoading: _isLoading,
+                              mode: _selectedMode,
                               onBoxDrawn: _sendBoxPrompt,
                               onPointDrawn: _sendPointPrompt,
                             ),
@@ -821,10 +738,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(width: 8),
                 const Text("Prompt", style: TextStyle(fontWeight: FontWeight.bold)),
                 const Spacer(),
-                Radio<String>(
-                  value: "prompt",
-                  groupValue: _selectedMode,
-                  onChanged: (v) => setState(() => _selectedMode = _selectedMode == "prompt" ? "" : "prompt"),
+                const Radio<SelectionMode>(
+                  value: SelectionMode.prompt,
+                  toggleable: true,
                 ),
               ],
             ),
@@ -875,10 +791,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(width: 8),
                 const Text("Box Select", style: TextStyle(fontWeight: FontWeight.bold)),
                 const Spacer(),
-                Radio<String>(
-                  value: "box",
-                  groupValue: _selectedMode,
-                  onChanged: (v) => setState(() => _selectedMode = _selectedMode == "box" ? "" : "box"),
+                const Radio<SelectionMode>(
+                  value: SelectionMode.box,
+                  toggleable: true,
                 ),
               ],
             ),
@@ -906,10 +821,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(width: 8),
                 const Text("Point Select", style: TextStyle(fontWeight: FontWeight.bold)),
                 const Spacer(),
-                Radio<String>(
-                  value: "point",
-                  groupValue: _selectedMode,
-                  onChanged: (v) => setState(() => _selectedMode = _selectedMode == "point" ? "" : "point"),
+                const Radio<SelectionMode>(
+                  value: SelectionMode.point,
+                  toggleable: true,
                 ),
               ],
             ),
@@ -1024,6 +938,11 @@ class SegmentationCanvas extends StatefulWidget {
   final List<Segment> segments;
   final Map<String, dynamic>? result;
   final bool isLoading;
+
+  /// Active selection mode. Only [SelectionMode.box] accepts drags and only
+  /// [SelectionMode.point] accepts taps; anything else leaves the canvas inert.
+  final SelectionMode? mode;
+
   final Function(List<double>) onBoxDrawn;
   final Function(List<double>) onPointDrawn;
 
@@ -1033,6 +952,7 @@ class SegmentationCanvas extends StatefulWidget {
     required this.segments,
     this.result,
     required this.isLoading,
+    required this.mode,
     required this.onBoxDrawn,
     required this.onPointDrawn,
   });
@@ -1044,6 +964,20 @@ class SegmentationCanvas extends StatefulWidget {
 class _SegmentationCanvasState extends State<SegmentationCanvas> {
   Offset? _startDrag;
   Offset? _currentDrag;
+
+  bool get _boxing => widget.mode == SelectionMode.box;
+  bool get _pointing => widget.mode == SelectionMode.point;
+
+  @override
+  void didUpdateWidget(SegmentationCanvas oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Leaving box mode mid-drag would otherwise leave the rubber-band rect
+    // painted with no way to finish or cancel it.
+    if (!_boxing && (_startDrag != null || _currentDrag != null)) {
+      _startDrag = null;
+      _currentDrag = null;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1087,42 +1021,57 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
                 painter: PromptPainter(result: widget.result),
               ),
 
-              // Gesture detector for drawing new boxes
+              // Gesture detector for prompting. Only the handlers belonging to
+              // the active mode are attached: leaving the pan recognizer live
+              // in point mode would let it claim taps before onTapUp fires.
               GestureDetector(
-                onTapUp: (details) {
-                  final local = details.localPosition;
-                  final nx = local.dx / widget.uiImage.width;
-                  final ny = local.dy / widget.uiImage.height;
-                  // Simple bounds check to ensure we clicked inside
-                  if (nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1) {
-                    widget.onPointDrawn([nx, ny]);
-                  }
-                },
-                onPanStart: (details) => setState(() {
-                  _startDrag = details.localPosition;
-                  _currentDrag = details.localPosition;
-                }),
-                onPanUpdate: (details) => setState(() => _currentDrag = details.localPosition),
-                onPanEnd: (details) {
-                  if (_startDrag != null && _currentDrag != null) {
-                    final rect = Rect.fromPoints(_startDrag!, _currentDrag!);
+                onTapUp: _pointing
+                    ? (details) {
+                        final local = details.localPosition;
+                        final nx = local.dx / widget.uiImage.width;
+                        final ny = local.dy / widget.uiImage.height;
+                        // Simple bounds check to ensure we clicked inside
+                        if (nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1) {
+                          widget.onPointDrawn([nx, ny]);
+                        }
+                      }
+                    : null,
+                onPanStart: _boxing
+                    ? (details) => setState(() {
+                          _startDrag = details.localPosition;
+                          _currentDrag = details.localPosition;
+                        })
+                    : null,
+                onPanUpdate: _boxing
+                    ? (details) => setState(() => _currentDrag = details.localPosition)
+                    : null,
+                onPanEnd: _boxing
+                    ? (details) {
+                        if (_startDrag != null && _currentDrag != null) {
+                          final rect = Rect.fromPoints(_startDrag!, _currentDrag!);
 
-                    // Normalize coordinates for the API call.
-                    final double nx = rect.center.dx / widget.uiImage.width;
-                    final double ny = rect.center.dy / widget.uiImage.height;
-                    final double nw = rect.width / widget.uiImage.width;
-                    final double nh = rect.height / widget.uiImage.height;
+                          // Normalize coordinates for the API call.
+                          final double nx = rect.center.dx / widget.uiImage.width;
+                          final double ny = rect.center.dy / widget.uiImage.height;
+                          final double nw = rect.width / widget.uiImage.width;
+                          final double nh = rect.height / widget.uiImage.height;
 
-                    if (nw > 0.005 && nh > 0.005) { // Avoid tiny boxes
-                      widget.onBoxDrawn([nx, ny, nw, nh]);
-                    }
-                  }
-                  setState(() {
-                    _startDrag = null;
-                    _currentDrag = null;
-                  });
-                },
-                child: Container(color: Colors.transparent),
+                          if (nw > 0.005 && nh > 0.005) { // Avoid tiny boxes
+                            widget.onBoxDrawn([nx, ny, nw, nh]);
+                          }
+                        }
+                        setState(() {
+                          _startDrag = null;
+                          _currentDrag = null;
+                        });
+                      }
+                    : null,
+                child: MouseRegion(
+                  cursor: (_pointing || _boxing)
+                      ? SystemMouseCursors.precise
+                      : MouseCursor.defer,
+                  child: Container(color: Colors.transparent),
+                ),
               ),
 
               // Painter for the box being currently drawn

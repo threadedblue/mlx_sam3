@@ -118,11 +118,11 @@ class MasksPainter extends CustomPainter {
     const singleColor = ui.Color.fromARGB(255, 48, 42, 42); // Dark grey
 
     final fillPaint = Paint()
-      ..color = singleColor.withOpacity(0.2)
+      ..color = singleColor.withValues(alpha: 0.2)
       ..style = PaintingStyle.fill;
 
     final stripePaint = Paint()
-      ..color = singleColor.withOpacity(0.5)
+      ..color = singleColor.withValues(alpha: 0.5)
       ..strokeWidth = 2.0
       ..style = PaintingStyle.stroke;
 
