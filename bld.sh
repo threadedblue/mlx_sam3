@@ -7,7 +7,7 @@ set -e
 ROOT_DIR=$(pwd)
 
 echo "🚀 Moving to frontend directory..."
-cd "$ROOT_DIR/app/frontend"
+cd "$ROOT_DIR/frontend"
 
 echo "🧹 Cleaning and fetching packages..."
 flutter clean
@@ -17,5 +17,5 @@ echo "🏗️ Building for Web (CanvasKit)..."
 
 flutter build web --debug --base-href /web/
 
-echo "✅ Build complete! Files are in app/frontend/build/web"
+echo "✅ Build complete! Files are in frontend/build/web"
 cd "$ROOT_DIR"

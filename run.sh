@@ -7,8 +7,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
-BACKEND_DIR="$SCRIPT_DIR/app/backend"
-FRONTEND_DIR="$SCRIPT_DIR/app/frontend"
+BACKEND_DIR="$SCRIPT_DIR/backend"
+FRONTEND_DIR="$SCRIPT_DIR/frontend"
 
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
