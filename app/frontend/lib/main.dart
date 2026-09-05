@@ -119,7 +119,6 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _checkHealth();
-    _loadSavedSessions();
     _healthCheckTimer = Timer.periodic(
       const Duration(seconds: 10),
       (_) => _checkHealth(),
