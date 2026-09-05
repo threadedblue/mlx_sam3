@@ -870,9 +870,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(width: 8),
                 const Text("Box Select", style: TextStyle(fontWeight: FontWeight.bold)),
                 const Spacer(),
-                Checkbox(
-                  value: _boxSelectEnabled,
-                  onChanged: (v) => setState(() => _boxSelectEnabled = v ?? false),
+                Radio<bool>(
+                  value: true,
+                  groupValue: _boxSelectEnabled,
+                  onChanged: (v) => setState(() => _boxSelectEnabled = !_boxSelectEnabled),
                 ),
               ],
             ),
@@ -900,9 +901,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(width: 8),
                 const Text("Point Select", style: TextStyle(fontWeight: FontWeight.bold)),
                 const Spacer(),
-                Checkbox(
-                  value: _pointSelectEnabled,
-                  onChanged: (v) => setState(() => _pointSelectEnabled = v ?? false),
+                Radio<bool>(
+                  value: true,
+                  groupValue: _pointSelectEnabled,
+                  onChanged: (v) => setState(() => _pointSelectEnabled = !_pointSelectEnabled),
                 ),
               ],
             ),
