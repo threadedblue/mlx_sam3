@@ -50,7 +50,7 @@ class IncludeExcludeToggle extends StatelessWidget {
                       Icon(
                         Icons.check,
                         size: 18,
-                        color: value ? Colors.black : Colors.grey,
+                        color: value ? Colors.white : Colors.grey,
                       ),
                       const SizedBox(width: 4),
                       Text(
@@ -58,7 +58,7 @@ class IncludeExcludeToggle extends StatelessWidget {
                         style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w500,
-                          color: value ? Colors.black : Colors.grey,
+                          color: value ? Colors.white : Colors.grey,
                         ),
                       ),
                     ],
