@@ -269,11 +269,14 @@ class SegmentationService:
         else:
             image_path = session_dir / self.ORIGINAL_IMAGE_FILENAME
 
-        if not image_path.exists():
-            raise FileNotFoundError(f"Image file not found: {image_path}")
-
-        image_bytes = image_path.read_bytes()
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        # A session registered by /initSession but never uploaded to has
+        # metadata and no image. That is a session the caller can still use --
+        # the frontend shows its name while the image is on its way -- so the
+        # image is optional here rather than a 404 for the whole session.
+        if image_path.exists():
+            image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+        else:
+            image_b64 = None
 
         response = {
             "session_id": session_id,

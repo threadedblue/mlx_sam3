@@ -28,10 +28,31 @@ NC='\033[0m'
 # The frontend default is in frontend/lib/launch_config.dart; keep the two in
 # step, or override both with SEGFORGE_PORT and --dart-define=SEGFORGE_BACKEND_URL.
 SF_PORT="${SEGFORGE_PORT:-8401}"
+PIDFILE="$PROJECT_ROOT/.sfbe.pid"
 
 MODE=$1
 
 case "$MODE" in
+
+  STOP)
+    if [ -f "$PIDFILE" ]; then
+      PID=$(cat "$PIDFILE")
+      if kill -0 "$PID" 2>/dev/null; then
+        kill "$PID" && echo -e "${GREEN}Stopped SF backend (pid $PID).${NC}"
+      else
+        echo -e "${YELLOW}PID $PID is not running.${NC}"
+      fi
+      rm -f "$PIDFILE"
+    else
+      # Fall back to pkill if no PID file (e.g. started outside run.sh)
+      if pkill -f "uvicorn main:app" 2>/dev/null; then
+        echo -e "${GREEN}Stopped SF backend (via pkill).${NC}"
+      else
+        echo -e "${YELLOW}SF backend not running.${NC}"
+      fi
+    fi
+    exit 0
+    ;;
 
   BE)
     for arg in "$@"; do
@@ -47,9 +68,11 @@ case "$MODE" in
     echo ""
     cd "$PROJECT_ROOT"
     source "$PROJECT_ROOT/.venv/bin/activate"
-    pip install -q -r "$BACKEND_DIR/requirements.txt" 2>&1 | grep -v "already satisfied"
+    pip install -q -r "$BACKEND_DIR/requirements.txt" 2>&1 | grep -v "already satisfied" || true
     cd "$BACKEND_DIR"
-    exec uvicorn main:app --reload --host 127.0.0.1 --port "$SF_PORT"
+    echo $$ > "$PIDFILE"
+    trap 'rm -f "$PIDFILE"' EXIT
+    uvicorn main:app --reload --host 127.0.0.1 --port "$SF_PORT"
     ;;
 
   FE)
@@ -97,6 +120,7 @@ case "$MODE" in
   *)
     echo -e "${RED}Usage:${NC}"
     echo "  ./run.sh BE [--clear-storage]              start FastAPI backend"
+    echo "  ./run.sh STOP                              stop FastAPI backend"
     echo "  ./run.sh FE [--url=URL] [--session=ID]     start Flutter macOS app"
     echo ""
     echo "  --url / --session may also be given as SEGFORGE_IMAGE_URL /"

@@ -29,6 +29,32 @@ class ApiService {
     return {"status": "offline", "model_loaded": false};
   }
 
+  /// Reads back everything already stored for [sessionId]: its metadata
+  /// (`name`, `description`, `image_url`), its image as `image_b64`, and any
+  /// prompts/results it already holds.
+  ///
+  /// This is how a session handed to the app at launch fills the UI in. The
+  /// caller that created the session — DoubleNaught's Seg Forge node — has
+  /// already uploaded the image and named the session over `/initSession`, so
+  /// re-downloading the image URL and re-uploading it would move the same
+  /// bytes twice and still leave the name unknown.
+  ///
+  /// Returns null when the backend has nothing on file (404), which is the
+  /// ordinary case for a session id that has not been uploaded to yet.
+  Future<Map<String, dynamic>?> loadSession(String sessionId) async {
+    try {
+      final response = await http.get(Uri.parse('$baseUrl/loadSession/$sessionId'));
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      if (response.statusCode == 404) return null;
+      throw Exception('Load session failed: ${response.statusCode} ${response.body}');
+    } catch (e) {
+      debugPrint('Error loading session $sessionId: $e');
+      rethrow;
+    }
+  }
+
   /// Uploads image bytes, optionally into an existing session.
   ///
   /// When [sessionId] is null the backend allocates a session and returns its

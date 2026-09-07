@@ -524,7 +524,8 @@ async def init_session(request: InitSessionRequest):
 
     Called by DoubleNaught after allocating a session but before launching
     the SF frontend. Stores session name, description, and image URL so they
-    are available to the frontend via /getSession/{id}.
+    are available to the frontend via /loadSession/{id}, which is what the app
+    reads at startup to fill in the session card.
     """
     if service is None:
         raise HTTPException(status_code=503, detail="Service not available")
@@ -1088,12 +1089,14 @@ async def inference_logs(run_id: str):
     return run["logs"]
 
 
-app.mount(
-    "/web",
-    StaticFiles(directory=FLUTTER_WEB_DIR, html=True),
-    name="frontend",
-)
+if FLUTTER_WEB_DIR.exists():
+    app.mount(
+        "/web",
+        StaticFiles(directory=FLUTTER_WEB_DIR, html=True),
+        name="frontend",
+    )
 
+STORAGE_PARENT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount(
     "/storage",
     StaticFiles(directory=STORAGE_PARENT_DIR),

@@ -10,6 +10,7 @@
 // If your current ApiService only accepts File, update it to accept bytes, or create an overload.
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:http/http.dart' as http;
@@ -88,6 +89,12 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _sessionId;
   String? _imageUrl; // Supplied at launch, non-editable
 
+  /// Session metadata, read back from the backend at startup. Whoever created
+  /// the session named it (DoubleNaught's Seg Forge node does, over
+  /// `/initSession`), and that name is more use to the reader than the id.
+  String? _sessionName;
+  String? _sessionDescription;
+
   Uint8List? _imageBytes; // Web-safe image data
   ui.Image? _uiImage; // Decoded image for canvas
   Size? _imageSize; // Original size
@@ -127,6 +134,9 @@ class _HomeScreenState extends State<HomeScreen> {
     // A null session id is fine: /upload allocates one and returns it.
     _sessionId = LaunchConfig.sessionId;
     _imageUrl = LaunchConfig.imageUrl;
+    // Whatever the backend already holds for this session goes on screen at
+    // once — it needs no model, so the window is never blank while SAM loads.
+    _loadLaunchSession();
     // The Select button is disabled while the prompt is empty, so the field has
     // to trigger a rebuild as it is typed into.
     _textController.addListener(_onPromptTextChanged);
@@ -184,14 +194,73 @@ class _HomeScreenState extends State<HomeScreen> {
     _maybeAutoLoadImage();
   }
 
-  /// Uploads the launch-supplied image once the model is ready.
+  /// Puts a launch-supplied session on screen: its name, its description and
+  /// its image, straight from the backend.
+  ///
+  /// Deliberately independent of the model: `/loadSession` reads state.json and
+  /// the stored PNG, so none of this waits on SAM. The upload in
+  /// [_maybeAutoLoadImage] still has to happen — only `/upload` builds the
+  /// in-memory image state that `/segment/*` works from — but the user should
+  /// not be looking at an empty window until then.
+  Future<void> _loadLaunchSession() async {
+    final sessionId = _sessionId;
+    if (sessionId == null || sessionId.isEmpty) return;
+
+    final Map<String, dynamic>? loaded;
+    try {
+      loaded = await _api.loadSession(sessionId);
+    } catch (e) {
+      // A session with nothing stored yet is ordinary, not an error worth
+      // showing: the URL auto-load below is the other way in.
+      debugPrint('Could not load launch session $sessionId: $e');
+      return;
+    }
+    if (loaded == null || !mounted) return;
+    final session = loaded;
+
+    final b64 = session['image_b64'] as String?;
+    Uint8List? bytes;
+    ui.Image? decoded;
+    if (b64 != null && b64.isNotEmpty) {
+      try {
+        bytes = base64Decode(b64);
+        decoded = await _decodeImage(bytes);
+      } catch (e) {
+        debugPrint('Could not decode session image: $e');
+        bytes = null;
+        decoded = null;
+      }
+    }
+    if (!mounted) return;
+
+    setState(() {
+      _sessionName = (session['name'] as String?)?.trim();
+      _sessionDescription = (session['description'] as String?)?.trim();
+      if (bytes != null && decoded != null) {
+        _imageBytes = bytes;
+        _uiImage = decoded;
+        _imageSize = Size(
+          (session['width'] as num?)?.toDouble() ?? decoded.width.toDouble(),
+          (session['height'] as num?)?.toDouble() ?? decoded.height.toDouble(),
+        );
+        _imageSourceResult = [
+          ResultDatum(label: 'Session', value: _sessionName ?? sessionId),
+        ];
+      }
+    });
+  }
+
+  /// Registers the launch image with the backend once the model is ready.
   ///
   /// /upload answers 503 until the model finishes loading, so this waits for
-  /// the first "online" health check rather than firing from initState.
+  /// the first "online" health check rather than firing from initState. Bytes
+  /// already in hand from [_loadLaunchSession] are reused — the image only
+  /// needs fetching when the session had none stored.
   void _maybeAutoLoadImage() {
     if (_autoLoadStarted) return;
     if (_backendStatus != "online") return;
-    if (_imageUrl == null || _imageUrl!.isEmpty) return;
+    final haveBytes = _imageBytes != null;
+    if (!haveBytes && (_imageUrl == null || _imageUrl!.isEmpty)) return;
     _autoLoadStarted = true;
     _loadImageFromUrl();
   }
@@ -278,30 +347,42 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _loadImageFromUrl() async {
-    if (_imageUrl == null || _imageUrl!.isEmpty) return;
-    final url = _imageUrl!;
+    // Bytes from the session load are the same bytes the URL serves, so the
+    // download is skipped when they are already here.
+    final preloaded = _imageBytes;
+    final url = _imageUrl;
+    if (preloaded == null && (url == null || url.isEmpty)) return;
 
     setState(() {
       _isLoading = true;
       _imageSourceRunning = true;
-      _imageSourceResult = [];
       _error = null;
     });
 
     try {
-      // Download image from URL
-      final response = await http.get(Uri.parse(url));
-      if (response.statusCode != 200) {
-        throw Exception("Failed to download image: ${response.statusCode}");
+      Uint8List imageBytes;
+      ui.Image decodedImage;
+      if (preloaded != null) {
+        imageBytes = preloaded;
+        decodedImage = _uiImage ?? await _decodeImage(preloaded);
+      } else {
+        final response = await http.get(Uri.parse(url!));
+        if (response.statusCode != 200) {
+          throw Exception("Failed to download image: ${response.statusCode}");
+        }
+        imageBytes = response.bodyBytes;
+        decodedImage = await _decodeImage(imageBytes);
       }
 
-      final imageBytes = response.bodyBytes;
-      final decodedImage = await _decodeImage(imageBytes);
+      final filename = url == null || url.split('/').last.isEmpty
+          ? "image.png"
+          : url.split('/').last;
 
-      // Upload to backend
+      // Upload to backend. This is what gives /segment/* something to work
+      // from: only /upload builds the in-memory image state.
       final uploadResponse = await _api.uploadImageBytes(
         imageBytes,
-        filename: url.split('/').last.isEmpty ? "image.png" : url.split('/').last,
+        filename: filename,
         sessionId: _sessionId,
       );
 
@@ -316,7 +397,10 @@ class _HomeScreenState extends State<HomeScreen> {
           );
           _result = null;
           _segments = [];
-          _imageSourceResult = [ResultDatum(label: 'URL', value: url)];
+          _imageSourceResult = [
+            ResultDatum(label: url != null ? 'URL' : 'Session',
+                value: url ?? _sessionId ?? ''),
+          ];
         });
       }
     } catch (e) {
@@ -632,32 +716,58 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildSessionCard() {
+    final name = _sessionName;
+    final description = _sessionDescription;
+
     return _buildBorderedCard(
       Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("Session ID", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+            const Text("Session", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
             const SizedBox(height: 8),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              decoration: BoxDecoration(
-                border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Text(
-                _sessionId ?? "(none)",
-                style: TextStyle(
-                  fontSize: 13,
-                  color: _sessionId != null ? Theme.of(context).colorScheme.onSurface : Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ),
+            // Name and description are only known once the backend has been
+            // asked, and only when whoever created the session supplied them,
+            // so each row appears only if there is something in it.
+            if (name != null && name.isNotEmpty) ...[
+              _sessionField("Name", name),
+              const SizedBox(height: 8),
+            ],
+            if (description != null && description.isNotEmpty) ...[
+              _sessionField("Description", description),
+              const SizedBox(height: 8),
+            ],
+            _sessionField("ID", _sessionId ?? "(none)", dim: _sessionId == null),
           ],
         ),
       ),
+    );
+  }
+
+  Widget _sessionField(String label, String value, {bool dim = false}) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant)),
+        const SizedBox(height: 4),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            border: Border.all(color: scheme.outlineVariant),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Text(
+            value,
+            style: TextStyle(
+              fontSize: 13,
+              color: dim ? scheme.onSurfaceVariant : scheme.onSurface,
+            ),
+          ),
+        ),
+      ],
     );
   }
 
