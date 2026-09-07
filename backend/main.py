@@ -150,6 +150,13 @@ class SessionSettingsRequest(BaseModel):
     settings: Dict[str, Any]
 
 
+class InitSessionRequest(BaseModel):
+    session_id: str
+    name: str
+    description: str
+    image_url: str
+
+
 class LoraAppendRequest(BaseModel):
     session_id: str
     segment_index: int
@@ -508,6 +515,38 @@ async def new_session():
     """Creates a new session ID and its storage directories."""
     session_id = service.create_session()
     return {"session_id": session_id}
+
+
+@app.post("/initSession")
+async def init_session(request: InitSessionRequest):
+    """
+    Initialize a session with metadata before the SegForge app launches.
+
+    Called by DoubleNaught after allocating a session but before launching
+    the SF frontend. Stores session name, description, and image URL so they
+    are available to the frontend via /getSession/{id}.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    try:
+        service.register_session_data(
+            request.session_id,
+            {
+                "name": request.name,
+                "description": request.description,
+                "image_url": request.image_url,
+            }
+        )
+        return {
+            "session_id": request.session_id,
+            "name": request.name,
+            "description": request.description,
+            "image_url": request.image_url,
+            "ready": True,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize session: {str(e)}")
 
 
 @app.delete("/deleteSession/{session_id}")

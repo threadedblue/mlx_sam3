@@ -166,6 +166,9 @@ class SegmentationService:
                 "image_size": (state_data.get("width"), state_data.get("height")),
                 "created_at": state_data.get("created_at"),
                 "prompts": prompts,
+                "name": state_data.get("name"),
+                "description": state_data.get("description"),
+                "image_url": state_data.get("image_url"),
             }
             self.sessions[session_id] = session_data
             print(f"Successfully loaded session {session_id} from disk into memory.")
@@ -226,7 +229,10 @@ class SegmentationService:
             "width": image_size[0],
             "height": image_size[1],
             "prompts": session.get("prompts", []),
-            "results": serialize_state(state)
+            "results": serialize_state(state),
+            "name": session.get("name"),
+            "description": session.get("description"),
+            "image_url": session.get("image_url"),
         }
 
         # 3. Write to state.json, which is read by the /updateState endpoint
@@ -277,6 +283,9 @@ class SegmentationService:
             "results": state_data.get("results", {}),
             "prompts": state_data.get("prompts", []),
             "created_at": state_data.get("created_at"),
+            "name": state_data.get("name"),
+            "description": state_data.get("description"),
+            "image_url": state_data.get("image_url"),
         }
 
         if "view_layers" in state_data:
