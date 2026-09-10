@@ -224,10 +224,41 @@ class ApiService {
     if (response.statusCode != 200) {
       throw Exception('List sessions failed: ${response.statusCode} ${response.body}');
     }
-    final j = jsonDecode(response.body) as Map<String, dynamic>;
+    final parsed = jsonDecode(response.body);
+    debugPrint('listSavedSessions raw response: $parsed (type: ${parsed.runtimeType})');
+
+    List<dynamic> sessionsList;
+
+    // Handle both response shapes:
+    // 1. Wrapped: {"sessions": [...]}
+    // 2. Bare: [...]
+    if (parsed is Map<String, dynamic>) {
+      sessionsList = (parsed['sessions'] as List?) ?? [];
+    } else if (parsed is List) {
+      sessionsList = parsed;
+    } else {
+      throw Exception(
+        'Expected Map or List response, got ${parsed.runtimeType}: $parsed'
+      );
+    }
+
+    debugPrint(
+      'sessions list: $sessionsList (${sessionsList.length} items, '
+      'first: ${sessionsList.isNotEmpty ? sessionsList[0].runtimeType : "empty"})'
+    );
+
+    // Convert each session to a Map<String, dynamic>. Handle two cases:
+    // 1. Already a dict: {"session_id": "...", "name": "...", ...}
+    // 2. Just an ID string: "session-id-..." (legacy format, convert to minimal record)
     return [
-      for (final s in (j['sessions'] as List? ?? const []))
-        (s as Map).cast<String, dynamic>(),
+      for (final s in sessionsList)
+        if (s is Map<String, dynamic>)
+          s
+        else if (s is String)
+          // Legacy: bare session ID string. Create minimal record with just the ID.
+          {"session_id": s, "name": "", "description": "", "created_at": "", "image_url": ""}
+        else
+          (s as Map).cast<String, dynamic>(),
     ];
   }
 

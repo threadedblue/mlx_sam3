@@ -505,7 +505,19 @@ async def list_sessions():
     both SF's own standalone SessionPickerScreen and, indirectly,
     DoubleNaught's picklist.
     """
-    return {"sessions": aa_persistence.list_registries()}
+    try:
+        sessions = aa_persistence.list_registries()
+        # Ensure return type is always wrapped in {"sessions": [...]},
+        # with each session a dict containing at least session_id.
+        if not isinstance(sessions, list):
+            print(f"WARNING: list_registries returned {type(sessions)}, not list: {sessions}")
+            sessions = []
+        return {"sessions": sessions}
+    except Exception as e:
+        print(f"ERROR in list_sessions: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"sessions": []}
 
 
 @app.post("/newSession")
