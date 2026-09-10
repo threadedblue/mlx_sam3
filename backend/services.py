@@ -19,6 +19,8 @@ import numpy as np
 from PIL import Image
 from sam3.model.sam3_image_processor import Sam3Processor
 
+import aa_persistence
+
 
 def _img_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
     buf = io.BytesIO()
@@ -101,7 +103,6 @@ def serialize_state(state: dict) -> dict:
 
 
 class SegmentationService:
-    SESSION_STATE_FILENAME = "session.json"
     ORIGINAL_IMAGE_FILENAME = "original.png"
 
     def __init__(self, storage_dir: Path, processor: Sam3Processor):
@@ -128,27 +129,23 @@ class SegmentationService:
 
     def _load_session_into_memory(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
-        Reads a session from disk, reconstructs its MLX state,
+        Reads a session from its persisted Segment/Linkage/Registry AAs,
+        reconstructs its MLX state by replaying prompts in original order,
         and loads it into the in-memory session cache.
         """
-        session_dir = self.storage_dir / session_id
-        state_file = session_dir / self.SESSION_STATE_FILENAME
-        image_file = session_dir / self.ORIGINAL_IMAGE_FILENAME
-
-        if not (session_dir.is_dir() and state_file.exists() and image_file.exists()):
+        raw = aa_persistence.read_session_raw(session_id)
+        if raw is None or raw["image_bytes"] is None:
             return None
 
         try:
-            # 1. Load metadata and image bytes
-            state_data = json.loads(state_file.read_text())
-            image_bytes = image_file.read_bytes()
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            # 1. Load image bytes
+            image = Image.open(io.BytesIO(raw["image_bytes"])).convert("RGB")
 
             # 2. Re-initialize model state with the image
             state = self.processor.set_image(image)
 
-            # 3. Re-apply prompts to reconstruct the full state
-            prompts = state_data.get("prompts", [])
+            # 3. Re-apply prompts, in original order, to reconstruct the full state
+            prompts = raw["prompts"]
             for p in prompts:
                 if isinstance(p, str):  # Text prompt
                     state = self.processor.set_text_prompt(p, state)
@@ -161,14 +158,14 @@ class SegmentationService:
             # 4. Construct the session object and store it in memory
             session_data = {
                 "state": state,
-                "original_image_bytes": image_bytes,
-                "original_filename": state_data.get("original_filename"),
-                "image_size": (state_data.get("width"), state_data.get("height")),
-                "created_at": state_data.get("created_at"),
+                "original_image_bytes": raw["image_bytes"],
+                "original_filename": raw["original_filename"],
+                "image_size": (raw["width"], raw["height"]),
+                "created_at": raw["created_at"],
                 "prompts": prompts,
-                "name": state_data.get("name"),
-                "description": state_data.get("description"),
-                "image_url": state_data.get("image_url"),
+                "name": raw["name"],
+                "description": raw["description"],
+                "image_url": raw["image_url"],
             }
             self.sessions[session_id] = session_data
             print(f"Successfully loaded session {session_id} from disk into memory.")
@@ -203,96 +200,75 @@ class SegmentationService:
             print(f"Warning: Failed to save initial state for session {session_id}: {e}")
 
     def save_session_to_disk(self, session_id: str):
-        """Saves the full application state to disk for later reloading via /updateState."""
+        """Persists the full session state as Segment/Linkage/Registry AAs.
+
+        Replaces the old JSON+PNG flow — session.json/original.png are no
+        longer written here. See aa_persistence for the schema.
+        """
         session = self.get_session(session_id)
         if not session:
             print(f"Warning: Cannot save state for non-existent in-memory session {session_id}")
             return
 
-        session_dir = self.storage_dir / session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
-
-        # 1. Save original image if it exists
-        image_path = session_dir / self.ORIGINAL_IMAGE_FILENAME
-        if "original_image_bytes" in session:
-            image_path.write_bytes(session["original_image_bytes"])
-
-        # 2. Prepare state data for JSON
-        state = session.get("state", {})
-        image_size = session.get("image_size", (None, None))
-
-        state_data = {
-            "session_id": session_id,
-            "created_at": session.get("created_at"),
-            "original_filename": session.get("original_filename"),
-            "image_path": str(image_path),
-            "width": image_size[0],
-            "height": image_size[1],
-            "prompts": session.get("prompts", []),
-            "results": serialize_state(state),
-            "name": session.get("name"),
-            "description": session.get("description"),
-            "image_url": session.get("image_url"),
-        }
-
-        # 3. Write to state.json, which is read by the /updateState endpoint
-        (session_dir / self.SESSION_STATE_FILENAME).write_text(json.dumps(state_data, indent=2))
+        aa_persistence.save_session(session_id, session)
 
     def save_session_settings(self, session_id: str, settings: Dict[str, Any]):
-        """Saves UI-specific settings to the session's state file."""
-        session_dir = self.storage_dir / session_id
-        state_file = session_dir / self.SESSION_STATE_FILENAME
-
-        if not state_file.exists():
-            raise FileNotFoundError(f"State file not found for session {session_id}, cannot save settings.")
-
-        # Read, update, write
-        state_data = json.loads(state_file.read_text())
-        state_data.update(settings)  # Merge the new settings
-        state_file.write_text(json.dumps(state_data, indent=2))
+        """Merges UI-specific settings into the session's persisted registry."""
+        aa_persistence.save_session_settings(session_id, settings)
 
     def load_session_from_disk(self, session_id: str) -> Dict[str, Any]:
-        """Load session state and image from disk."""
-        session_dir = self.storage_dir / session_id
-        state_file = session_dir / self.SESSION_STATE_FILENAME
+        """Load session state and image from the persisted AAs.
 
-        print("state_file==",state_file)
-
-        if not state_file.exists():
+        Reconstructs the same wire shape the old JSON+PNG flow produced:
+        image_b64, width/height, results (masks as RLE / boxes / scores),
+        prompts, name/description/image_url/created_at.
+        """
+        raw = aa_persistence.read_session_raw(session_id)
+        if raw is None:
             raise FileNotFoundError(f"State file not found for session {session_id}")
-
-        state_data = json.loads(state_file.read_text())
-
-        image_path_str = state_data.get("image_path")
-        if image_path_str:
-            image_path = Path(image_path_str)
-        else:
-            image_path = session_dir / self.ORIGINAL_IMAGE_FILENAME
 
         # A session registered by /initSession but never uploaded to has
         # metadata and no image. That is a session the caller can still use --
         # the frontend shows its name while the image is on its way -- so the
         # image is optional here rather than a 404 for the whole session.
-        if image_path.exists():
-            image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
-        else:
-            image_b64 = None
+        image_b64 = (
+            base64.b64encode(raw["image_bytes"]).decode("utf-8")
+            if raw["image_bytes"] else None
+        )
+
+        masks_rle: list = []
+        boxes: list = []
+        scores: list = []
+        for seg in raw["segments"]:
+            if seg["mask_bytes"] is not None:
+                mask_img = Image.open(io.BytesIO(seg["mask_bytes"])).convert("L")
+                mask_np = (np.array(mask_img) > 127).astype(np.uint8)
+                masks_rle.append(mask_to_rle(mask_np))
+            if seg["bbox"] is not None:
+                boxes.append(seg["bbox"])
+            if seg["score"] is not None:
+                scores.append(seg["score"])
 
         response = {
             "session_id": session_id,
             "image_b64": image_b64,
-            "width": state_data.get("width"),
-            "height": state_data.get("height"),
-            "results": state_data.get("results", {}),
-            "prompts": state_data.get("prompts", []),
-            "created_at": state_data.get("created_at"),
-            "name": state_data.get("name"),
-            "description": state_data.get("description"),
-            "image_url": state_data.get("image_url"),
+            "width": raw["width"],
+            "height": raw["height"],
+            "results": {
+                "masks": masks_rle,
+                "boxes": boxes,
+                "scores": scores,
+            },
+            "prompts": raw["prompts"],
+            "created_at": raw["created_at"],
+            "name": raw["name"],
+            "description": raw["description"],
+            "image_url": raw["image_url"],
         }
 
-        if "view_layers" in state_data:
-            response["view_layers"] = state_data["view_layers"]
+        view_layers = raw["ui_settings"].get("view_layers")
+        if view_layers is not None:
+            response["view_layers"] = view_layers
 
         return response
 
@@ -331,11 +307,10 @@ class SegmentationService:
 
         start_time = time.perf_counter()
         state = session["state"]
-        image_size = session.get("image_size", (None, None))
-        
+
         session_dir = self.storage_dir / session_id
         masks_dir = session_dir / "masks"
-        
+
         # Ensure directories exist (idempotent)
         masks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -345,10 +320,8 @@ class SegmentationService:
             image_path.write_bytes(session["original_image_bytes"])
 
         # 2. Save masks
-        mask_count = 0
         if "masks" in state:
             masks = state["masks"]
-            mask_count = len(masks)
             for i, mask_mx in enumerate(masks):
                 mask_np = np.array(mask_mx)
                 mask_binary = (mask_np > 0.5).astype(np.uint8) * 255
@@ -357,20 +330,6 @@ class SegmentationService:
                 
                 mask_image = Image.fromarray(mask_binary, mode='L')
                 mask_image.save(masks_dir / f"mask_{i:03d}.png")
-
-        # 3. Save metadata
-        session_data = {
-            "session_id": session_id,
-            "created_at": session.get("created_at"),
-            "original_filename": session.get("original_filename"),
-            "image_path": str(image_path),
-            "width": image_size[0],
-            "height": image_size[1],
-            "prompts": session.get("prompts", []),
-            "results": serialize_state(state),
-            "mask_count": mask_count
-        }
-        (session_dir / self.SESSION_STATE_FILENAME).write_text(json.dumps(session_data, indent=2))
 
         return {
             "path": str(session_dir),

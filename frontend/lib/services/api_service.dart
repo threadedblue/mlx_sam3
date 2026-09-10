@@ -8,10 +8,12 @@ import '../launch_config.dart';
 /// Client for the SegForge FastAPI backend.
 ///
 /// Only the endpoints the current UI uses are exposed here. The backend still
-/// serves several others (session listing/creation/deletion, `/updateState`,
-/// `/createSegments`, `/showSegments`, the `/lora/*` family, `/process-image`,
-/// and `/inference/*`); they lost their last caller when the corresponding
-/// cards were removed from the UI.
+/// serves several others (`/updateState`, `/createSegments`, `/showSegments`,
+/// the `/lora/*` family, `/process-image`, and `/inference/*`); they lost
+/// their last caller when the corresponding cards were removed from the UI.
+/// Session listing/creation (`/listSessions`, `/newSession`, `/initSession`)
+/// regained a caller — [SessionPickerScreen] — for the standalone launch
+/// path.
 class ApiService {
   /// Backend address, overridable at launch with
   /// `--dart-define=SEGFORGE_BACKEND_URL=...`. See [LaunchConfig.backendUrl].
@@ -187,6 +189,78 @@ class ApiService {
     } catch (e) {
       debugPrint('Error saving masks: $e');
       rethrow;
+    }
+  }
+
+  /// Persists the session's Segment/Linkage/Registry AAs so it can be
+  /// resumed later (standalone picker, or DoubleNaught re-launching the same
+  /// session id). Distinct from [saveMasks], which only rasterizes mask PNGs
+  /// for DoubleNaught's own Close-Forge collection flow.
+  Future<Map<String, dynamic>?> saveSession(String sessionId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/saveSession'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId}),
+      );
+
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      }
+      throw Exception('Save session failed: ${response.body}');
+    } catch (e) {
+      debugPrint('Error saving session: $e');
+      rethrow;
+    }
+  }
+
+  /// Lists sessions SF has actually saved, for [SessionPickerScreen].
+  ///
+  /// Reads the same registry.parquet-backed listing DoubleNaught's own
+  /// picklist reads — a session that was only ever staged (an id minted, no
+  /// Save yet) does not appear here.
+  Future<List<Map<String, dynamic>>> listSavedSessions() async {
+    final response = await http.get(Uri.parse('$baseUrl/listSessions'));
+    if (response.statusCode != 200) {
+      throw Exception('List sessions failed: ${response.statusCode} ${response.body}');
+    }
+    final j = jsonDecode(response.body) as Map<String, dynamic>;
+    return [
+      for (final s in (j['sessions'] as List? ?? const []))
+        (s as Map).cast<String, dynamic>(),
+    ];
+  }
+
+  /// Allocates a new session id on the backend. Nothing is written under
+  /// storage/sf/sessions/ until that session's first Save.
+  Future<String?> newSession() async {
+    final response = await http.post(Uri.parse('$baseUrl/newSession'));
+    if (response.statusCode != 200) {
+      throw Exception('New session failed: ${response.statusCode} ${response.body}');
+    }
+    final j = jsonDecode(response.body) as Map<String, dynamic>;
+    return j['session_id'] as String?;
+  }
+
+  /// Registers name/description for a freshly allocated session — same
+  /// `/initSession` call DoubleNaught's Open Forge flow uses.
+  Future<void> initSessionMetadata({
+    required String sessionId,
+    required String name,
+    required String description,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/initSession'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'session_id': sessionId,
+        'name': name,
+        'description': description,
+        'image_url': '',
+      }),
+    );
+    if (response.statusCode != 200) {
+      throw Exception('Init session failed: ${response.statusCode} ${response.body}');
     }
   }
 

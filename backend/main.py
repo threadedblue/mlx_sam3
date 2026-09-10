@@ -37,6 +37,7 @@ from sam3.model.sam3_image_processor import Sam3Processor
 from dotenv import load_dotenv
 
 from services import SegmentationService, serialize_state
+import aa_persistence
 from lora_inferencer import (
     validate_inference_inputs,
     run_inference as _run_inference_fn,
@@ -496,18 +497,15 @@ async def delete_session(session_id: str):
 
 @app.get("/listSessions")
 async def list_sessions():
-    """List all saved sessions in storage."""
-    if not STORAGE_DIR.exists():
-        return []
-    
-    # List directories only
-    sessions_list = [
-        d.name for d in STORAGE_DIR.iterdir() 
-        if d.is_dir() and not d.name.startswith('.')
-    ]
-    # Sort by modification time (newest first) if possible, or just name
-    sessions_list.sort(reverse=True)
-    return sessions_list
+    """List sessions actually persisted under storage/sf/sessions/.
+
+    Reads registry.parquet metadata (session_id/name/description/created_at/
+    image_url) — a session that was only ever staged (an id minted via
+    /newSession or /initSession, no Save yet) does not appear here. Backs
+    both SF's own standalone SessionPickerScreen and, indirectly,
+    DoubleNaught's picklist.
+    """
+    return {"sessions": aa_persistence.list_registries()}
 
 
 @app.post("/newSession")

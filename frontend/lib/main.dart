@@ -11,11 +11,13 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:http/http.dart' as http;
 
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 
 import 'services/api_service.dart';
 import 'segment_layers_card.dart';
@@ -67,19 +69,183 @@ class SamApp extends StatelessWidget {
           cardTheme: const CardThemeData(elevation: 2, margin: EdgeInsets.zero),
         ),
         themeMode: ThemeMode.dark,
-        home: const HomeScreen(),
+        // The picker is purely the fallback for "nothing told SF what to do
+        // yet" — launched with args (session id and/or image url), DN's Open
+        // Forge flow always supplies at least one, so this only fires on a
+        // bare standalone launch.
+        home: (LaunchConfig.sessionId == null && LaunchConfig.imageUrl == null)
+            ? const SessionPickerScreen()
+            : const HomeScreen(),
       ),
     );
   }
 }
 
+/// Standalone session open/create screen, shown only when SF is launched
+/// with no session id or image URL at all (see [SamApp.build]). Lists
+/// sessions SF has actually saved (reading the same registry.parquet-backed
+/// listing DoubleNaught's picklist reads) and offers "+ New" — nothing is
+/// written to disk for a new session until its first Save, same rule as
+/// everywhere else in this flow.
+class SessionPickerScreen extends StatefulWidget {
+  const SessionPickerScreen({super.key});
+
+  @override
+  State<SessionPickerScreen> createState() => _SessionPickerScreenState();
+}
+
+class _SessionPickerScreenState extends State<SessionPickerScreen> {
+  final ApiService _api = ApiService();
+  List<Map<String, dynamic>> _sessions = [];
+  bool _loading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final sessions = await _api.listSavedSessions();
+      if (!mounted) return;
+      setState(() {
+        _sessions = sessions;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  void _openExisting(String sessionId) {
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => HomeScreen(initialSessionId: sessionId)),
+    );
+  }
+
+  Future<void> _createNew() async {
+    final nameCtrl = TextEditingController();
+    final descCtrl = TextEditingController();
+
+    final create = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('New SegForge Session'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              decoration: const InputDecoration(labelText: 'Name'),
+            ),
+            TextField(
+              controller: descCtrl,
+              decoration: const InputDecoration(labelText: 'Description'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Create'),
+          ),
+        ],
+      ),
+    );
+    if (create != true || !mounted) return;
+
+    try {
+      final sessionId = await _api.newSession();
+      if (sessionId == null) return;
+      // Same convention DN's own "+ New Session" form uses: metadata is
+      // registered on the backend, but nothing is written to
+      // storage/sf/sessions/ until the first explicit Save.
+      await _api.initSessionMetadata(
+        sessionId: sessionId,
+        name: nameCtrl.text.trim(),
+        description: descCtrl.text.trim(),
+      );
+      if (!mounted) return;
+      _openExisting(sessionId);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('SegForge Sessions')),
+      body: Column(
+        children: [
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Text(_error!, style: const TextStyle(color: Colors.red)),
+            ),
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _sessions.isEmpty
+                    ? const Center(child: Text('No saved sessions yet.'))
+                    : ListView.builder(
+                        itemCount: _sessions.length,
+                        itemBuilder: (context, i) {
+                          final s = _sessions[i];
+                          final name = (s['name'] as String?)?.trim();
+                          final sessionId = s['session_id'] as String;
+                          return ListTile(
+                            title: Text(
+                              name != null && name.isNotEmpty ? name : sessionId,
+                            ),
+                            subtitle: Text((s['description'] as String?) ?? ''),
+                            onTap: () => _openExisting(sessionId),
+                          );
+                        },
+                      ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _createNew,
+                child: const Text('+ New Session'),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  /// Overrides [LaunchConfig.sessionId] — set when [SessionPickerScreen]
+  /// hands off a chosen or newly created session. Null means fall back to
+  /// the launch-time value, the ordinary (DN-launched) path.
+  final String? initialSessionId;
+
+  const HomeScreen({super.key, this.initialSessionId});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
-} 
+}
 
 class _HomeScreenState extends State<HomeScreen> {
   final ApiService _api = ApiService();
@@ -88,6 +254,11 @@ class _HomeScreenState extends State<HomeScreen> {
   // State (supplied at launch, not user-entered)
   String? _sessionId;
   String? _imageUrl; // Supplied at launch, non-editable
+
+  /// Whether SF was launched standalone (no launch args). Determines whether
+  /// the Image URL field shows a file picker affordance.
+  late final bool _isStandalone;
+  String? _pickedFilePath; // For standalone mode: display the picked file path
 
   /// Session metadata, read back from the backend at startup. Whoever created
   /// the session named it (DoubleNaught's Seg Forge node does, over
@@ -132,8 +303,12 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     // Session id and image URL are launch-time inputs, not user-entered.
     // A null session id is fine: /upload allocates one and returns it.
-    _sessionId = LaunchConfig.sessionId;
+    _sessionId = widget.initialSessionId ?? LaunchConfig.sessionId;
     _imageUrl = LaunchConfig.imageUrl;
+    // Standalone mode: no launch image URL and either no session ID or session
+    // came from the picker (initialSessionId != null). This gates the file
+    // picker affordance on the Image URL field.
+    _isStandalone = _imageUrl == null && (LaunchConfig.sessionId == null || widget.initialSessionId != null);
     // Whatever the backend already holds for this session goes on screen at
     // once — it needs no model, so the window is never blank while SAM loads.
     _loadLaunchSession();
@@ -265,6 +440,41 @@ class _HomeScreenState extends State<HomeScreen> {
     _loadImageFromUrl();
   }
 
+  /// Open file picker to select an image file (standalone mode only).
+  /// Converts the selected file path to a proper file:// URI and loads it through
+  /// the same path as DN-launched images (_loadImageFromUrl), ensuring consistent
+  /// behavior across both launch modes.
+  Future<void> _pickImageFile() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      allowMultiple: false,
+    );
+    if (result == null || result.files.isEmpty || !mounted) return;
+
+    final file = result.files.single;
+    final path = file.path;
+    if (path == null || path.isEmpty) {
+      debugPrint('File picker: no path available');
+      setState(() => _error = 'Could not read file path');
+      return;
+    }
+
+    // Convert bare filesystem path to proper file:// URI, with percent-encoding
+    // for spaces and non-ASCII characters. This matches how DN supplies paths.
+    final fileUri = Uri.file(path).toString();
+
+    // Display the picked file name and load the image
+    setState(() {
+      _pickedFilePath = file.name;
+      _imageUrl = fileUri;
+      _error = null;
+    });
+
+    // Use the existing _loadImageFromUrl path, which already handles file:// URIs
+    // correctly. This ensures standalone and DN-launched images flow through the
+    // same code path.
+    await _loadImageFromUrl();
+  }
 
   Future<ui.Image> _decodeImage(Uint8List bytes) {
     final completer = Completer<ui.Image>();
@@ -366,12 +576,22 @@ class _HomeScreenState extends State<HomeScreen> {
         imageBytes = preloaded;
         decodedImage = _uiImage ?? await _decodeImage(preloaded);
       } else {
-        final response = await http.get(Uri.parse(url!));
-        if (response.statusCode != 200) {
-          throw Exception("Failed to download image: ${response.statusCode}");
+        // Handle file:// URIs (from standalone file picker) by reading directly
+        // from the filesystem. HTTP URLs use http.get as before.
+        if (url!.startsWith('file://')) {
+          // Convert file:// URI to filesystem path and read bytes directly.
+          // Uri.parse().path gives the filesystem path without the file:// scheme.
+          final filePath = Uri.parse(url).path;
+          imageBytes = await File(filePath).readAsBytes();
+          decodedImage = await _decodeImage(imageBytes);
+        } else {
+          final response = await http.get(Uri.parse(url));
+          if (response.statusCode != 200) {
+            throw Exception("Failed to download image: ${response.statusCode}");
+          }
+          imageBytes = response.bodyBytes;
+          decodedImage = await _decodeImage(imageBytes);
         }
-        imageBytes = response.bodyBytes;
-        decodedImage = await _decodeImage(imageBytes);
       }
 
       final filename = url == null || url.split('/').last.isEmpty
@@ -495,15 +715,15 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Future<void> _saveMasks() async {
+  Future<void> _saveSession() async {
     if (_sessionId == null) return;
     setState(() { _isLoading = true; });
     try {
-      final response = await _api.saveMasks(_sessionId!);
+      final response = await _api.saveSession(_sessionId!);
       if (!mounted) return;
       if (response != null) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Masks saved successfully")),
+          const SnackBar(content: Text("Session saved successfully")),
         );
       }
     } catch (e) {
@@ -808,18 +1028,61 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               )
+            else if (_isStandalone && _pickedFilePath != null)
+              GestureDetector(
+                onTap: _isLoading ? null : _loadImageFromUrl,
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: greenColor, width: 1.5),
+                    borderRadius: BorderRadius.circular(24),
+                    color: Colors.transparent,
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.image, size: 14, color: greenColor),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          _pickedFilePath!,
+                          style: const TextStyle(fontSize: 12, color: greenColor),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              )
             else
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                decoration: BoxDecoration(
-                  border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Text(
-                  "(no image URL)",
-                  style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
-                ),
+              Row(
+                children: [
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        "(no image URL)",
+                        style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                      ),
+                    ),
+                  ),
+                  if (_isStandalone && !_isLoading)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 8),
+                      child: IconButton(
+                        icon: const Icon(Icons.folder_open),
+                        tooltip: 'Browse for image',
+                        iconSize: 18,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                        onPressed: _pickImageFile,
+                      ),
+                    ),
+                ],
               ),
             if (_imageSize != null)
               Padding(
@@ -1011,7 +1274,7 @@ class _HomeScreenState extends State<HomeScreen> {
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
-                onPressed: (_sessionId == null || _isLoading) ? null : _saveMasks,
+                onPressed: (_sessionId == null || _isLoading) ? null : _saveSession,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF007F00),
                   foregroundColor: Colors.white,
