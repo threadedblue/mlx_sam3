@@ -190,41 +190,132 @@ class _SessionPickerScreenState extends State<SessionPickerScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('SegForge Sessions')),
       body: Column(
         children: [
+          // Centered title at top
+          Padding(
+            padding: const EdgeInsets.only(top: 32, bottom: 24),
+            child: Text(
+              'SegForge Sessions',
+              style: Theme.of(context).textTheme.headlineSmall,
+            ),
+          ),
+          // Error banner
           if (_error != null)
             Padding(
-              padding: const EdgeInsets.all(8),
-              child: Text(_error!, style: const TextStyle(color: Colors.red)),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text(
+                _error!,
+                style: const TextStyle(color: Colors.red, fontSize: 12),
+              ),
             ),
+          // Session list or loading/empty state
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
                 : _sessions.isEmpty
                     ? const Center(child: Text('No saved sessions yet.'))
                     : ListView.builder(
+                        padding: const EdgeInsets.symmetric(horizontal: 16),
                         itemCount: _sessions.length,
                         itemBuilder: (context, i) {
                           final s = _sessions[i];
-                          final name = (s['name'] as String?)?.trim();
+                          final name = (s['name'] as String?)?.trim() ?? '';
+                          final description = (s['description'] as String?)?.trim() ?? '';
                           final sessionId = s['session_id'] as String;
-                          return ListTile(
-                            title: Text(
-                              name != null && name.isNotEmpty ? name : sessionId,
+
+                          final displayName = name.isNotEmpty ? name : 'Untitled session';
+                          final displayDesc = description.isNotEmpty ? description : 'No description';
+
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            child: GestureDetector(
+                              onTap: () => _openExisting(sessionId),
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  border: Border.all(
+                                    color: Colors.white,
+                                    width: 1.5,
+                                  ),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(16),
+                                  child: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            // Name (prominent)
+                                            Text(
+                                              displayName,
+                                              style: Theme.of(context)
+                                                  .textTheme
+                                                  .titleMedium
+                                                  ?.copyWith(
+                                                    fontWeight: FontWeight.w600,
+                                                  ),
+                                            ),
+                                            const SizedBox(height: 4),
+                                            // Description (smaller, dimmer)
+                                            Text(
+                                              displayDesc,
+                                              style: Theme.of(context)
+                                                  .textTheme
+                                                  .bodySmall
+                                                  ?.copyWith(
+                                                    color: Colors.grey[400],
+                                                  ),
+                                            ),
+                                            const SizedBox(height: 8),
+                                            // Session ID (faint)
+                                            Text(
+                                              sessionId,
+                                              style: Theme.of(context)
+                                                  .textTheme
+                                                  .labelSmall
+                                                  ?.copyWith(
+                                                    color: Colors.grey[500],
+                                                  ),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      // Chevron (right-aligned)
+                                      const Padding(
+                                        padding: EdgeInsets.only(left: 12),
+                                        child: Icon(
+                                          Icons.chevron_right,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
                             ),
-                            subtitle: Text((s['description'] as String?) ?? ''),
-                            onTap: () => _openExisting(sessionId),
                           );
                         },
                       ),
           ),
+          // "+ New Session" button at bottom
           Padding(
             padding: const EdgeInsets.all(16),
             child: SizedBox(
               width: double.infinity,
               child: ElevatedButton(
                 onPressed: _createNew,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(24),
+                  ),
+                ),
                 child: const Text('+ New Session'),
               ),
             ),
@@ -580,10 +671,18 @@ class _HomeScreenState extends State<HomeScreen> {
         // from the filesystem. HTTP URLs use http.get as before.
         if (url!.startsWith('file://')) {
           // Convert file:// URI to filesystem path and read bytes directly.
-          // Uri.parse().path gives the filesystem path without the file:// scheme.
-          final filePath = Uri.parse(url).path;
-          imageBytes = await File(filePath).readAsBytes();
-          decodedImage = await _decodeImage(imageBytes);
+          // Use toFilePath() instead of .path to properly decode percent-encoding
+          // (e.g. %20 → space) and handle platform-specific path conversion.
+          final filePath = Uri.parse(url).toFilePath();
+          debugPrint('Loading image from file:// URI: $url -> path: $filePath');
+          try {
+            imageBytes = await File(filePath).readAsBytes();
+            debugPrint('Successfully read ${imageBytes.length} bytes from file');
+            decodedImage = await _decodeImage(imageBytes);
+          } catch (e) {
+            debugPrint('Error reading file from file:// URI: $e');
+            rethrow;
+          }
         } else {
           final response = await http.get(Uri.parse(url));
           if (response.statusCode != 200) {
@@ -600,11 +699,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
       // Upload to backend. This is what gives /segment/* something to work
       // from: only /upload builds the in-memory image state.
+      debugPrint('Uploading ${imageBytes.length} bytes with filename=$filename, sessionId=$_sessionId');
       final uploadResponse = await _api.uploadImageBytes(
         imageBytes,
         filename: filename,
         sessionId: _sessionId,
       );
+      debugPrint('Upload response: $uploadResponse');
 
       if (uploadResponse != null && mounted) {
         setState(() {
@@ -622,6 +723,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 value: url ?? _sessionId ?? ''),
           ];
         });
+        debugPrint('Upload complete. sessionId=$_sessionId, imageSize=$_imageSize');
       }
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
@@ -751,6 +853,45 @@ class _HomeScreenState extends State<HomeScreen> {
       // Ignore errors for background saves
       debugPrint("Failed to save layer state: $e");
     }
+  }
+
+  /// Check if there are unsaved changes in the current session.
+  /// Returns true if there are segmentation results that haven't been saved.
+  bool get _hasUnsavedWork => _result != null;
+
+  /// Switch to a different session (standalone mode only).
+  /// Warns if there are unsaved changes before discarding them.
+  Future<void> _switchSession() async {
+    if (!_isStandalone) return;
+
+    if (_hasUnsavedWork) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Unsaved Changes'),
+          content: const Text(
+            'You have unsaved segmentation results. Switch to a different session anyway?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Keep Working'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              style: TextButton.styleFrom(foregroundColor: Colors.red),
+              child: const Text('Discard & Switch'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+    }
+
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => const SessionPickerScreen()),
+    );
   }
 
 
@@ -959,6 +1100,24 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 8),
             ],
             _sessionField("ID", _sessionId ?? "(none)", dim: _sessionId == null),
+            if (_isStandalone) ...[
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  icon: const Icon(Icons.folder_open, size: 16),
+                  label: const Text("Switch Session"),
+                  onPressed: _switchSession,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Colors.white),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(24),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),
