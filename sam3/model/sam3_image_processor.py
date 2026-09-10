@@ -123,6 +123,38 @@ class Sam3Processor:
 
         return self._call_grounding(state)
 
+    def add_point_prompt(self, point: List, label: bool, state: Dict):
+        """Adds a point prompt and runs inference.
+
+        The point is [x, y], normalized in [0, 1] range. The label is True
+        for a positive (foreground) point, False for a negative (background)
+        point. Points are encoded via SequenceGeometryEncoder's dedicated
+        point path (direct-project + ROI-pool sample at that pixel +
+        sinusoidal position encoding) — a separate, trained pathway from
+        boxes, not a degenerate zero-area box run through the box path
+        (which uses roi_align over a zero-area region and was never a
+        trained input shape).
+        """
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before set_text_prompt")
+
+        if "language_features" not in state["backbone_out"]:
+            # Looks like we don't have a text prompt yet. This is allowed, but we need to set the text prompt to "visual" for the model to rely only on the geometric prompt
+            dummy_text_outputs = self.model.backbone.call_text(
+                ["visual"]
+            )
+            state["backbone_out"].update(dummy_text_outputs)
+
+        if "geometric_prompt" not in state:
+            state["geometric_prompt"] = self.model._get_dummy_prompt()
+
+        # adding a batch and sequence dimension
+        points = mx.array(point, dtype=mx.float32).reshape(1, 1, 2)
+        labels = mx.array([label], dtype=mx.bool_).reshape(1, 1)
+        state["geometric_prompt"].append_points(points, labels)
+
+        return self._call_grounding(state)
+
     def reset_all_prompts(self, state: Dict):
         """Removes all the prompts and results"""
         if "backbone_out" in state:

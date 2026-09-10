@@ -358,7 +358,14 @@ async def add_box_prompt(request: BoxPromptRequest):
 
 @app.post("/segment/point")
 async def add_point_prompt(request: PointPromptRequest):
-    """Add a point prompt by encoding it as a zero-size box."""
+    """Add a point prompt using the model's native point-prompt input.
+
+    Points are encoded via a dedicated, trained pathway distinct from boxes
+    — see Sam3Processor.add_point_prompt. Previously this encoded a point as
+    a zero-area box, sending it through the box path's roi_align on a
+    zero-area region — an input shape the model was never trained on, which
+    is why point select never reliably worked.
+    """
     if processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
@@ -387,9 +394,8 @@ async def add_point_prompt(request: PointPromptRequest):
             "label": "positive" if request.label else "negative",
         })
 
-        # Encode as degenerate box [cx, cy, 0, 0]
         start_time = time.perf_counter()
-        state = processor.add_geometric_prompt([x, y, 0.0, 0.0], request.label, state)
+        state = processor.add_point_prompt([x, y], request.label, state)
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
 
