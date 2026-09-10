@@ -57,7 +57,10 @@ class LayeredSegmentationCanvas extends StatelessWidget {
               Visibility(
                 visible: layerState.showMasks,
                 child: CustomPaint(
-                  painter: MasksPainter(segments: segments),
+                  painter: MasksPainter(
+                    segments: segments,
+                    showOriginal: layerState.showOriginal,
+                  ),
                   size: Size.infinite,
                 ),
               ),
@@ -110,24 +113,39 @@ class OriginalImagePainter extends CustomPainter {
 /// Layer 2: Draws semi-transparent colored masks for each segment.
 class MasksPainter extends CustomPainter {
   final List<Segment> segments;
+  final bool showOriginal;
 
-  MasksPainter({required this.segments});
+  MasksPainter({required this.segments, required this.showOriginal});
 
   @override
   void paint(Canvas canvas, Size size) {
-    const singleColor = ui.Color.fromARGB(255, 48, 42, 42); // Dark grey
+    // Use bright cyan for good visibility against both light and dark backgrounds.
+    // When Original is shown, it's a subtle overlay. When hidden, it's bright and clear.
+    final fillColor = showOriginal
+        ? const ui.Color.fromARGB(255, 48, 42, 42)   // Dark grey for subtle overlay
+        : const ui.Color.fromARGB(255, 100, 200, 255);  // Bright cyan for standalone visibility
+
+    // When Original layer is shown, use subtle overlay (alpha 0.2).
+    // When Original is hidden, use more opaque fill (alpha 0.6) so masks are clearly visible.
+    final fillAlpha = showOriginal ? 0.2 : 0.6;
 
     final fillPaint = Paint()
-      ..color = singleColor.withValues(alpha: 0.2)
+      ..color = fillColor.withValues(alpha: fillAlpha)
       ..style = PaintingStyle.fill;
 
+    // Border stroke to outline each mask, making edges more visible
+    final borderPaint = Paint()
+      ..color = fillColor.withValues(alpha: showOriginal ? 0.3 : 1.0)
+      ..strokeWidth = 2.0
+      ..style = PaintingStyle.stroke;
+
     final stripePaint = Paint()
-      ..color = singleColor.withValues(alpha: 0.5)
+      ..color = fillColor.withValues(alpha: showOriginal ? 0.5 : 0.8)
       ..strokeWidth = 2.0
       ..style = PaintingStyle.stroke;
 
     for (final segment in segments) {
-      // First, draw a light, uniform fill.
+      // First, draw the fill.
       canvas.drawPath(segment.path, fillPaint);
 
       // Then, clip to the path and draw a stripe pattern on top.
@@ -146,13 +164,17 @@ class MasksPainter extends CustomPainter {
       }
 
       canvas.restore();
+
+      // Finally, draw a border around the mask for clear edge definition.
+      canvas.drawPath(segment.path, borderPaint);
     }
   }
 
   @override
   bool shouldRepaint(covariant MasksPainter oldDelegate) {
     // For better performance, consider a deep list comparison or versioning.
-    return !listEquals(segments, oldDelegate.segments);
+    return !listEquals(segments, oldDelegate.segments) ||
+        showOriginal != oldDelegate.showOriginal;
   }
 }
 

@@ -9,7 +9,7 @@ python-dotenv
 jsonschema>=4.0.0
 # Julia bridge: builds/persists D4M.jl Assocs for session persistence.
 # Shared with DoubleNaught's backend rather than duplicated.
--e /Users/gcr/d4m.Wk/d4m_juliacall_bridge
+-e /Users/gcr/populi.Wk/d4m_juliacall_bridge
 # LoRA inference (MLX local)
 mflux>=0.9.0
 # LoRA training
