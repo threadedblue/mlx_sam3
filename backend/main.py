@@ -263,13 +263,22 @@ async def segment_with_text(request: TextPromptRequest):
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session.setdefault("prompts", []).append(request.prompt)
         session["state"] = state
-        service.save_session_to_disk(request.session_id)
+
+        # Serialize results first — if segmentation succeeded, return them
+        # regardless of whether persistence succeeds.
         start = time.perf_counter()
         results = serialize_state(state)
         end = time.perf_counter()
         mask_count = len(results.get("masks") or [])
         print(f"Serialization took {end - start:.4f} seconds | masks={mask_count} | inference={processing_time_ms:.1f}ms")
-        
+
+        # Persist to disk as a best-effort side effect. Don't crash the
+        # response if this fails — the user still got their segmentation results.
+        try:
+            service.save_session_to_disk(request.session_id)
+        except Exception as persist_err:
+            print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
+
         return {
             "session_id": request.session_id,
             "prompt": request.prompt,
@@ -277,7 +286,7 @@ async def segment_with_text(request: TextPromptRequest):
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2)
         }
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error during segmentation: {str(e)}")
 
@@ -323,16 +332,26 @@ async def add_box_prompt(request: BoxPromptRequest):
         state = processor.add_geometric_prompt(request.box, request.label, state)
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
-        service.save_session_to_disk(request.session_id)
-        
+
+        # Serialize results first — if segmentation succeeded, return them
+        # regardless of whether persistence succeeds.
+        results = serialize_state(state)
+
+        # Persist to disk as a best-effort side effect. Don't crash the
+        # response if this fails — the user still got their segmentation results.
+        try:
+            service.save_session_to_disk(request.session_id)
+        except Exception as persist_err:
+            print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
+
         return {
             "session_id": request.session_id,
             "box_type": "positive" if request.label else "negative",
-            "results": serialize_state(state),
+            "results": results,
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2)
         }
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error adding box prompt: {str(e)}")
 
@@ -373,12 +392,22 @@ async def add_point_prompt(request: PointPromptRequest):
         state = processor.add_geometric_prompt([x, y, 0.0, 0.0], request.label, state)
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
-        service.save_session_to_disk(request.session_id)
+
+        # Serialize results first — if segmentation succeeded, return them
+        # regardless of whether persistence succeeds.
+        results = serialize_state(state)
+
+        # Persist to disk as a best-effort side effect. Don't crash the
+        # response if this fails — the user still got their segmentation results.
+        try:
+            service.save_session_to_disk(request.session_id)
+        except Exception as persist_err:
+            print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
 
         return {
             "session_id": request.session_id,
             "point_type": "positive" if request.label else "negative",
-            "results": serialize_state(state),
+            "results": results,
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2),
         }
@@ -408,17 +437,26 @@ async def reset_prompts(request: SessionRequest):
             del state["prompted_boxes"]
         if "prompts" in session:
             session["prompts"] = []
-        
-        service.save_session_to_disk(request.session_id)
-        
+
+        # Serialize results first — if reset succeeded, return them
+        # regardless of whether persistence succeeds.
+        results = serialize_state(state)
+
+        # Persist to disk as a best-effort side effect. Don't crash the
+        # response if this fails — the user still got their reset results.
+        try:
+            service.save_session_to_disk(request.session_id)
+        except Exception as persist_err:
+            print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
+
         return {
             "session_id": request.session_id,
             "message": "All prompts reset",
-            "results": serialize_state(state),
+            "results": results,
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2)
         }
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error resetting prompts: {str(e)}")
 
