@@ -20,6 +20,7 @@ from PIL import Image
 from sam3.model.sam3_image_processor import Sam3Processor
 
 import aa_persistence
+import sf_engine
 
 
 def _img_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
@@ -109,6 +110,7 @@ class SegmentationService:
         self.storage_dir = storage_dir
         self.processor = processor
         self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.sf_sessions: Dict[str, sf_engine.SFSession] = {}
         self.segment_prompt_dir = self.storage_dir.parent / "segment_prompt"
         schema_path = Path(__file__).parent.parent / "schemas" / "metadata-schema.json"
         with schema_path.open() as _f:
@@ -126,6 +128,102 @@ class SegmentationService:
         # Session not in memory, try to load from disk
         print(f"Session {session_id} not in memory, attempting to load from disk.")
         return self._load_session_into_memory(session_id)
+
+    def get_or_create_sf_session(self, session_id: str) -> Optional[sf_engine.SFSession]:
+        """The SFSession paired with this session, if one can exist yet.
+
+        None only for a session with no image/state at all (e.g. staged via
+        /initSession but never uploaded to) — there's nothing to segment.
+        A session reloaded from disk gets its SFSession reconstructed by
+        `_load_session_into_memory` (from persisted mask_type/pass/text_tag,
+        not by replay — see aa_persistence's module docstring), not here.
+        """
+        if session_id in self.sf_sessions:
+            return self.sf_sessions[session_id]
+        session = self.sessions.get(session_id)
+        if not session or session.get("state") is None or not session.get("original_image_bytes"):
+            return None
+        sf_session = sf_engine.SFSession(
+            session_id=session_id,
+            original=sf_engine.ImmutableOriginal(session["original_image_bytes"]),
+            segmentor=self.processor,
+            state=session["state"],
+        )
+        self.sf_sessions[session_id] = sf_session
+        return sf_session
+
+    def _reconstruct_sf_session(
+        self, session_id: str, raw: Dict[str, Any], replayed_state: dict,
+    ) -> sf_engine.SFSession:
+        """Rebuild the SFSession's mask index from persisted AA columns.
+
+        The mask index itself is not from prompt replay: replay (in
+        `_load_session_into_memory`) only reconstructs SAM3's raw mask list,
+        not SF's own mask_type/pass classification, which exists only in
+        segment.parquet's mask_type/pass/text_tag columns.
+
+        `state`, however, deliberately IS `replayed_state` for a
+        Pass-1-only session — same object as `session_data["state"]`, no
+        second source of truth (PART 1's decision). For a session that
+        reached Pass 2, this can't hold: `replayed_state` was built by
+        replaying *every* flat prompt (linkage.parquet has no per-prompt
+        pass marker) against the *original* image, which is Pass-1-shaped
+        and wrong for Pass 2. Best effort there: re-`set_image` on the
+        correct background so future selections at least segment the right
+        picture, but SAM3's accumulated-prompt history for Pass 2 starts
+        empty rather than resuming where the session left off — a real,
+        flagged gap (fixing it needs linkage.parquet to track pass per
+        prompt, out of scope here), not a silent one.
+        """
+        background_bytes = raw.get("background_image_bytes")
+        has_background_segment = any(seg.get("pass") == "background" for seg in raw["segments"])
+        current_pass = (
+            sf_engine.Pass.BACKGROUND if (background_bytes or has_background_segment)
+            else sf_engine.Pass.FOREGROUND
+        )
+
+        if current_pass is sf_engine.Pass.FOREGROUND:
+            state = replayed_state
+        else:
+            state = self.processor.set_image(Image.open(io.BytesIO(background_bytes)).convert("RGB"))
+
+        sf_session = sf_engine.SFSession(
+            session_id=session_id,
+            original=sf_engine.ImmutableOriginal(raw["image_bytes"]),
+            segmentor=self.processor,
+            state=state,
+        )
+        sf_session._pass = current_pass
+        if background_bytes:
+            sf_session._working_copy = sf_engine.WorkingCopy(
+                Image.open(io.BytesIO(background_bytes)).convert("RGBA")
+            )
+
+        masks: list[sf_engine.MaskRecord] = []
+        for seg in raw["segments"]:
+            if seg.get("mask_bytes") is None:
+                continue
+            mask_img = Image.open(io.BytesIO(seg["mask_bytes"])).convert("L")
+            geometry = (np.array(mask_img) > 127).astype(np.uint8)
+            pass_value = seg.get("pass", "foreground")
+            # Old rows' segment_id is a bare uuid4 with no pass prefix;
+            # new rows' segment_id already IS mask.mask_id verbatim
+            # (f"{pass}:{uuid4()}") — see aa_persistence's module docstring.
+            mask_id = seg["segment_id"] if ":" in seg["segment_id"] else f"{pass_value}:{seg['segment_id']}"
+            masks.append(sf_engine.MaskRecord(
+                mask_id=mask_id,
+                mask_type=sf_engine.MaskType(seg.get("mask_type", "in")),
+                pass_=sf_engine.Pass(pass_value),
+                geometry=geometry,
+                text_tag=seg.get("text_tag") or "",
+                # Not persisted (audit-only, no downstream algorithmic use —
+                # see aa_persistence's module docstring): the original
+                # text_prompt/box/point distinction can't be recovered.
+                source="loaded",
+                score=seg.get("score"),
+            ))
+        sf_session.masks = masks
+        return sf_session
 
     def _load_session_into_memory(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -168,6 +266,7 @@ class SegmentationService:
                 "image_url": raw["image_url"],
             }
             self.sessions[session_id] = session_data
+            self.sf_sessions[session_id] = self._reconstruct_sf_session(session_id, raw, state)
             print(f"Successfully loaded session {session_id} from disk into memory.")
             return session_data
         except Exception as e:
@@ -189,10 +288,30 @@ class SegmentationService:
         return session_id
 
     def register_session_data(self, session_id: str, data: Dict[str, Any]):
-        """Register session data in memory and save its initial state to disk."""
+        """Register session data in memory and save its initial state to disk.
+
+        Eagerly pairs an SFSession with this session_id once both `state`
+        and `original_image_bytes` are present (i.e. right after /upload) —
+        so every mask made from here on is mask_type/pass-tracked from its
+        very first selection, not just retroactively. Sessions that already
+        had masks before this feature existed only get one on disk reload,
+        via `_reconstruct_sf_session`'s migration path.
+        """
         if session_id not in self.sessions:
             self.sessions[session_id] = {}
         self.sessions[session_id].update(data)
+        session = self.sessions[session_id]
+        if (
+            session_id not in self.sf_sessions
+            and session.get("state") is not None
+            and session.get("original_image_bytes")
+        ):
+            self.sf_sessions[session_id] = sf_engine.SFSession(
+                session_id=session_id,
+                original=sf_engine.ImmutableOriginal(session["original_image_bytes"]),
+                segmentor=self.processor,
+                state=session["state"],
+            )
         try:
             self.save_session_to_disk(session_id)
         except Exception as e:
@@ -210,7 +329,7 @@ class SegmentationService:
             print(f"Warning: Cannot save state for non-existent in-memory session {session_id}")
             return
 
-        aa_persistence.save_session(session_id, session)
+        aa_persistence.save_session(session_id, session, self.sf_sessions.get(session_id))
 
     def save_session_settings(self, session_id: str, settings: Dict[str, Any]):
         """Merges UI-specific settings into the session's persisted registry."""

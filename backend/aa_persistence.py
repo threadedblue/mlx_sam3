@@ -11,17 +11,43 @@ Row/column scheme (SF is one-image-per-session; no `image_id` layer):
                       width, height).
   segment.parquet  — row `session_id:_source`, column `image_bytes` (base64
                       of the original image) for the source-image sentinel;
-                      row `session_id:<segment_id>`, columns `crop_bytes` /
+                      row `session_id:_background`, column
+                      `background_image_bytes` (base64 PNG) for the
+                      LaMa-scrubbed working copy, present only once
+                      sf_engine.SFSession.run_lama_pass() has run; row
+                      `session_id:<segment_id>`, columns `crop_bytes` /
                       `mask_bytes` (base64 PNG each) / `bbox` (JSON
                       `[x0, y0, x1, y1]`) / `score` (str(float), parallel to
-                      SAM3's own per-segment confidence) per detected
-                      segment. `score` isn't in the originally-discussed
-                      3-column list — added because DoubleNaught's Seg Forge
-                      node (`SegForgeMapping.linkage`, Dart, unrelated to
-                      this Parquet persistence) reads `results.scores` back
-                      out of `/loadSession/{id}` to build its own `confidence`
+                      SAM3's own per-segment confidence) / `mask_type`
+                      (`"in"`/`"out"`) / `pass` (`"foreground"`/
+                      `"background"`) / `text_tag` (SAM3 prompt or user
+                      substitute string) per detected segment. `score` isn't
+                      in the originally-discussed 3-column list — added
+                      because DoubleNaught's Seg Forge node
+                      (`SegForgeMapping.linkage`, Dart, unrelated to this
+                      Parquet persistence) reads `results.scores` back out
+                      of `/loadSession/{id}` to build its own `confidence`
                       Linkage rows; dropping it would silently empty those
                       rows on every session DN touches after this change.
+
+                      When an `sf_engine.SFSession` is available for this
+                      session, `segment_id` is `sf_engine.MaskRecord.mask_id`
+                      itself (`f"{pass}:{uuid4()}"`, already unique across
+                      both passes) rather than a fresh uuid4 per Save — see
+                      `_build_segments_from_masks`. Rows are then sourced
+                      from `SFSession.masks` (both passes), not the flat
+                      `state["masks"]`: `state` only reflects the *current*
+                      pass (`run_lama_pass` re-`set_image`s it), so once Pass
+                      2 starts, Pass 1's masks would silently vanish from
+                      every subsequent Save if derived from `state` instead.
+                      `mask_type`/`pass`/`text_tag`/`score` are absent (not
+                      empty) on rows written before this schema existed —
+                      `read_session_raw` defaults a row with no `mask_type`/
+                      `pass` to `"in"`/`"foreground"`: every mask made before
+                      LaMa scrubbing existed was, by construction, an
+                      undifferentiated Pass-1 inclusion. `text_tag` defaults
+                      to `""` (unknown) since the old schema never recorded
+                      which prompt produced which specific mask.
   linkage.parquet  — row `session_id:_global` for every prompt. SF's SAM3
                       pipeline has no way to target one already-identified
                       segment — `add_geometric_prompt` re-runs grounding over
@@ -65,10 +91,12 @@ import numpy as np
 from PIL import Image
 
 import d4m_juliacall_bridge as bridge
+import sf_engine
 
 STORAGE_ROOT = Path(__file__).resolve().parent.parent / "storage" / "sf" / "sessions"
 
 _SOURCE_TARGET = "_source"
+_BACKGROUND_TARGET = "_background"
 _GLOBAL_TARGET = "_global"
 
 _REGISTRY_FIELDS = ("name", "description", "created_at", "image_url", "original_filename")
@@ -122,7 +150,17 @@ def _build_registry(session_id: str, session: dict) -> tuple[list, list, list]:
     return [session_id] * len(cols), cols, [fields[c] for c in cols]
 
 
-def _build_segments(session_id: str, session: dict) -> tuple[list, list, list]:
+def _build_segments(
+    session_id: str, session: dict, sf_session: "Optional[sf_engine.SFSession]" = None,
+) -> tuple[list, list, list]:
+    """Dispatch to the SFSession-aware builder when one exists for this
+    session, else the legacy flat-state builder. See module docstring."""
+    if sf_session is not None:
+        return _build_segments_from_masks(session_id, sf_session)
+    return _build_segments_legacy(session_id, session)
+
+
+def _build_segments_legacy(session_id: str, session: dict) -> tuple[list, list, list]:
     rows: list[str] = []
     cols: list[str] = []
     vals: list[str] = []
@@ -157,6 +195,71 @@ def _build_segments(session_id: str, session: dict) -> tuple[list, list, list]:
     return rows, cols, vals
 
 
+def _bbox_from_geometry(geometry: np.ndarray) -> Optional[list[int]]:
+    ys, xs = np.nonzero(geometry)
+    if len(xs) == 0:
+        return None
+    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+
+
+def _build_segments_from_masks(session_id: str, sf_session: "sf_engine.SFSession") -> tuple[list, list, list]:
+    """Segment rows sourced from `SFSession.masks` — see module docstring
+    for why this must not derive from `state["masks"]` once Pass 2 exists.
+    """
+    rows: list[str] = []
+    cols: list[str] = []
+    vals: list[str] = []
+
+    image_bytes = sf_session.original.bytes
+    rows.append(f"{session_id}:{_SOURCE_TARGET}")
+    cols.append("image_bytes")
+    vals.append(_b64(image_bytes))
+
+    working_copy = sf_session.working_copy
+    if working_copy is not None:
+        rows.append(f"{session_id}:{_BACKGROUND_TARGET}")
+        cols.append("background_image_bytes")
+        vals.append(_b64(_png_bytes(working_copy.image)))
+
+    original_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    background_image = working_copy.image.convert("RGBA") if working_copy is not None else None
+
+    for mask in sf_session.masks:
+        base_image = (
+            background_image if mask.pass_ is sf_engine.Pass.BACKGROUND and background_image is not None
+            else original_image
+        )
+        # mask.mask_id already embeds pass (f"{pass}:{uuid4()}") — see
+        # module docstring; this is the "third convention" sf_engine.py's
+        # own mask_id format already covers, not a fresh uuid4 per Save.
+        row_key = f"{session_id}:{mask.mask_id}"
+        rows += [row_key, row_key, row_key, row_key, row_key]
+        cols += ["crop_bytes", "mask_bytes", "bbox", "mask_type", "pass"]
+        vals += [
+            _b64(_crop_png_bytes(base_image, mask.geometry)),
+            _b64(_mask_png_bytes(mask.geometry)),
+            json.dumps(_bbox_from_geometry(mask.geometry)),
+            mask.mask_type.value,
+            mask.pass_.value,
+        ]
+        if mask.text_tag:
+            rows.append(row_key)
+            cols.append("text_tag")
+            vals.append(mask.text_tag)
+        if mask.score is not None:
+            rows.append(row_key)
+            cols.append("score")
+            vals.append(str(float(mask.score)))
+
+    return rows, cols, vals
+
+
+def _png_bytes(image: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _build_linkage(session_id: str, session: dict) -> tuple[list, list, list]:
     prompts = session.get("prompts") or []
     rows: list[str] = []
@@ -169,13 +272,19 @@ def _build_linkage(session_id: str, session: dict) -> tuple[list, list, list]:
     return rows, cols, vals
 
 
-def save_session(session_id: str, session: dict) -> dict:
+def save_session(
+    session_id: str, session: dict, sf_session: "Optional[sf_engine.SFSession]" = None,
+) -> dict:
     """Persist *session*'s current state to storage/sf/sessions/<id>/.
 
     Always writes registry.parquet. Writes segment.parquet/linkage.parquet
     only when there's something to put in them; removes any stale file left
     from a previous, non-empty Save of this same session so Load doesn't
     resurrect data that's no longer current.
+
+    *sf_session*, when given, sources segment.parquet from its `.masks`
+    (both passes, with mask_type/pass/text_tag) instead of the flat
+    `session["state"]` — see module docstring and `_build_segments`.
     """
     d = session_dir(session_id)
 
@@ -184,7 +293,7 @@ def save_session(session_id: str, session: dict) -> dict:
     written = ["registry.parquet"]
 
     seg_path = d / "segment.parquet"
-    seg_rows, seg_cols, seg_vals = _build_segments(session_id, session)
+    seg_rows, seg_cols, seg_vals = _build_segments(session_id, session, sf_session)
     if seg_rows:
         bridge.save_parquet(str(seg_path), seg_rows, seg_cols, seg_vals)
         written.append("segment.parquet")
@@ -247,6 +356,7 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
     fields = dict(zip(r_cols, r_vals))
 
     image_bytes: Optional[bytes] = None
+    background_image_bytes: Optional[bytes] = None
     segments: list[dict[str, Any]] = []
     seg_path = d / "segment.parquet"
     if seg_path.exists():
@@ -259,12 +369,23 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
             if target_id == _SOURCE_TARGET:
                 image_bytes = _unb64(attrs["image_bytes"])
                 continue
+            if target_id == _BACKGROUND_TARGET:
+                background_image_bytes = _unb64(attrs["background_image_bytes"])
+                continue
             segments.append({
                 "segment_id": target_id,
                 "crop_bytes": _unb64(attrs["crop_bytes"]) if "crop_bytes" in attrs else None,
                 "mask_bytes": _unb64(attrs["mask_bytes"]) if "mask_bytes" in attrs else None,
                 "bbox": json.loads(attrs["bbox"]) if "bbox" in attrs else None,
                 "score": float(attrs["score"]) if "score" in attrs else None,
+                # Migration default: rows saved before this schema existed
+                # have no mask_type/pass at all — every mask made before
+                # LaMa scrubbing existed was an undifferentiated Pass-1
+                # inclusion, so that's what they read back as. text_tag
+                # defaults to "" (unknown) — never recorded pre-migration.
+                "mask_type": attrs.get("mask_type", "in"),
+                "pass": attrs.get("pass", "foreground"),
+                "text_tag": attrs.get("text_tag", ""),
             })
 
     prompts: list[Any] = []
@@ -288,6 +409,7 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
         "width": width,
         "height": height,
         "image_bytes": image_bytes,
+        "background_image_bytes": background_image_bytes,
         "segments": segments,
         "prompts": prompts,
         "ui_settings": json.loads(fields["ui_settings"]) if fields.get("ui_settings") else {},

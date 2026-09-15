@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 
 from services import SegmentationService, serialize_state
 import aa_persistence
+import sf_engine
 from lora_inferencer import (
     validate_inference_inputs,
     run_inference as _run_inference_fn,
@@ -55,6 +56,39 @@ from lora_inferencer import (
 model = None
 processor = None
 service = None
+_lama_inpainter: Optional[sf_engine.LamaInpainter] = None
+
+
+def _get_lama_inpainter() -> sf_engine.LamaInpainter:
+    """Process-wide LaMa instance — constructing one loads a torchscript
+    checkpoint, so this must not happen fresh on every /lama/scrub call."""
+    global _lama_inpainter
+    if _lama_inpainter is None:
+        _lama_inpainter = sf_engine.LamaInpainter()
+    return _lama_inpainter
+
+
+def _parse_mask_type(raw: str) -> sf_engine.MaskType:
+    try:
+        return sf_engine.MaskType(raw)
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"mask_type must be 'in' or 'out', got {raw!r}")
+
+
+def _reject_out_mask_in_background_pass(sf_session: sf_engine.SFSession, mask_type: sf_engine.MaskType) -> None:
+    """API-boundary decision: sf_engine.py itself stays permissive about a
+    Pass 2 'out' selection (it's simply inert — never scrubbed, excluded
+    from export, no error) so the engine doesn't encode API opinions. At
+    the HTTP boundary, silently accepting a request that does nothing is a
+    foot-gun — the caller gets no error and may believe it took effect."""
+    if mask_type is sf_engine.MaskType.OUT and sf_session.pass_ is sf_engine.Pass.BACKGROUND:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "mask_type 'out' is only valid before the LaMa scrub (Pass 1). "
+                "Pass 2 identifies uncovered background elements to keep, not new obscurators to strip."
+            ),
+        )
 
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR.parent.parent / "storage" / "sessions"
@@ -123,18 +157,23 @@ app.add_middleware(
 class TextPromptRequest(BaseModel):
     session_id: str
     prompt: str
+    mask_type: str = "in"  # "in" (green, keep) | "out" (red, strip via LaMa) — defaults "in" so existing callers are unaffected
 
 
 class BoxPromptRequest(BaseModel):
     session_id: str
     box: list[float]  # [center_x, center_y, width, height] normalized
-    label: bool  # True for positive, False for negative
+    label: bool  # True for positive, False for negative — SAM3's own grounding polarity, independent of mask_type
+    mask_type: str = "in"
+    text_substitute: str = ""  # SF's per-region tag; SAM3 has no text for a geometric prompt on its own
 
 
 class PointPromptRequest(BaseModel):
     session_id: str
     point: list[float]  # [x, y] normalized
     label: bool  # True for positive, False for negative
+    mask_type: str = "in"
+    text_substitute: str = ""
 
 
 class ConfidenceRequest(BaseModel):
@@ -256,10 +295,22 @@ async def segment_with_text(request: TextPromptRequest):
     print(f"session:id=={request.session_id}")
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=400, detail="Session has no image uploaded yet")
+    mask_type = _parse_mask_type(request.mask_type)
+    _reject_out_mask_in_background_pass(sf_session, mask_type)
+
     try:
+        # sf_session.add_text_selection makes the one real call to
+        # processor.set_text_prompt (see PART 1: sf_session.state and
+        # session["state"] alias the same object — a second, independent
+        # call here would double-invoke SAM3 and, worse, double-register
+        # this prompt in its accumulated grounding history).
         start_time = time.perf_counter()
-        state = processor.set_text_prompt(request.prompt, session["state"])
+        sf_session.add_text_selection(request.prompt, mask_type)
+        state = sf_session.state
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session.setdefault("prompts", []).append(request.prompt)
         session["state"] = state
@@ -300,14 +351,20 @@ async def add_box_prompt(request: BoxPromptRequest):
     session = service.get_session(request.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=400, detail="Session has no image uploaded yet")
+    mask_type = _parse_mask_type(request.mask_type)
+    _reject_out_mask_in_background_pass(sf_session, mask_type)
+
     try:
         state = session["state"]
-        
+
         # Store prompted box for display
         if "prompted_boxes" not in state:
             state["prompted_boxes"] = []
-        
+
         # Convert from normalized cxcywh to pixel xyxy for display
         img_w = state["original_width"]
         img_h = state["original_height"]
@@ -316,20 +373,24 @@ async def add_box_prompt(request: BoxPromptRequest):
         y_min = (cy - h / 2) * img_h
         x_max = (cx + w / 2) * img_w
         y_max = (cy + h / 2) * img_h
-        
+
         state["prompted_boxes"].append({
             "box": [x_min, y_min, x_max, y_max],
             "label": request.label
         })
-        
+
         session.setdefault("prompts", []).append({
             "type": "box",
             "box": request.box,
             "label": "positive" if request.label else "negative"
         })
-        
+
+        # sf_session.add_box_selection makes the one real call to
+        # processor.add_geometric_prompt — see PART 1 (single source of
+        # truth for `state`, same reasoning as /segment/text).
         start_time = time.perf_counter()
-        state = processor.add_geometric_prompt(request.box, request.label, state)
+        sf_session.add_box_selection(request.box, request.label, request.text_substitute, mask_type)
+        state = sf_session.state
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
 
@@ -373,6 +434,12 @@ async def add_point_prompt(request: PointPromptRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=400, detail="Session has no image uploaded yet")
+    mask_type = _parse_mask_type(request.mask_type)
+    _reject_out_mask_in_background_pass(sf_session, mask_type)
+
     try:
         state = session["state"]
         x, y = request.point
@@ -394,8 +461,11 @@ async def add_point_prompt(request: PointPromptRequest):
             "label": "positive" if request.label else "negative",
         })
 
+        # sf_session.add_point_selection makes the one real call to
+        # processor.add_point_prompt — see PART 1.
         start_time = time.perf_counter()
-        state = processor.add_point_prompt([x, y], request.label, state)
+        sf_session.add_point_selection(request.point, request.label, request.text_substitute, mask_type)
+        state = sf_session.state
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
 
@@ -420,6 +490,61 @@ async def add_point_prompt(request: PointPromptRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error adding point prompt: {str(e)}")
+
+
+class LamaScrubRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/lama/scrub")
+async def lama_scrub(request: LamaScrubRequest):
+    """Scrub Pass 1's Red out-masks via LaMa and advance into Pass 2.
+
+    One-shot per sf_engine.py's run_lama_pass — a second call is a 409, not
+    a 500 (it's an ordinary, anticipated state-machine violation, not an
+    unexpected server error).
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    session = service.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=400, detail="Session has no image uploaded yet")
+
+    try:
+        working_copy = sf_session.run_lama_pass(_get_lama_inpainter())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    # run_lama_pass re-`set_image`s sf_session.state — keep the flat mirror
+    # in sync (PART 1's single-source-of-truth invariant applies here too).
+    session["state"] = sf_session.state
+
+    consumed_out_mask_ids = [
+        m.mask_id for m in sf_session.masks
+        if m.mask_type is sf_engine.MaskType.OUT and m.pass_ is sf_engine.Pass.FOREGROUND
+    ]
+
+    try:
+        service.save_session_to_disk(request.session_id)
+    except Exception as persist_err:
+        print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
+
+    buf = io.BytesIO()
+    working_copy.image.save(buf, format="PNG")
+    image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    return {
+        "session_id": request.session_id,
+        "image_b64": image_b64,
+        "width": working_copy.image.width,
+        "height": working_copy.image.height,
+        "consumed_out_mask_ids": consumed_out_mask_ids,
+    }
 
 
 @app.post("/reset")
