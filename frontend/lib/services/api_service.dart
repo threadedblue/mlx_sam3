@@ -112,7 +112,19 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>?> segmentWithBox(String sessionId, List<double> box, bool label) async {
+  /// [label] is SAM3's grounding polarity (Target/Avoid — see
+  /// IncludeExcludeToggle). [textSubstitute] is an optional per-region tag;
+  /// it is NOT a caption — captioning is a separate, later action via
+  /// [attachCaption]. In/out marking no longer exists as a per-request
+  /// field (v2): whether a selection is kept is `dataset_status`, set only
+  /// by captioning, and whether it's queued for scrubbing is `held`, set
+  /// only by [setMaskHeld].
+  Future<Map<String, dynamic>?> segmentWithBox(
+    String sessionId,
+    List<double> box,
+    bool label, {
+    String? textSubstitute,
+  }) async {
     try {
       final response = await http.post(
         Uri.parse('$baseUrl/segment/box'),
@@ -121,6 +133,7 @@ class ApiService {
           'session_id': sessionId,
           'box': box, // [cx, cy, w, h] normalized
           'label': label,
+          if (textSubstitute != null) 'text_substitute': textSubstitute,
         }),
       );
 
@@ -134,7 +147,12 @@ class ApiService {
     }
   }
 
-  Future<Map<String, dynamic>?> segmentWithPoint(String sessionId, List<double> point, bool label) async {
+  Future<Map<String, dynamic>?> segmentWithPoint(
+    String sessionId,
+    List<double> point,
+    bool label, {
+    String? textSubstitute,
+  }) async {
     try {
       final response = await http.post(
         Uri.parse('$baseUrl/segment/point'),
@@ -143,6 +161,7 @@ class ApiService {
           'session_id': sessionId,
           'point': point, // [x, y] normalized
           'label': label,
+          if (textSubstitute != null) 'text_substitute': textSubstitute,
         }),
       );
 
@@ -153,6 +172,73 @@ class ApiService {
     } catch (e) {
       debugPrint('Error point segment: $e');
       rethrow;
+    }
+  }
+
+  /// Queues (or un-queues) a selection for the current pass's next scrub
+  /// batch — `sf_engine.SFSession.set_held`. Independent of captioning.
+  Future<Map<String, dynamic>?> setMaskHeld(String sessionId, String maskId, bool held) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/mask/hold'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId, 'mask_id': maskId, 'held': held}),
+      );
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      throw Exception('Set held failed: ${response.statusCode} ${response.body}');
+    } catch (e) {
+      debugPrint('Error setting held: $e');
+      rethrow;
+    }
+  }
+
+  /// Captions an existing selection, marking it `keep` —
+  /// `sf_engine.SFSession.attach_caption`. This is the Prompt card's
+  /// caption-mode call (see main.dart), distinct from [segmentWithText]'s
+  /// SAM3 text-grounding call.
+  Future<Map<String, dynamic>?> attachCaption(String sessionId, String maskId, String caption) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/mask/caption'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId, 'mask_id': maskId, 'caption': caption}),
+      );
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      throw Exception('Attach caption failed: ${response.statusCode} ${response.body}');
+    } catch (e) {
+      debugPrint('Error attaching caption: $e');
+      rethrow;
+    }
+  }
+
+  /// Triggers the LaMa scrub of the current pass's held masks
+  /// (`SFSession.run_lama_pass`), advancing to the next pass. Repeatable
+  /// without limit (v2) — there is no "already scrubbed" state.
+  ///
+  /// Unlike segmentWithText/Box/Point, this does not rethrow on failure —
+  /// same defensive pattern as [checkHealth] — since scrubbing is a
+  /// deliberate, occasional action whose card should show an inline error
+  /// state rather than an uncaught exception if the backend endpoint isn't
+  /// there yet.
+  Future<Map<String, dynamic>?> scrubLamaBackground(String sessionId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/lama/scrub'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId}),
+      );
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      debugPrint('LaMa scrub failed: ${response.statusCode} ${response.body}');
+      return null;
+    } catch (e) {
+      debugPrint('Error scrubbing LaMa background: $e');
+      return null;
     }
   }
 

@@ -14,7 +14,26 @@ class Segment {
   final Path path;
   final ui.Image? retouchedImage;
 
-  Segment({required this.path, this.retouchedImage});
+  /// Backend `sf_engine.MaskRecord.mask_id` — what the hold/caption
+  /// endpoints (`/mask/hold`, `/mask/caption`) need to name which record a
+  /// UI action applies to. Null for a segment with no v2 identity behind it
+  /// (e.g. the bbox fallback path).
+  final String? maskId;
+
+  /// `"unassigned"` | `"keep"` (sf_engine.DatasetStatus) — whether this
+  /// selection has been captioned yet. Null when unknown (no maskId).
+  final String? datasetStatus;
+
+  /// Whether this record is currently queued for the next scrub batch.
+  final bool held;
+
+  Segment({
+    required this.path,
+    this.retouchedImage,
+    this.maskId,
+    this.datasetStatus,
+    this.held = false,
+  });
 }
 
 /// A widget that displays an image and its segmentations in four distinct,
@@ -117,34 +136,61 @@ class MasksPainter extends CustomPainter {
 
   MasksPainter({required this.segments, required this.showOriginal});
 
+  /// Green for a captioned keeper, red for a record queued in the pending
+  /// scrub batch, the original neutral colours otherwise (see
+  /// [Segment.datasetStatus]/[Segment.held]).
+  ///
+  /// `held` wins over `datasetStatus` when both are true (a captioned
+  /// keeper can still be held for a later scrub, per the design doc) —
+  /// "about to be scrubbed" is the more time-sensitive thing to flag at a
+  /// glance than "already captioned". This priority, and reusing red/green
+  /// for held/keep rather than adding a third hue, is my own call: the v2
+  /// design doc left canvas styling as an open item (§8), unlike the v1
+  /// green=in/red=out convention the Blender mockup specified directly.
+  ///
+  /// Hues are the same literals the mask-type/polarity toggles use, so the
+  /// canvas and the controls agree. Typed masks get slightly stronger
+  /// alphas than the neutral ones — 0x007F00 at the old 0.2 fill is nearly
+  /// invisible over artwork, and these need to be read at a glance to be
+  /// useful. Those alphas are my choice, not sourced from a mockup.
+  ({ui.Color color, double fill, double stripe, double border}) _paletteFor(Segment segment) {
+    const green = ui.Color(0xFF007F00);
+    const red = ui.Color(0xFFFF0000);
+    if (segment.held) {
+      return (color: red, fill: showOriginal ? 0.28 : 0.6,
+              stripe: showOriginal ? 0.7 : 0.9, border: showOriginal ? 0.9 : 1.0);
+    }
+    if (segment.datasetStatus == 'keep') {
+      return (color: green, fill: showOriginal ? 0.28 : 0.6,
+              stripe: showOriginal ? 0.7 : 0.9, border: showOriginal ? 0.9 : 1.0);
+    }
+    final neutral = showOriginal
+        ? const ui.Color.fromARGB(255, 48, 42, 42)     // Dark grey for subtle overlay
+        : const ui.Color.fromARGB(255, 100, 200, 255); // Bright cyan standalone
+    return (color: neutral, fill: showOriginal ? 0.2 : 0.6,
+            stripe: showOriginal ? 0.5 : 0.8, border: showOriginal ? 0.3 : 1.0);
+  }
+
   @override
   void paint(Canvas canvas, Size size) {
-    // Use bright cyan for good visibility against both light and dark backgrounds.
-    // When Original is shown, it's a subtle overlay. When hidden, it's bright and clear.
-    final fillColor = showOriginal
-        ? const ui.Color.fromARGB(255, 48, 42, 42)   // Dark grey for subtle overlay
-        : const ui.Color.fromARGB(255, 100, 200, 255);  // Bright cyan for standalone visibility
-
-    // When Original layer is shown, use subtle overlay (alpha 0.2).
-    // When Original is hidden, use more opaque fill (alpha 0.6) so masks are clearly visible.
-    final fillAlpha = showOriginal ? 0.2 : 0.6;
-
-    final fillPaint = Paint()
-      ..color = fillColor.withValues(alpha: fillAlpha)
-      ..style = PaintingStyle.fill;
-
-    // Border stroke to outline each mask, making edges more visible
-    final borderPaint = Paint()
-      ..color = fillColor.withValues(alpha: showOriginal ? 0.3 : 1.0)
-      ..strokeWidth = 2.0
-      ..style = PaintingStyle.stroke;
-
-    final stripePaint = Paint()
-      ..color = fillColor.withValues(alpha: showOriginal ? 0.5 : 0.8)
-      ..strokeWidth = 2.0
-      ..style = PaintingStyle.stroke;
-
     for (final segment in segments) {
+      final palette = _paletteFor(segment);
+
+      final fillPaint = Paint()
+        ..color = palette.color.withValues(alpha: palette.fill)
+        ..style = PaintingStyle.fill;
+
+      // Border stroke to outline each mask, making edges more visible
+      final borderPaint = Paint()
+        ..color = palette.color.withValues(alpha: palette.border)
+        ..strokeWidth = 2.0
+        ..style = PaintingStyle.stroke;
+
+      final stripePaint = Paint()
+        ..color = palette.color.withValues(alpha: palette.stripe)
+        ..strokeWidth = 2.0
+        ..style = PaintingStyle.stroke;
+
       // First, draw the fill.
       canvas.drawPath(segment.path, fillPaint);
 

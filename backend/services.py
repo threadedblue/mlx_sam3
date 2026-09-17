@@ -103,6 +103,52 @@ def serialize_state(state: dict) -> dict:
     return result
 
 
+def _bbox_from_geometry(mask: np.ndarray) -> List[float]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return [0.0, 0.0, 0.0, 0.0]
+    return [float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)]
+
+
+def serialize_sf_masks(sf_session, state: dict) -> dict:
+    """Wire shape for the /segment/* responses, built from SFSession's
+    *recorded selections* rather than raw `state["masks"]`.
+
+    Two reasons this can't just be `serialize_state`:
+
+    1. A box/point prompt leaves every exemplar generalisation in
+       `state["masks"]` (9, on the page this was root-caused against) even
+       though only one of them is the user's selection — rendering straight
+       from state would still draw all 9.
+    2. `state` carries no dataset_status/held, so keep/unassigned and
+       pending-scrub styling are unrepresentable from it. `mask_ids`/
+       `dataset_statuses`/`held_flags`/`captions` here are parallel to
+       `masks`/`boxes`/`scores`, which is what the canvas indexes by —
+       `mask_ids` in particular is what the hold/caption endpoints need
+       back from the frontend to name which record they act on.
+
+    Only the current pass's records are emitted: an earlier pass's masks
+    were traced against a different image than the current pass's, so
+    mixing them would draw one pass's geometry over another's picture.
+    """
+    records = [m for m in sf_session.masks if m.pass_ == sf_session.pass_]
+    result = {
+        "original_width": state.get("original_width"),
+        "original_height": state.get("original_height"),
+        "masks": [mask_to_rle(m.geometry) for m in records],
+        "boxes": [_bbox_from_geometry(m.geometry) for m in records],
+        "scores": [float(m.score) if m.score is not None else 0.0 for m in records],
+        "mask_ids": [m.mask_id for m in records],
+        "dataset_statuses": [m.dataset_status.value for m in records],
+        "held_flags": [m.held for m in records],
+        "captions": [m.caption for m in records],
+        "text_tags": [m.text_tag for m in records],
+    }
+    if "prompted_boxes" in state:
+        result["prompted_boxes"] = state["prompted_boxes"]
+    return result
+
+
 class SegmentationService:
     ORIGINAL_IMAGE_FILENAME = "original.png"
 
@@ -135,8 +181,9 @@ class SegmentationService:
         None only for a session with no image/state at all (e.g. staged via
         /initSession but never uploaded to) — there's nothing to segment.
         A session reloaded from disk gets its SFSession reconstructed by
-        `_load_session_into_memory` (from persisted mask_type/pass/text_tag,
-        not by replay — see aa_persistence's module docstring), not here.
+        `_load_session_into_memory` (from persisted dataset_status/held/
+        pass/text_tag, not by replay — see aa_persistence's module
+        docstring), not here.
         """
         if session_id in self.sf_sessions:
             return self.sf_sessions[session_id]
@@ -159,33 +206,38 @@ class SegmentationService:
 
         The mask index itself is not from prompt replay: replay (in
         `_load_session_into_memory`) only reconstructs SAM3's raw mask list,
-        not SF's own mask_type/pass classification, which exists only in
-        segment.parquet's mask_type/pass/text_tag columns.
+        not SF's own dataset_status/held/pass classification, which exists
+        only in segment.parquet's columns.
 
-        `state`, however, deliberately IS `replayed_state` for a
-        Pass-1-only session — same object as `session_data["state"]`, no
-        second source of truth (PART 1's decision). For a session that
-        reached Pass 2, this can't hold: `replayed_state` was built by
-        replaying *every* flat prompt (linkage.parquet has no per-prompt
-        pass marker) against the *original* image, which is Pass-1-shaped
-        and wrong for Pass 2. Best effort there: re-`set_image` on the
-        correct background so future selections at least segment the right
-        picture, but SAM3's accumulated-prompt history for Pass 2 starts
-        empty rather than resuming where the session left off — a real,
-        flagged gap (fixing it needs linkage.parquet to track pass per
-        prompt, out of scope here), not a silent one.
+        `state`, however, deliberately IS `replayed_state` at pass 0 — same
+        object as `session_data["state"]`, no second source of truth (an
+        earlier decision, unaffected by v2). For a session at a later pass,
+        this can't hold: `replayed_state` was built by replaying *every*
+        flat prompt (linkage.parquet has no per-prompt pass marker) against
+        the *original* image, which is pass-0-shaped and wrong for any later
+        pass. Best effort there: re-`set_image` on that pass's actual image
+        so future selections at least segment the right picture, but SAM3's
+        accumulated-prompt history for that pass starts empty rather than
+        resuming where the session left off — a real, flagged gap (fixing
+        it needs linkage.parquet to track pass per prompt, out of scope
+        here), not a silent one.
         """
-        background_bytes = raw.get("background_image_bytes")
-        has_background_segment = any(seg.get("pass") == "background" for seg in raw["segments"])
-        current_pass = (
-            sf_engine.Pass.BACKGROUND if (background_bytes or has_background_segment)
-            else sf_engine.Pass.FOREGROUND
-        )
+        pass_images_bytes: Dict[int, bytes] = raw.get("pass_images") or {}
+        segments = raw["segments"]
+        current_pass = max([0] + [int(seg["pass"]) for seg in segments] + list(pass_images_bytes.keys()))
 
-        if current_pass is sf_engine.Pass.FOREGROUND:
+        pass_images: Dict[int, Image.Image] = {
+            p: Image.open(io.BytesIO(b)).convert("RGBA") for p, b in pass_images_bytes.items()
+        }
+
+        if current_pass == 0:
             state = replayed_state
         else:
-            state = self.processor.set_image(Image.open(io.BytesIO(background_bytes)).convert("RGB"))
+            if current_pass not in pass_images:
+                raise ValueError(
+                    f"session {session_id!r} is at pass {current_pass} but has no persisted image for it"
+                )
+            state = self.processor.set_image(pass_images[current_pass].convert("RGB"))
 
         sf_session = sf_engine.SFSession(
             session_id=session_id,
@@ -193,36 +245,34 @@ class SegmentationService:
             segmentor=self.processor,
             state=state,
         )
-        sf_session._pass = current_pass
-        if background_bytes:
-            sf_session._working_copy = sf_engine.WorkingCopy(
-                Image.open(io.BytesIO(background_bytes)).convert("RGBA")
-            )
 
         masks: list[sf_engine.MaskRecord] = []
-        for seg in raw["segments"]:
+        for seg in segments:
             if seg.get("mask_bytes") is None:
                 continue
             mask_img = Image.open(io.BytesIO(seg["mask_bytes"])).convert("L")
             geometry = (np.array(mask_img) > 127).astype(np.uint8)
-            pass_value = seg.get("pass", "foreground")
-            # Old rows' segment_id is a bare uuid4 with no pass prefix;
-            # new rows' segment_id already IS mask.mask_id verbatim
+            pass_value = int(seg["pass"])
+            # Old (v1) rows' segment_id is a bare uuid4 with no pass prefix;
+            # v2 rows' segment_id already IS mask.mask_id verbatim
             # (f"{pass}:{uuid4()}") — see aa_persistence's module docstring.
             mask_id = seg["segment_id"] if ":" in seg["segment_id"] else f"{pass_value}:{seg['segment_id']}"
             masks.append(sf_engine.MaskRecord(
                 mask_id=mask_id,
-                mask_type=sf_engine.MaskType(seg.get("mask_type", "in")),
-                pass_=sf_engine.Pass(pass_value),
+                pass_=pass_value,
                 geometry=geometry,
-                text_tag=seg.get("text_tag") or "",
+                text_tag=seg.get("text_tag") or None,
                 # Not persisted (audit-only, no downstream algorithmic use —
                 # see aa_persistence's module docstring): the original
                 # text_prompt/box/point distinction can't be recovered.
                 source="loaded",
                 score=seg.get("score"),
+                dataset_status=sf_engine.DatasetStatus(seg.get("dataset_status", "unassigned")),
+                held=bool(seg.get("held", False)),
+                caption=seg.get("caption"),
             ))
-        sf_session.masks = masks
+
+        sf_session.restore(current_pass, pass_images, masks)
         return sf_session
 
     def _load_session_into_memory(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -292,8 +342,8 @@ class SegmentationService:
 
         Eagerly pairs an SFSession with this session_id once both `state`
         and `original_image_bytes` are present (i.e. right after /upload) —
-        so every mask made from here on is mask_type/pass-tracked from its
-        very first selection, not just retroactively. Sessions that already
+        so every mask made from here on is dataset_status/held/pass-tracked
+        from its very first selection, not just retroactively. Sessions that already
         had masks before this feature existed only get one on disk reload,
         via `_reconstruct_sf_session`'s migration path.
         """

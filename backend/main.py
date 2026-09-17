@@ -36,9 +36,10 @@ from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 from dotenv import load_dotenv
 
-from services import SegmentationService, serialize_state
+from services import SegmentationService, serialize_state, serialize_sf_masks
 import aa_persistence
 import sf_engine
+import compile_training_set
 from lora_inferencer import (
     validate_inference_inputs,
     run_inference as _run_inference_fn,
@@ -67,28 +68,6 @@ def _get_lama_inpainter() -> sf_engine.LamaInpainter:
         _lama_inpainter = sf_engine.LamaInpainter()
     return _lama_inpainter
 
-
-def _parse_mask_type(raw: str) -> sf_engine.MaskType:
-    try:
-        return sf_engine.MaskType(raw)
-    except ValueError:
-        raise HTTPException(status_code=422, detail=f"mask_type must be 'in' or 'out', got {raw!r}")
-
-
-def _reject_out_mask_in_background_pass(sf_session: sf_engine.SFSession, mask_type: sf_engine.MaskType) -> None:
-    """API-boundary decision: sf_engine.py itself stays permissive about a
-    Pass 2 'out' selection (it's simply inert — never scrubbed, excluded
-    from export, no error) so the engine doesn't encode API opinions. At
-    the HTTP boundary, silently accepting a request that does nothing is a
-    foot-gun — the caller gets no error and may believe it took effect."""
-    if mask_type is sf_engine.MaskType.OUT and sf_session.pass_ is sf_engine.Pass.BACKGROUND:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "mask_type 'out' is only valid before the LaMa scrub (Pass 1). "
-                "Pass 2 identifies uncovered background elements to keep, not new obscurators to strip."
-            ),
-        )
 
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR.parent.parent / "storage" / "sessions"
@@ -157,23 +136,36 @@ app.add_middleware(
 class TextPromptRequest(BaseModel):
     session_id: str
     prompt: str
-    mask_type: str = "in"  # "in" (green, keep) | "out" (red, strip via LaMa) — defaults "in" so existing callers are unaffected
 
 
 class BoxPromptRequest(BaseModel):
     session_id: str
     box: list[float]  # [center_x, center_y, width, height] normalized
-    label: bool  # True for positive, False for negative — SAM3's own grounding polarity, independent of mask_type
-    mask_type: str = "in"
-    text_substitute: str = ""  # SF's per-region tag; SAM3 has no text for a geometric prompt on its own
+    label: bool  # True for positive, False for negative — SAM3's own grounding polarity
+    text_substitute: Optional[str] = None  # SF's per-region tag; optional — captioning is a separate, later action
 
 
 class PointPromptRequest(BaseModel):
     session_id: str
     point: list[float]  # [x, y] normalized
     label: bool  # True for positive, False for negative
-    mask_type: str = "in"
-    text_substitute: str = ""
+    text_substitute: Optional[str] = None
+
+
+class SetHeldRequest(BaseModel):
+    session_id: str
+    mask_id: str
+    held: bool
+
+
+class AttachCaptionRequest(BaseModel):
+    session_id: str
+    mask_id: str
+    caption: str
+
+
+class CompileDatasetRequest(BaseModel):
+    output_dir: str
 
 
 class ConfidenceRequest(BaseModel):
@@ -299,37 +291,28 @@ async def segment_with_text(request: TextPromptRequest):
     sf_session = service.get_or_create_sf_session(request.session_id)
     if sf_session is None:
         raise HTTPException(status_code=400, detail="Session has no image uploaded yet")
-    mask_type = _parse_mask_type(request.mask_type)
-    _reject_out_mask_in_background_pass(sf_session, mask_type)
 
     try:
         # sf_session.add_text_selection makes the one real call to
-        # processor.set_text_prompt (see PART 1: sf_session.state and
-        # session["state"] alias the same object — a second, independent
-        # call here would double-invoke SAM3 and, worse, double-register
-        # this prompt in its accumulated grounding history).
+        # processor.set_text_prompt (sf_session.state and session["state"]
+        # alias the same object — a second, independent call here would
+        # double-invoke SAM3 and, worse, double-register this prompt in its
+        # accumulated grounding history).
         start_time = time.perf_counter()
-        sf_session.add_text_selection(request.prompt, mask_type)
+        sf_session.add_text_selection(request.prompt)
         state = sf_session.state
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session.setdefault("prompts", []).append(request.prompt)
         session["state"] = state
 
-        # Serialize results first — if segmentation succeeded, return them
-        # regardless of whether persistence succeeds.
         start = time.perf_counter()
-        results = serialize_state(state)
+        results = serialize_sf_masks(sf_session, state)
         end = time.perf_counter()
         mask_count = len(results.get("masks") or [])
         print(f"Serialization took {end - start:.4f} seconds | masks={mask_count} | inference={processing_time_ms:.1f}ms")
 
-        # Persist to disk as a best-effort side effect. Don't crash the
-        # response if this fails — the user still got their segmentation results.
-        try:
-            service.save_session_to_disk(request.session_id)
-        except Exception as persist_err:
-            print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
-
+        # Persistence is explicit-Save-only (sf-model-v2-design.md §5) —
+        # no autosave here. The session lives in memory until /saveSession.
         return {
             "session_id": request.session_id,
             "prompt": request.prompt,
@@ -355,8 +338,6 @@ async def add_box_prompt(request: BoxPromptRequest):
     sf_session = service.get_or_create_sf_session(request.session_id)
     if sf_session is None:
         raise HTTPException(status_code=400, detail="Session has no image uploaded yet")
-    mask_type = _parse_mask_type(request.mask_type)
-    _reject_out_mask_in_background_pass(sf_session, mask_type)
 
     try:
         state = session["state"]
@@ -386,29 +367,29 @@ async def add_box_prompt(request: BoxPromptRequest):
         })
 
         # sf_session.add_box_selection makes the one real call to
-        # processor.add_geometric_prompt — see PART 1 (single source of
-        # truth for `state`, same reasoning as /segment/text).
+        # processor.add_geometric_prompt (single source of truth for
+        # `state`, same reasoning as /segment/text).
         start_time = time.perf_counter()
-        sf_session.add_box_selection(request.box, request.label, request.text_substitute, mask_type)
+        sf_session.add_box_selection(request.box, request.label, request.text_substitute)
         state = sf_session.state
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
 
-        # Serialize results first — if segmentation succeeded, return them
-        # regardless of whether persistence succeeds.
-        results = serialize_state(state)
+        results = serialize_sf_masks(sf_session, state)
 
-        # Persist to disk as a best-effort side effect. Don't crash the
-        # response if this fails — the user still got their segmentation results.
-        try:
-            service.save_session_to_disk(request.session_id)
-        except Exception as persist_err:
-            print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
-
+        # Persistence is explicit-Save-only — no autosave here.
         return {
             "session_id": request.session_id,
             "box_type": "positive" if request.label else "negative",
             "results": results,
+            # Which mask THIS call matched-or-created — `results` is the
+            # full current-pass list, not a diff, so this is the only way
+            # the frontend knows which one to focus (e.g. for the Prompt
+            # card's caption mode). Unchanged from whatever was focused
+            # before for a negative/"Avoid" label (records nothing, so
+            # there's nothing new to focus — the previous selection, if
+            # any, stays focused rather than being cleared).
+            "selected_mask_id": sf_session.last_touched_mask_id,
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2)
         }
@@ -437,8 +418,6 @@ async def add_point_prompt(request: PointPromptRequest):
     sf_session = service.get_or_create_sf_session(request.session_id)
     if sf_session is None:
         raise HTTPException(status_code=400, detail="Session has no image uploaded yet")
-    mask_type = _parse_mask_type(request.mask_type)
-    _reject_out_mask_in_background_pass(sf_session, mask_type)
 
     try:
         state = session["state"]
@@ -462,28 +441,21 @@ async def add_point_prompt(request: PointPromptRequest):
         })
 
         # sf_session.add_point_selection makes the one real call to
-        # processor.add_point_prompt — see PART 1.
+        # processor.add_point_prompt.
         start_time = time.perf_counter()
-        sf_session.add_point_selection(request.point, request.label, request.text_substitute, mask_type)
+        sf_session.add_point_selection(request.point, request.label, request.text_substitute)
         state = sf_session.state
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
 
-        # Serialize results first — if segmentation succeeded, return them
-        # regardless of whether persistence succeeds.
-        results = serialize_state(state)
+        results = serialize_sf_masks(sf_session, state)
 
-        # Persist to disk as a best-effort side effect. Don't crash the
-        # response if this fails — the user still got their segmentation results.
-        try:
-            service.save_session_to_disk(request.session_id)
-        except Exception as persist_err:
-            print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
-
+        # Persistence is explicit-Save-only — no autosave here.
         return {
             "session_id": request.session_id,
             "point_type": "positive" if request.label else "negative",
             "results": results,
+            "selected_mask_id": sf_session.last_touched_mask_id,
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2),
         }
@@ -498,12 +470,9 @@ class LamaScrubRequest(BaseModel):
 
 @app.post("/lama/scrub")
 async def lama_scrub(request: LamaScrubRequest):
-    """Scrub Pass 1's Red out-masks via LaMa and advance into Pass 2.
-
-    One-shot per sf_engine.py's run_lama_pass — a second call is a 409, not
-    a 500 (it's an ordinary, anticipated state-machine violation, not an
-    unexpected server error).
-    """
+    """Scrub the current pass's held masks via LaMa and advance to the next
+    pass. Repeatable without limit (sf-model-v2-design.md §3/§4) — there is
+    no "already scrubbed" state to reject; every call is ordinary."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not available")
 
@@ -517,34 +486,94 @@ async def lama_scrub(request: LamaScrubRequest):
 
     try:
         working_copy = sf_session.run_lama_pass(_get_lama_inpainter())
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error running LaMa scrub: {exc}")
 
     # run_lama_pass re-`set_image`s sf_session.state — keep the flat mirror
-    # in sync (PART 1's single-source-of-truth invariant applies here too).
+    # in sync (single-source-of-truth invariant applies here too).
     session["state"] = sf_session.state
 
-    consumed_out_mask_ids = [
-        m.mask_id for m in sf_session.masks
-        if m.mask_type is sf_engine.MaskType.OUT and m.pass_ is sf_engine.Pass.FOREGROUND
-    ]
-
-    try:
-        service.save_session_to_disk(request.session_id)
-    except Exception as persist_err:
-        print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
-
+    # Persistence is explicit-Save-only — no autosave here.
     buf = io.BytesIO()
     working_copy.image.save(buf, format="PNG")
     image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
+    scrub = sf_session.last_scrub
     return {
         "session_id": request.session_id,
         "image_b64": image_b64,
         "width": working_copy.image.width,
         "height": working_copy.image.height,
-        "consumed_out_mask_ids": consumed_out_mask_ids,
+        "from_pass": scrub.from_pass,
+        "to_pass": scrub.to_pass,
+        "scrubbed_mask_ids": list(scrub.mask_ids),
     }
+
+
+@app.post("/mask/hold")
+async def set_mask_held(request: SetHeldRequest):
+    """Queue (or un-queue) a selection for the current pass's next scrub —
+    sf_engine.SFSession.set_held. Independent of captioning (design doc §2)."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+
+    try:
+        record = sf_session.set_held(request.mask_id, request.held)
+    except sf_engine.UnknownMaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Persistence is explicit-Save-only — no autosave here.
+    return {
+        "session_id": request.session_id,
+        "mask_id": record.mask_id,
+        "held": record.held,
+    }
+
+
+@app.post("/mask/caption")
+async def attach_mask_caption(request: AttachCaptionRequest):
+    """Caption an existing selection, marking it `keep` — sf_engine.SFSession
+    .attach_caption. This is the Prompt card's caption-mode call, distinct
+    from a text-grounding /segment/text call."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+
+    try:
+        record = sf_session.attach_caption(request.mask_id, request.caption)
+    except sf_engine.UnknownMaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Persistence is explicit-Save-only — no autosave here.
+    return {
+        "session_id": request.session_id,
+        "mask_id": record.mask_id,
+        "dataset_status": record.dataset_status.value,
+        "caption": record.caption,
+    }
+
+
+@app.post("/dataset/compile")
+async def compile_dataset(request: CompileDatasetRequest):
+    """Compiles a LoRA training set from every saved session's kept,
+    captioned masks (sf-model-v2-design.md §5) — a read-time operation over
+    all of storage/sf/sessions/, idempotent and re-runnable."""
+    try:
+        result = compile_training_set.compile_training_set(request.output_dir)
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error compiling training set: {exc}")
 
 
 @app.post("/reset")
@@ -569,17 +598,19 @@ async def reset_prompts(request: SessionRequest):
         if "prompts" in session:
             session["prompts"] = []
 
-        # Serialize results first — if reset succeeded, return them
-        # regardless of whether persistence succeeds.
-        results = serialize_state(state)
+        # Clearing SAM3's prompts invalidates this pass's recorded
+        # selections too — nothing in live state backs them anymore. Without
+        # this they'd keep coming back in every /segment/* response (which
+        # is now built from the records, not raw state) as phantom masks.
+        # Other passes are left alone: a Pass 2 reset must not discard the
+        # Pass 1 selections the scrub already consumed.
+        sf_session = service.get_or_create_sf_session(request.session_id)
+        if sf_session is not None:
+            sf_session.masks = [m for m in sf_session.masks if m.pass_ != sf_session.pass_]
 
-        # Persist to disk as a best-effort side effect. Don't crash the
-        # response if this fails — the user still got their reset results.
-        try:
-            service.save_session_to_disk(request.session_id)
-        except Exception as persist_err:
-            print(f"Warning: Failed to save session {request.session_id}: {persist_err}")
+        results = serialize_sf_masks(sf_session, state) if sf_session is not None else serialize_state(state)
 
+        # Persistence is explicit-Save-only — no autosave here.
         return {
             "session_id": request.session_id,
             "message": "All prompts reset",

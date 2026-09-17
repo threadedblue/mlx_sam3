@@ -1,7 +1,17 @@
 import 'package:flutter/material.dart';
 
+/// SAM3 grounding polarity for a box/point prompt — the `label: bool` the
+/// backend forwards to `add_geometric_prompt`/`add_point_prompt`: "this
+/// region IS part of what I'm describing" vs "it ISN'T".
+///
+/// Labelled Target/Avoid rather than Include/Exclude because it is NOT
+/// what decides whether an object gets scrubbed or captioned — those are
+/// `held`/`dataset_status` (see main.dart's "Hold for next scrub" control
+/// and the Prompt card's caption mode), a separate axis entirely. The old
+/// Include/Exclude wording read as a duplicate of that axis and was the
+/// likeliest reason users expected this control to drive scrubbing.
 class IncludeExcludeToggle extends StatelessWidget {
-  final bool value; // true = Include, false = Exclude
+  final bool value; // true = Target (positive), false = Avoid (negative)
   final ValueChanged<bool> onChanged;
 
   const IncludeExcludeToggle({
@@ -29,7 +39,7 @@ class IncludeExcludeToggle extends StatelessWidget {
       clipBehavior: Clip.antiAlias,
       child: Row(
         children: [
-          // Include (left half)
+          // Target / positive (left half)
           Expanded(
             child: Container(
               decoration: BoxDecoration(
@@ -54,7 +64,7 @@ class IncludeExcludeToggle extends StatelessWidget {
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        'Include',
+                        'Target',
                         style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w500,
@@ -72,7 +82,7 @@ class IncludeExcludeToggle extends StatelessWidget {
             width: 1,
             color: value ? greenColor : redColor,
           ),
-          // Exclude (right half)
+          // Avoid / negative (right half)
           Expanded(
             child: Container(
               decoration: BoxDecoration(
@@ -97,7 +107,7 @@ class IncludeExcludeToggle extends StatelessWidget {
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        'Exclude',
+                        'Avoid',
                         style: TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w500,

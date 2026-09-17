@@ -27,6 +27,7 @@ import 'layer_state.dart';
 import 'models/result_datum.dart';
 import 'widgets/result_cell.dart';
 import 'widgets/include_exclude_toggle.dart';
+import 'widgets/lbs_card.dart';
 import 'launch_config.dart';
 
 void main() {
@@ -382,6 +383,32 @@ class _HomeScreenState extends State<HomeScreen> {
   List<ResultDatum> _boxResult = [];
   bool _pointRunning = false;
   List<ResultDatum> _pointResult = [];
+  bool _isScrubbing = false;
+  String? _lastScrubLabel;
+
+  /// The mask a box/point selection (or a Hold toggle) most recently
+  /// touched — what the Prompt card's caption mode and the Hold control
+  /// act on. Cleared on scrub (the pass changes; whatever was focused no
+  /// longer has a live geometry in the new pass's result set).
+  String? _focusedMaskId;
+
+  Segment? get _focusedSegment {
+    final id = _focusedMaskId;
+    if (id == null) return null;
+    for (final s in _segments) {
+      if (s.maskId == id) return s;
+    }
+    return null;
+  }
+
+  /// design doc's exact trigger: held AND still unassigned. A captioned
+  /// (`keep`) mask stays in grounding mode even if re-focused — captioning
+  /// again would just overwrite the existing caption via the same call,
+  /// which isn't the flow this mode is for.
+  bool get _isCaptionMode {
+    final seg = _focusedSegment;
+    return seg != null && seg.held && seg.datasetStatus == 'unassigned';
+  }
   bool _resultsRunning = false;
   List<ResultDatum> _resultsResult = [];
   Timer? _healthCheckTimer;
@@ -584,18 +611,27 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     final List<Segment> newSegments = [];
+    // Parallel to masks/boxes/scores (see services.serialize_sf_masks) —
+    // looked up by index, defensively: absent/short arrays just leave a
+    // segment's identity fields null rather than throwing.
+    final maskIds = _result!['mask_ids'] as List?;
+    final datasetStatuses = _result!['dataset_statuses'] as List?;
+    final heldFlags = _result!['held_flags'] as List?;
+    String? idAt(int i) => (maskIds != null && i < maskIds.length) ? maskIds[i] as String? : null;
+    String? statusAt(int i) => (datasetStatuses != null && i < datasetStatuses.length) ? datasetStatuses[i] as String? : null;
+    bool heldAt(int i) => (heldFlags != null && i < heldFlags.length) ? heldFlags[i] as bool : false;
 
     try {
       // 1. Try to load Masks (RLE)
       final masks = _result!['masks'] as List?;
       if (masks != null && masks.isNotEmpty && masks[0] is Map) {
-        for (var maskData in masks) {
+        for (var i = 0; i < masks.length; i++) {
           try {
-            final rle = maskData as Map;
+            final rle = masks[i] as Map;
             final counts = (rle['counts'] as List).cast<int>();
             final size = (rle['size'] as List).cast<int>(); // [H, W]
             final w = size[1];
-            
+
             final path = Path();
             int p = 0;
             bool isForeground = false; // First run is always background (0) per backend logic
@@ -619,22 +655,33 @@ class _HomeScreenState extends State<HomeScreen> {
               p += count;
               isForeground = !isForeground;
             }
-            newSegments.add(Segment(path: path));
+            newSegments.add(Segment(
+              path: path,
+              maskId: idAt(i),
+              datasetStatus: statusAt(i),
+              held: heldAt(i),
+            ));
           } catch (e, st) {
             debugPrint('Error parsing RLE mask: $e\n$st');
           }
         }
-      } 
+      }
       // 2. Fallback to Boxes if no RLE masks found
       else {
         final boxes = _result!['boxes'] as List? ?? _result!['masks'] as List?;
         if (boxes != null) {
-          for (var maskData in boxes) {
+          for (var i = 0; i < boxes.length; i++) {
+            final maskData = boxes[i];
             if (maskData is List && maskData.length == 4) {
               final list = maskData.map((e) => (e as num).toDouble()).toList();
               final rect = Rect.fromLTRB(list[0], list[1], list[2], list[3]);
               final path = Path()..addRect(rect);
-              newSegments.add(Segment(path: path));
+              newSegments.add(Segment(
+                path: path,
+                maskId: idAt(i),
+                datasetStatus: statusAt(i),
+                held: heldAt(i),
+              ));
             }
           }
         }
@@ -732,8 +779,19 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Prompt card dual mode: grounding (default) vs. caption (see
+  /// [_isCaptionMode]) — submitting text calls a completely different
+  /// endpoint depending on which. [_buildTextPromptCard]'s header/label
+  /// changes with the same condition, so the mode is always visible on
+  /// screen rather than something to infer from what happens after submit
+  /// (this is the deliberate mitigation for the IncludeExcludeToggle
+  /// ambiguity bug from the earlier investigation).
   Future<void> _sendTextPrompt() async {
     if (_sessionId == null || _textController.text.isEmpty) return;
+    if (_isCaptionMode) {
+      await _attachCaptionToFocusedMask();
+      return;
+    }
     setState(() { _isLoading = true; _textPromptRunning = true; _textPromptResult = []; });
     try {
       final response = await _api.segmentWithText(_sessionId!, _textController.text);
@@ -753,6 +811,78 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// The Prompt card's caption-mode submit: attaches the typed text as a
+  /// caption on the focused mask (`/mask/caption`) instead of running a
+  /// SAM3 text-grounding call. Patches the one changed record locally
+  /// rather than re-deriving segments — this endpoint returns just that
+  /// record, not a full results payload like /segment/* does.
+  Future<void> _attachCaptionToFocusedMask() async {
+    final maskId = _focusedMaskId;
+    if (_sessionId == null || maskId == null) return;
+    setState(() { _isLoading = true; _textPromptRunning = true; _textPromptResult = []; });
+    try {
+      final response = await _api.attachCaption(_sessionId!, maskId, _textController.text);
+      if (!mounted) return;
+      if (response != null) {
+        _patchMaskLocally(maskId, datasetStatus: response['dataset_status'] as String?);
+        _textController.clear();
+        setState(() {
+          _textPromptResult = [const ResultDatum(label: 'Status', value: 'Captioned')];
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() { _isLoading = false; _textPromptRunning = false; });
+    }
+  }
+
+  /// Patches one mask's fields in both [_segments] (what the canvas
+  /// renders) and `_result`'s parallel arrays (what a later
+  /// [_updateSegmentsFromResult] call would rebuild [_segments] from) —
+  /// needed because /mask/hold and /mask/caption return only the one
+  /// changed record, not a full results payload, so without this the two
+  /// would silently drift apart on the next unrelated rebuild.
+  void _patchMaskLocally(String maskId, {String? datasetStatus, bool? held}) {
+    setState(() {
+      _segments = [
+        for (final s in _segments)
+          if (s.maskId == maskId)
+            Segment(
+              path: s.path,
+              retouchedImage: s.retouchedImage,
+              maskId: s.maskId,
+              datasetStatus: datasetStatus ?? s.datasetStatus,
+              held: held ?? s.held,
+            )
+          else
+            s,
+      ];
+      final maskIds = _result?['mask_ids'] as List?;
+      if (maskIds != null) {
+        final idx = maskIds.indexOf(maskId);
+        if (idx != -1) {
+          if (datasetStatus != null) (_result!['dataset_statuses'] as List)[idx] = datasetStatus;
+          if (held != null) (_result!['held_flags'] as List)[idx] = held;
+        }
+      }
+    });
+  }
+
+  Future<void> _setFocusedMaskHeld(bool held) async {
+    final maskId = _focusedMaskId;
+    if (_sessionId == null || maskId == null) return;
+    try {
+      final response = await _api.setMaskHeld(_sessionId!, maskId, held);
+      if (!mounted || response == null) return;
+      _patchMaskLocally(maskId, held: response['held'] as bool?);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    }
+  }
+
   Future<void> _sendBoxPrompt(List<double> box) async {
     if (_sessionId == null) return;
     setState(() { _isLoading = true; _boxRunning = true; _boxResult = []; });
@@ -763,6 +893,7 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
+          _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
           _boxResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
       }
@@ -784,6 +915,7 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
+          _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
           _pointResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
       }
@@ -814,6 +946,38 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _error = e.toString());
     } finally {
       if (mounted) setState(() { _isLoading = false; _resultsRunning = false; });
+    }
+  }
+
+  Future<void> _scrubLamaBackground() async {
+    if (_sessionId == null) return;
+    setState(() { _isScrubbing = true; });
+    try {
+      final response = await _api.scrubLamaBackground(_sessionId!);
+      if (!mounted) return;
+      if (response != null) {
+        setState(() {
+          _lastScrubLabel = "Pass ${response['from_pass']} → Pass ${response['to_pass']}";
+          // The pass just changed; whatever was focused/shown belonged to
+          // the pass before the scrub and has no live geometry in the new
+          // one's result set (serialize_sf_masks only returns the current
+          // pass — see its docstring).
+          _focusedMaskId = null;
+          _result = null;
+          _segments = [];
+        });
+      } else {
+        // scrubLamaBackground doesn't rethrow (see ApiService) — a null
+        // response means the call itself failed (network error, or the
+        // backend doesn't have this endpoint) — v2 has no "already
+        // scrubbed" state to distinguish here, unlike the old two-pass cap.
+        setState(() => _error = "LaMa scrub failed.");
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() { _isScrubbing = false; });
     }
   }
 
@@ -943,6 +1107,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   _buildCardRow(_buildPointPromptCard(),   ResultCell(isRunning: _pointRunning, data: _pointResult)),
                   const SizedBox(height: 16),
                   _buildCardRow(_buildResultsCard(),       ResultCell(isRunning: _resultsRunning, data: _resultsResult)),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildLBSCard(),           const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
                   _buildCardRow(_buildSegmentLayersCard(), const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
@@ -1258,6 +1424,14 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildTextPromptCard() {
+    // REQUIRED, not cosmetic: the mode must be visible on screen at all
+    // times, never something to infer from what happens after submit —
+    // see _sendTextPrompt's docstring for why.
+    final captionMode = _isCaptionMode;
+    final headerLabel = captionMode
+        ? "Caption: ${_focusedSegment?.maskId?.split(':').last.substring(0, 8) ?? ''}"
+        : "Prompt";
+
     return _buildBorderedCard(
       Padding(
         padding: const EdgeInsets.all(16),
@@ -1266,25 +1440,34 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Row(
               children: [
-                const Icon(Icons.text_fields, size: 16),
+                Icon(captionMode ? Icons.local_offer : Icons.text_fields, size: 16),
                 const SizedBox(width: 8),
-                const Text("Prompt", style: TextStyle(fontWeight: FontWeight.bold)),
-                const Spacer(),
-                const Radio<SelectionMode>(
-                  value: SelectionMode.prompt,
-                  toggleable: true,
+                Expanded(
+                  child: Text(
+                    headerLabel,
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: captionMode ? const Color(0xFF007F00) : null,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
                 ),
+                if (!captionMode)
+                  const Radio<SelectionMode>(
+                    value: SelectionMode.prompt,
+                    toggleable: true,
+                  ),
               ],
             ),
             const SizedBox(height: 12),
             TextField(
               controller: _textController,
               maxLines: null,
-              decoration: const InputDecoration(
-                hintText: 'e.g. "cat", "wheel"',
+              decoration: InputDecoration(
+                hintText: captionMode ? 'Describe this object for training' : 'e.g. "cat", "wheel"',
                 isDense: true,
-                border: OutlineInputBorder(),
-                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                border: const OutlineInputBorder(),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
               ),
               enabled: _sessionId != null && !_isLoading,
               onSubmitted: (_) => _sendTextPrompt(),
@@ -1295,13 +1478,13 @@ class _HomeScreenState extends State<HomeScreen> {
               child: OutlinedButton(
                 onPressed: (_sessionId == null || _textController.text.isEmpty || _isLoading) ? null : _sendTextPrompt,
                 style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.white,
-                  side: const BorderSide(color: Colors.white),
+                  foregroundColor: captionMode ? const Color(0xFF007F00) : Colors.white,
+                  side: BorderSide(color: captionMode ? const Color(0xFF007F00) : Colors.white),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(24),
                   ),
                 ),
-                child: const Text("Select"),
+                child: Text(captionMode ? "Save Caption" : "Select"),
               ),
             ),
           ],
@@ -1372,6 +1555,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildResultsCard() {
     final maskCount = (_result?['masks'] as List?)?.length ?? 0;
+    final focused = _focusedSegment;
 
     return _buildBorderedCard(
       Padding(
@@ -1388,6 +1572,21 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 12),
             _buildResultRow("Object count", maskCount.toString()),
+            // A control to toggle `held` on the focused mask — deliberately
+            // its own row, not folded into the Prompt card's two modes.
+            if (focused != null) ...[
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                value: focused.held,
+                onChanged: (_sessionId == null || _isLoading)
+                    ? null
+                    : (checked) => _setFocusedMaskHeld(checked ?? false),
+                controlAffinity: ListTileControlAffinity.leading,
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                title: const Text("Hold for next scrub"),
+              ),
+            ],
             const SizedBox(height: 12),
             SizedBox(
               width: double.infinity,
@@ -1413,6 +1612,21 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildSegmentLayersCard() {
     // This widget now manages its own state via a Consumer<LayerState>
     return const SegmentLayersCard();
+  }
+
+  Widget _buildLBSCard() {
+    // Now that /segment/* reports held state per mask (v2), "pending" can
+    // finally mean what LBSCard's label says — regions actually queued for
+    // the next scrub — rather than the total-selected-count proxy used
+    // before that data existed.
+    final heldFlags = _result?['held_flags'] as List?;
+    final pendingCount = heldFlags?.where((h) => h == true).length ?? 0;
+    return LBSCard(
+      pendingCount: pendingCount,
+      lastScrubLabel: _lastScrubLabel,
+      isScrubbing: _isScrubbing,
+      onScrub: _scrubLamaBackground,
+    );
   }
 
   Widget _buildSaveCard() {

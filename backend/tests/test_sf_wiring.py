@@ -1,11 +1,16 @@
-"""End-to-end tests for SFSession wired into the running backend:
-session-state mask_type tracking (PART 1), the /lama/scrub endpoint
-(PART 2), and aa_persistence.py's schema extension (PART 3).
+"""End-to-end tests for the v2 model (sf-model-v2-design.md) wired into the
+running backend: select/hold/caption/scrub over the real HTTP endpoints,
+aa_persistence.py's schema (pass/dataset_status/held/caption), and the
+training-set compile step.
 
 Drives real HTTP endpoints via FastAPI's TestClient against `main.app`,
 with `main.model`/`main.processor`/`main.service` swapped for fakes so no
 real SAM3/LaMa model ever loads — `TestClient(app)` used without a `with`
 block does not run `lifespan`, confirmed separately.
+
+Persistence is explicit-Save-only (design doc §5): nothing here relies on
+an endpoint silently autosaving — every test that checks disk state calls
+/saveSession (or `service.save_session_to_disk`) itself.
 
 Run with:  pytest backend/tests/test_sf_wiring.py -v
 """
@@ -20,6 +25,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import aa_persistence
+import compile_training_set
 import d4m_juliacall_bridge as bridge
 import main
 import sf_engine
@@ -106,159 +112,210 @@ def _upload(client) -> str:
     return r.json()["session_id"]
 
 
-def _drive_full_mask_flow(client) -> str:
-    """Runs mark-in/mark-out/scrub/mark-in-again via the real HTTP
-    endpoints, asserting the whole way; returns the session_id for callers
-    (TestSaveReloadRoundTrip) that need to inspect what got persisted."""
-    session_id = _upload(client)
+def _box_select(client, session_id, box, text_substitute=None) -> str:
+    """Selects via /segment/box and returns the mask id THIS call touched.
 
-    main.processor.text_boxes = {"widget": [(10, 10, 30, 30)]}
-    r = client.post("/segment/text", json={
-        "session_id": session_id, "prompt": "widget", "mask_type": "in",
-    })
-    assert r.status_code == 200
-    assert len(r.json()["results"]["masks"]) == 1
-
+    Not `results["mask_ids"][0]`/length: `results` is the full current-pass
+    list (serialize_sf_masks is not a diff — see its docstring), so it
+    already has every prior selection in it too once more than one exists.
+    `selected_mask_id` is the field that exists specifically to answer
+    "which one was this call about."
+    """
     r = client.post("/segment/box", json={
-        "session_id": session_id,
-        "box": [0.7, 0.7, 0.2, 0.2],
-        "label": True,
-        "mask_type": "out",
-        "text_substitute": "word balloon",
+        "session_id": session_id, "box": box, "label": True,
+        **({"text_substitute": text_substitute} if text_substitute else {}),
     })
     assert r.status_code == 200
-
-    sf_session = main.service.sf_sessions[session_id]
-    assert len(sf_session.masks) == 2
-    assert {m.mask_type.value for m in sf_session.masks} == {"in", "out"}
-    out_record = next(m for m in sf_session.masks if m.mask_type is sf_engine.MaskType.OUT)
-    assert out_record.text_tag == "word balloon"
-
-    # Scrub
-    r = client.post("/lama/scrub", json={"session_id": session_id})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["image_b64"]
-    assert body["consumed_out_mask_ids"] == [out_record.mask_id]
-    assert sf_session.pass_ is sf_engine.Pass.BACKGROUND
-
-    # Two-pass lock: a second scrub is a 409, not a 500
-    r = client.post("/lama/scrub", json={"session_id": session_id})
-    assert r.status_code == 409
-    assert "already run" in r.json()["detail"]
-
-    # Pass 2 "out" is rejected outright, not silently accepted as a no-op
-    r = client.post("/segment/text", json={
-        "session_id": session_id, "prompt": "anything", "mask_type": "out",
-    })
-    assert r.status_code == 422
-    assert len(sf_session.masks) == 2  # rejected before touching state
-
-    # Pass 2: mark newly-uncovered background as IN
-    main.processor.text_boxes = {"lamp": [(50, 50, 70, 70)]}
-    r = client.post("/segment/text", json={
-        "session_id": session_id, "prompt": "lamp", "mask_type": "in",
-    })
-    assert r.status_code == 200
-
-    assert len(sf_session.masks) == 3
-    pass2_masks = [m for m in sf_session.masks if m.pass_ is sf_engine.Pass.BACKGROUND]
-    assert len(pass2_masks) == 1
-    assert pass2_masks[0].text_tag == "lamp"
-    assert pass2_masks[0].mask_type is sf_engine.MaskType.IN
-
-    # Pass 1's records are untouched by the Pass 2 call.
-    pass1_masks = [m for m in sf_session.masks if m.pass_ is sf_engine.Pass.FOREGROUND]
-    assert len(pass1_masks) == 2
-
-    # session["state"] and sf_session.state never diverged (PART 1).
-    flat_session = main.service.sessions[session_id]
-    assert flat_session["state"] is sf_session.state
-
-    return session_id
+    mask_id = r.json()["selected_mask_id"]
+    assert mask_id is not None, f"expected a selection, got {r.json()}"
+    return mask_id
 
 
-class TestHttpMaskFlow:
-    """Deliverable 1: mark-in/mark-out/scrub/mark-in-again through the real
-    HTTP endpoints (SFSession itself is already covered by test_sf_engine.py
-    — this exercises main.py's routing, not the engine's own logic)."""
+def _hold(client, session_id, mask_id, held=True):
+    r = client.post("/mask/hold", json={"session_id": session_id, "mask_id": mask_id, "held": held})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _caption(client, session_id, mask_id, caption):
+    r = client.post("/mask/caption", json={"session_id": session_id, "mask_id": mask_id, "caption": caption})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+class TestHttpSelectHoldCaptionScrub:
+    """The actual acceptance test from the prompt: select (no caption) ->
+    hold -> caption via the second mask's Prompt-card-equivalent call ->
+    hold a second, uncaptioned mask -> scrub -> confirm both scrubbed."""
 
     def test_full_flow(self, client):
-        _drive_full_mask_flow(client)
+        session_id = _upload(client)
+
+        keeper_id = _box_select(client, session_id, [0.2, 0.2, 0.2, 0.2])
+        balloon_id = _box_select(client, session_id, [0.7, 0.7, 0.2, 0.2], text_substitute="word balloon")
+        assert keeper_id != balloon_id
+
+        # Selected, but neither held nor captioned yet.
+        sf_session = main.service.sf_sessions[session_id]
+        assert all(not m.held and m.dataset_status == sf_engine.DatasetStatus.UNASSIGNED for m in sf_session.masks)
+
+        _hold(client, session_id, keeper_id, True)
+        caption_resp = _caption(client, session_id, keeper_id, "a red egg")
+        assert caption_resp["dataset_status"] == "keep"
+        assert sf_session.get_mask(keeper_id).held is True  # captioning didn't touch held
+
+        _hold(client, session_id, balloon_id, True)
+        assert sf_session.get_mask(balloon_id).dataset_status == sf_engine.DatasetStatus.UNASSIGNED  # never captioned
+
+        r = client.post("/lama/scrub", json={"session_id": session_id})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["from_pass"] == 0 and body["to_pass"] == 1
+        assert set(body["scrubbed_mask_ids"]) == {keeper_id, balloon_id}
+
+        assert sf_session.pass_ == 1
+        assert sf_session.get_mask(keeper_id).held is False
+        assert sf_session.get_mask(balloon_id).held is False
+        # Scrubbing didn't touch dataset_status either direction.
+        assert sf_session.get_mask(keeper_id).dataset_status == sf_engine.DatasetStatus.KEEP
+        assert sf_session.get_mask(balloon_id).dataset_status == sf_engine.DatasetStatus.UNASSIGNED
+
+    def test_scrub_is_repeatable_no_two_pass_cap(self, client):
+        session_id = _upload(client)
+        for _ in range(3):
+            r = client.post("/lama/scrub", json={"session_id": session_id})
+            assert r.status_code == 200
+        assert main.service.sf_sessions[session_id].pass_ == 3
+
+    def test_hold_unknown_mask_is_404_not_500(self, client):
+        session_id = _upload(client)
+        r = client.post("/mask/hold", json={"session_id": session_id, "mask_id": "0:nope", "held": True})
+        assert r.status_code == 404
+
+    def test_caption_unknown_mask_is_404_and_empty_caption_is_422(self, client):
+        session_id = _upload(client)
+        mask_id = _box_select(client, session_id, [0.2, 0.2, 0.2, 0.2])
+
+        r = client.post("/mask/caption", json={"session_id": session_id, "mask_id": "0:nope", "caption": "x"})
+        assert r.status_code == 404
+
+        r = client.post("/mask/caption", json={"session_id": session_id, "mask_id": mask_id, "caption": "   "})
+        assert r.status_code == 422
+
+    def test_holding_a_record_from_an_earlier_pass_is_422(self, client):
+        session_id = _upload(client)
+        old_id = _box_select(client, session_id, [0.2, 0.2, 0.2, 0.2])
+        client.post("/lama/scrub", json={"session_id": session_id})  # advances to pass 1
+
+        r = client.post("/mask/hold", json={"session_id": session_id, "mask_id": old_id, "held": True})
+        assert r.status_code == 422
 
 
 class TestSaveReloadRoundTrip:
-    """Deliverable 2: mask_type and pass survive a save/reload round trip."""
+    """dataset_status, held, caption, and pass must survive a full
+    save_session -> read_session_raw cycle unchanged — a correctness bug,
+    not a nice-to-have, per the design doc (§6): a failure here means
+    captioned work silently never reaches the training set."""
 
-    def test_mask_type_and_pass_survive_direct_read(self, client):
-        session_id = _drive_full_mask_flow(client)
+    def _build_session(self, client) -> tuple[str, str, str]:
+        session_id = _upload(client)
+        keeper_id = _box_select(client, session_id, [0.2, 0.2, 0.2, 0.2])
+        balloon_id = _box_select(client, session_id, [0.7, 0.7, 0.2, 0.2], text_substitute="word balloon")
+        _hold(client, session_id, keeper_id, True)
+        _caption(client, session_id, keeper_id, "a red egg")
+        _hold(client, session_id, balloon_id, True)
+        client.post("/lama/scrub", json={"session_id": session_id})  # pass 0 -> 1
+
+        lamp_id = _box_select(client, session_id, [0.4, 0.4, 0.1, 0.1], text_substitute="lamp")
+        _caption(client, session_id, lamp_id, "a brass lamp")
+        return session_id, keeper_id, lamp_id
+
+    def test_fields_survive_direct_save_and_read(self, client):
+        session_id, keeper_id, lamp_id = self._build_session(client)
+        r = client.post("/saveSession", json={"session_id": session_id})
+        assert r.status_code == 200
 
         raw = aa_persistence.read_session_raw(session_id)
         assert raw is not None
-        assert raw["background_image_bytes"] is not None
-        by_tag = {seg["text_tag"]: seg for seg in raw["segments"] if seg["text_tag"]}
+        assert set(raw["pass_images"].keys()) == {1}  # pass 0 has no scrub image; only pass 1 does
 
-        assert by_tag["widget"]["mask_type"] == "in"
-        assert by_tag["widget"]["pass"] == "foreground"
-        assert by_tag["word balloon"]["mask_type"] == "out"
-        assert by_tag["word balloon"]["pass"] == "foreground"
-        assert by_tag["lamp"]["mask_type"] == "in"
-        assert by_tag["lamp"]["pass"] == "background"
+        by_id = {seg["segment_id"]: seg for seg in raw["segments"]}
 
-    def test_reload_reconstructs_sf_session_across_both_passes(self, client):
-        session_id = _drive_full_mask_flow(client)
-        original_sf_session = main.service.sf_sessions[session_id]
-        original_mask_ids = {m.mask_id for m in original_sf_session.masks}
+        keeper = by_id[keeper_id]
+        assert keeper["pass"] == "0"
+        assert keeper["dataset_status"] == "keep"
+        assert keeper["caption"] == "a red egg"
+        assert keeper["held"] is False  # cleared by the scrub
+
+        lamp = by_id[lamp_id]
+        assert lamp["pass"] == "1"
+        assert lamp["dataset_status"] == "keep"
+        assert lamp["caption"] == "a brass lamp"
+
+        # The uncaptioned balloon has no caption column at all (None, not "").
+        balloon = next(s for s in raw["segments"] if s["text_tag"] == "word balloon")
+        assert balloon["dataset_status"] == "unassigned"
+        assert balloon["caption"] is None
+        assert balloon["held"] is False
+
+    def test_full_reload_reconstructs_sf_session_across_passes(self, client):
+        session_id, keeper_id, lamp_id = self._build_session(client)
+        client.post("/saveSession", json={"session_id": session_id})
 
         # Simulate a process restart: evict the in-memory cache entirely.
         del main.service.sessions[session_id]
         del main.service.sf_sessions[session_id]
 
-        reloaded_flat = main.service.get_session(session_id)
-        assert reloaded_flat is not None
-        reloaded_sf = main.service.sf_sessions[session_id]
+        assert main.service.get_session(session_id) is not None
+        reloaded = main.service.sf_sessions[session_id]
 
-        assert reloaded_sf.pass_ is sf_engine.Pass.BACKGROUND
-        assert reloaded_sf.working_copy is not None
-        assert {m.mask_id for m in reloaded_sf.masks} == original_mask_ids
+        assert reloaded.pass_ == 1
+        assert reloaded.working_copy is not None
+        assert reloaded.image_for_pass(0) is not None
+        assert reloaded.image_for_pass(1) is not None
 
-        by_tag = {m.text_tag: m for m in reloaded_sf.masks if m.text_tag}
-        assert by_tag["widget"].mask_type is sf_engine.MaskType.IN
-        assert by_tag["widget"].pass_ is sf_engine.Pass.FOREGROUND
-        assert by_tag["word balloon"].mask_type is sf_engine.MaskType.OUT
-        assert by_tag["lamp"].pass_ is sf_engine.Pass.BACKGROUND
+        keeper = reloaded.get_mask(keeper_id)
+        assert (keeper.pass_, keeper.dataset_status, keeper.caption, keeper.held) == (0, sf_engine.DatasetStatus.KEEP, "a red egg", False)
+        lamp = reloaded.get_mask(lamp_id)
+        assert (lamp.pass_, lamp.dataset_status, lamp.caption) == (1, sf_engine.DatasetStatus.KEEP, "a brass lamp")
 
-        # Foreground-reload single-source-of-truth guarantee doesn't apply
-        # here (this session reached Pass 2 — see services.py's
-        # _reconstruct_sf_session docstring on the flagged Pass-2 gap), but
-        # the reconstructed state must still target the right image.
-        assert reloaded_sf.state["original_width"] == IMG_SIZE
+    def test_held_record_survives_a_save_reload_cycle(self, client):
+        """A record still IN the pending batch (not yet scrubbed) must
+        reload as held — this is the state a user leaves mid-session."""
+        session_id = _upload(client)
+        mask_id = _box_select(client, session_id, [0.2, 0.2, 0.2, 0.2])
+        _hold(client, session_id, mask_id, True)
+        client.post("/saveSession", json={"session_id": session_id})
+
+        del main.service.sessions[session_id]
+        del main.service.sf_sessions[session_id]
+        main.service.get_session(session_id)
+
+        assert main.service.sf_sessions[session_id].get_mask(mask_id).held is True
 
 
 class TestOldSessionMigration:
-    """Deliverable 3: sessions saved before this schema existed read back
-    with defined defaults, not undefined/missing behavior."""
+    """v1 (`MaskType.IN`/`OUT`, two-pass) rows read back with defined v2
+    defaults, not undefined/missing behavior."""
 
-    def test_pre_migration_segment_defaults_to_in_and_foreground(self, tmp_path, monkeypatch):
+    def test_pre_v2_segment_migrates_to_unassigned_unheld_pass_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(aa_persistence, "STORAGE_ROOT", tmp_path / "sf_storage")
         session_id = "legacy-session"
         d = aa_persistence.session_dir(session_id)
 
-        # Hand-write registry.parquet + an OLD-format segment.parquet: bare
-        # uuid4 row key, no mask_type/pass/text_tag columns at all.
+        # Hand-write registry.parquet + a v1-format segment.parquet: bare
+        # uuid4 row key, mask_type column, "foreground" pass — no
+        # dataset_status/held/caption columns at all.
         bridge.save_parquet(str(d / "registry.parquet"), [session_id], ["name"], ["Legacy"])
         old_mask_id = "old-mask-uuid"
         row = f"{session_id}:{old_mask_id}"
         tiny_png = _upload_png_bytes()
         bridge.save_parquet(
             str(d / "segment.parquet"),
-            [f"{session_id}:_source", row, row],
-            ["image_bytes", "crop_bytes", "mask_bytes"],
-            [
-                aa_persistence._b64(tiny_png),
-                aa_persistence._b64(tiny_png),
-                aa_persistence._b64(tiny_png),
-            ],
+            [f"{session_id}:_source", row, row, row, row],
+            ["image_bytes", "crop_bytes", "mask_bytes", "mask_type", "pass"],
+            [aa_persistence._b64(tiny_png), aa_persistence._b64(tiny_png), aa_persistence._b64(tiny_png),
+             "in", "foreground"],
         )
 
         raw = aa_persistence.read_session_raw(session_id)
@@ -266,12 +323,29 @@ class TestOldSessionMigration:
         assert len(raw["segments"]) == 1
         seg = raw["segments"][0]
         assert seg["segment_id"] == old_mask_id
-        assert seg["mask_type"] == "in"
-        assert seg["pass"] == "foreground"
-        assert seg["text_tag"] == ""
-        assert raw["background_image_bytes"] is None
+        assert seg["pass"] == "0"
+        assert seg["dataset_status"] == "unassigned"
+        assert seg["held"] is False
+        assert seg["caption"] is None
+        assert raw["pass_images"] == {}
 
-    def test_reconstructed_mask_id_gets_a_synthesized_pass_prefix(self, tmp_path, monkeypatch):
+    def test_pre_v2_background_sentinel_migrates_to_pass_one_image(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(aa_persistence, "STORAGE_ROOT", tmp_path / "sf_storage")
+        session_id = "legacy-session-bg"
+        d = aa_persistence.session_dir(session_id)
+        bridge.save_parquet(str(d / "registry.parquet"), [session_id], ["name"], ["Legacy"])
+        tiny_png = _upload_png_bytes()
+        bridge.save_parquet(
+            str(d / "segment.parquet"),
+            [f"{session_id}:_source", f"{session_id}:_background"],
+            ["image_bytes", "background_image_bytes"],
+            [aa_persistence._b64(tiny_png), aa_persistence._b64(tiny_png)],
+        )
+
+        raw = aa_persistence.read_session_raw(session_id)
+        assert set(raw["pass_images"].keys()) == {1}
+
+    def test_reconstructed_session_resumes_at_pass_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(aa_persistence, "STORAGE_ROOT", tmp_path / "sf_storage")
         fake_processor = FakeProcessor()
         fake_service = SegmentationService(tmp_path / "sessions", fake_processor)
@@ -294,7 +368,59 @@ class TestOldSessionMigration:
         sf_session = fake_service.sf_sessions[session_id]
         assert len(sf_session.masks) == 1
         migrated = sf_session.masks[0]
-        assert migrated.mask_id == f"foreground:{old_mask_id}"
-        assert migrated.mask_type is sf_engine.MaskType.IN
-        assert migrated.pass_ is sf_engine.Pass.FOREGROUND
-        assert sf_session.pass_ is sf_engine.Pass.FOREGROUND
+        assert migrated.mask_id == f"0:{old_mask_id}"
+        assert migrated.pass_ == 0
+        assert migrated.dataset_status == sf_engine.DatasetStatus.UNASSIGNED
+        assert sf_session.pass_ == 0
+
+
+class TestCompileTrainingSet:
+    """Only dataset_status == keep AND captioned masks reach the compiled
+    snapshot — the implicit-discard behavior, proven end to end through the
+    real HTTP + compile pipeline, not just at the sf_engine unit level."""
+
+    def test_only_captioned_keeper_is_compiled(self, client, tmp_path):
+        session_id = _upload(client)
+        keeper_id = _box_select(client, session_id, [0.2, 0.2, 0.2, 0.2])
+        balloon_id = _box_select(client, session_id, [0.7, 0.7, 0.2, 0.2], text_substitute="word balloon")
+        _hold(client, session_id, keeper_id, True)
+        _caption(client, session_id, keeper_id, "a red egg")
+        _hold(client, session_id, balloon_id, True)  # held, but never captioned
+
+        client.post("/lama/scrub", json={"session_id": session_id})
+        client.post("/saveSession", json={"session_id": session_id})
+
+        out_dir = tmp_path / "compiled"
+        r = client.post("/dataset/compile", json={"output_dir": str(out_dir)})
+        assert r.status_code == 200
+        result = r.json()
+        assert result["entry_count"] == 1
+
+        lines = (out_dir / "metadata.jsonl").read_text().strip().splitlines()
+        assert len(lines) == 1
+        import json as _json
+        entry = _json.loads(lines[0])
+        assert entry["text"] == "a red egg"
+        assert entry["segment_id"] == keeper_id
+        assert (out_dir / entry["file_name"]).exists()
+
+    def test_compile_is_idempotent_across_two_sessions(self, client, tmp_path):
+        s1 = _upload(client)
+        m1 = _box_select(client, s1, [0.2, 0.2, 0.2, 0.2])
+        _caption(client, s1, m1, "first image's keeper")
+        client.post("/saveSession", json={"session_id": s1})
+
+        out_dir = tmp_path / "compiled"
+        r1 = compile_training_set.compile_training_set(str(out_dir))
+        assert r1["entry_count"] == 1
+
+        s2 = _upload(client)
+        m2 = _box_select(client, s2, [0.3, 0.3, 0.2, 0.2])
+        _caption(client, s2, m2, "second image's keeper")
+        client.post("/saveSession", json={"session_id": s2})
+
+        r2 = compile_training_set.compile_training_set(str(out_dir))
+        assert r2["entry_count"] == 2  # re-run picked up both, not appended onto the first run's file
+
+        lines = (out_dir / "metadata.jsonl").read_text().strip().splitlines()
+        assert len(lines) == 2
