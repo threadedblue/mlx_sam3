@@ -883,6 +883,19 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// A Target/Avoid prompt with nothing recorded (`mask_ids` empty) draws
+  /// its marker exactly like one that found something -- a small dot,
+  /// accumulating with every click -- which is easy to mistake for "a mask
+  /// should have appeared here" (the investigation's Case F/G: three Avoid
+  /// clicks with no Target, landing on unintended objects, giving no
+  /// feedback that nothing was ever selected). This distinguishes the two
+  /// in the same status line the "Done" label already occupies, rather
+  /// than adding a new UI element.
+  String _promptStatusLabel(Map<String, dynamic>? result) {
+    final maskIds = result?['mask_ids'] as List?;
+    return (maskIds == null || maskIds.isEmpty) ? '0 objects found' : 'Done';
+  }
+
   Future<void> _sendBoxPrompt(List<double> box) async {
     if (_sessionId == null) return;
     setState(() { _isLoading = true; _boxRunning = true; _boxResult = []; });
@@ -894,7 +907,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _result = response['results'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
-          _boxResult = [const ResultDatum(label: 'Status', value: 'Done')];
+          _boxResult = [ResultDatum(label: 'Status', value: _promptStatusLabel(_result))];
         });
       }
     } catch (e) {
@@ -916,7 +929,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _result = response['results'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
-          _pointResult = [const ResultDatum(label: 'Status', value: 'Done')];
+          _pointResult = [ResultDatum(label: 'Status', value: _promptStatusLabel(_result))];
         });
       }
     } catch (e) {
@@ -938,6 +951,16 @@ class _HomeScreenState extends State<HomeScreen> {
           _result = response['results'] as Map<String, dynamic>?;
           _textController.clear();
           _updateSegmentsFromResult();
+          // Deliberately NOT the `?? _focusedMaskId` fallback the box/point
+          // handlers use (there, a null selected_mask_id means "recorded
+          // nothing new, keep whatever was focused" — see add_box_selection's
+          // negative-label case). A reset discards this pass's records
+          // outright, so focus has to actually clear, not just skip an
+          // update: reset now backend-clears sf_session.last_touched_mask_id
+          // too, but that alone can't fix this side — this method never
+          // read selected_mask_id at all before, so _focusedMaskId would
+          // otherwise keep pointing at a mask reset just deleted.
+          _focusedMaskId = null;
           _resultsResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
       }
@@ -956,8 +979,35 @@ class _HomeScreenState extends State<HomeScreen> {
       final response = await _api.scrubLamaBackground(_sessionId!);
       if (!mounted) return;
       if (response != null) {
+        // /lama/scrub returns the new pass's actual image (LaMa applied to
+        // the held set) as image_b64 -- decode it now, the same way
+        // _loadLaunchSession/the upload path do, so the canvas shows the
+        // scrubbed result instead of the pre-scrub image with its masks
+        // silently cleared out from under it.
+        final b64 = response['image_b64'] as String?;
+        Uint8List? bytes;
+        ui.Image? decoded;
+        if (b64 != null && b64.isNotEmpty) {
+          try {
+            bytes = base64Decode(b64);
+            decoded = await _decodeImage(bytes);
+          } catch (e) {
+            debugPrint('Could not decode scrubbed image: $e');
+            bytes = null;
+            decoded = null;
+          }
+        }
+        if (!mounted) return;
         setState(() {
           _lastScrubLabel = "Pass ${response['from_pass']} → Pass ${response['to_pass']}";
+          if (bytes != null && decoded != null) {
+            _imageBytes = bytes;
+            _uiImage = decoded;
+            _imageSize = Size(
+              (response['width'] as num?)?.toDouble() ?? decoded.width.toDouble(),
+              (response['height'] as num?)?.toDouble() ?? decoded.height.toDouble(),
+            );
+          }
           // The pass just changed; whatever was focused/shown belonged to
           // the pass before the scrub and has no live geometry in the new
           // one's result set (serialize_sf_masks only returns the current

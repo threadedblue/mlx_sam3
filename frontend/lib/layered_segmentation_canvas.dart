@@ -137,29 +137,23 @@ class MasksPainter extends CustomPainter {
   MasksPainter({required this.segments, required this.showOriginal});
 
   /// Green for a captioned keeper, red for a record queued in the pending
-  /// scrub batch, the original neutral colours otherwise (see
-  /// [Segment.datasetStatus]/[Segment.held]).
+  /// scrub batch is a SEPARATE, independent cue (the border stroke below) —
+  /// the two axes are independent in the v2 model (a captioned keeper can
+  /// still be held for a later scrub) and were colliding when `held` also
+  /// overrode fill color: both used red, and red is already owned by
+  /// Target/Avoid prompt markers (a third, unrelated meaning for the same
+  /// hue). Fill color no longer varies with `held` at all — see [paint]'s
+  /// border pass for how holding is actually shown.
   ///
-  /// `held` wins over `datasetStatus` when both are true (a captioned
-  /// keeper can still be held for a later scrub, per the design doc) —
-  /// "about to be scrubbed" is the more time-sensitive thing to flag at a
-  /// glance than "already captioned". This priority, and reusing red/green
-  /// for held/keep rather than adding a third hue, is my own call: the v2
-  /// design doc left canvas styling as an open item (§8), unlike the v1
-  /// green=in/red=out convention the Blender mockup specified directly.
-  ///
-  /// Hues are the same literals the mask-type/polarity toggles use, so the
-  /// canvas and the controls agree. Typed masks get slightly stronger
-  /// alphas than the neutral ones — 0x007F00 at the old 0.2 fill is nearly
-  /// invisible over artwork, and these need to be read at a glance to be
-  /// useful. Those alphas are my choice, not sourced from a mockup.
+  /// Green is the same literal the "keep"/caption-mode UI already uses
+  /// elsewhere, so the canvas and the controls agree. `keep` gets a
+  /// stronger alpha than the neutral fallback — 0x007F00 at the old 0.2
+  /// fill is nearly invisible over artwork, and this needs to be read at a
+  /// glance to be useful. That alpha is my choice, not sourced from a
+  /// mockup. Neutral (unassigned, not held) is UNCHANGED from the original
+  /// pre-v2 painter: dark grey with Original shown, bright cyan without.
   ({ui.Color color, double fill, double stripe, double border}) _paletteFor(Segment segment) {
     const green = ui.Color(0xFF007F00);
-    const red = ui.Color(0xFFFF0000);
-    if (segment.held) {
-      return (color: red, fill: showOriginal ? 0.28 : 0.6,
-              stripe: showOriginal ? 0.7 : 0.9, border: showOriginal ? 0.9 : 1.0);
-    }
     if (segment.datasetStatus == 'keep') {
       return (color: green, fill: showOriginal ? 0.28 : 0.6,
               stripe: showOriginal ? 0.7 : 0.9, border: showOriginal ? 0.9 : 1.0);
@@ -171,6 +165,14 @@ class MasksPainter extends CustomPainter {
             stripe: showOriginal ? 0.5 : 0.8, border: showOriginal ? 0.3 : 1.0);
   }
 
+  // Amber, not red or green — held is its own axis from dataset_status, and
+  // red/green are both already spoken for (Target/Avoid markers; keep
+  // fill). Solid rather than dashed: no path-dashing utility exists in this
+  // codebase yet, and drawing one (or adding a package for it) is more
+  // than a color cue needs — the color change alone reads clearly at a
+  // glance against every fill state.
+  static const _heldBorderColor = ui.Color(0xFFFFA000);
+
   @override
   void paint(Canvas canvas, Size size) {
     for (final segment in segments) {
@@ -180,7 +182,9 @@ class MasksPainter extends CustomPainter {
         ..color = palette.color.withValues(alpha: palette.fill)
         ..style = PaintingStyle.fill;
 
-      // Border stroke to outline each mask, making edges more visible
+      // Border stroke to outline each mask. Always the dataset-status hue —
+      // the held cue is drawn separately at the end of this loop, for the
+      // reason documented there.
       final borderPaint = Paint()
         ..color = palette.color.withValues(alpha: palette.border)
         ..strokeWidth = 2.0
@@ -213,6 +217,28 @@ class MasksPainter extends CustomPainter {
 
       // Finally, draw a border around the mask for clear edge definition.
       canvas.drawPath(segment.path, borderPaint);
+
+      // Held cue: an amber outline around the mask's BOUNDS, deliberately
+      // not a stroke of segment.path. That path is built scanline by
+      // scanline — one 1px-tall addRect per RLE run, thousands of them
+      // (main.dart's _updateSegmentsFromResult) — so stroking it strokes
+      // every one of those rects and floods the whole mask with the stroke
+      // colour rather than outlining it. That flooding is invisible while
+      // the stroke matches the fill hue (it just reads as a more saturated
+      // mask, which is what every pass above relies on), but an amber
+      // stroke painted the entire mask amber and buried the green `keep`
+      // fill under it: a captioned mask still looked held-only, which is
+      // exactly the bug this cue caused. Bounds are the one outline that
+      // survives that path shape without a contour trace.
+      if (segment.held) {
+        canvas.drawRect(
+          segment.path.getBounds(),
+          Paint()
+            ..color = _heldBorderColor.withValues(alpha: showOriginal ? 0.9 : 1.0)
+            ..strokeWidth = 2.0
+            ..style = PaintingStyle.stroke,
+        );
+      }
     }
   }
 

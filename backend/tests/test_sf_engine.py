@@ -20,10 +20,11 @@ Run with:  pytest backend/tests/test_sf_engine.py -v
 from __future__ import annotations
 
 import io
+import time
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageFilter
 
 import sf_engine as sfe
 
@@ -444,6 +445,72 @@ class TestSingleInstanceGeometricSelection:
         np.testing.assert_array_equal(recs[0].geometry, _geom(FAR_AWAY[1]))
 
 
+class TestAvoidRefinesRecordedGeometry:
+    """Fix regression: the live investigation's case D. `_select_single`
+    used to return before reconciling on a negative (Avoid) label, so a
+    re-ground that refined an already-recorded object's boundary (or
+    suppressed unrelated generalisations, as observed live: 17 raw
+    instances -> 10, and the targeted figure's own mask 2317px -> 2297px,
+    IoU 0.987) left the RECORDED MaskRecord frozen at its pre-refinement
+    shape forever. This class pins that the reconciliation the text-prompt
+    path already does (match by geometry, refresh in place) also runs for
+    box/point calls regardless of label."""
+
+    REFINED = (2, 6, 2, 5)  # DRAWN = (2, 6, 2, 6), shrunk by one column — high IoU, not identical
+
+    def test_avoid_after_target_refreshes_the_recorded_geometry(self):
+        seg = FakeSam3()
+        seg.geo_rects = [DRAWN]
+        session = _session(seg)
+
+        target = session.add_box_selection(_norm_box(DRAWN), True, "figure")
+        assert len(target) == 1
+        mask_id = target[0].mask_id
+        original_geometry = target[0].geometry.copy()
+
+        # Simulate the live scenario: an Avoid prompt re-grounds and comes
+        # back with a refined (not identical) boundary for the same figure.
+        seg.geo_rects = [self.REFINED]
+        avoid_result = session.add_point_selection(_norm_point(4, 3), False, "avoid this part")
+
+        assert avoid_result == []  # still no new selection
+        assert len(session.masks) == 1  # not duplicated
+        refreshed = session.get_mask(mask_id)
+        assert refreshed.mask_id == mask_id  # identity preserved, not a new record
+        np.testing.assert_array_equal(refreshed.geometry, _geom(self.REFINED))
+        assert not np.array_equal(refreshed.geometry, original_geometry)  # proves it actually changed
+
+    def test_avoid_refresh_preserves_caption_and_held(self):
+        seg = FakeSam3()
+        seg.geo_rects = [DRAWN]
+        session = _session(seg)
+
+        target = session.add_box_selection(_norm_box(DRAWN), True, "figure")[0]
+        session.attach_caption(target.mask_id, "a red egg")
+        session.set_held(target.mask_id, True)
+
+        seg.geo_rects = [self.REFINED]
+        session.add_point_selection(_norm_point(4, 3), False, "avoid this part")
+
+        refreshed = session.get_mask(target.mask_id)
+        assert refreshed.dataset_status == sfe.DatasetStatus.KEEP
+        assert refreshed.caption == "a red egg"
+        assert refreshed.held is True
+        np.testing.assert_array_equal(refreshed.geometry, _geom(self.REFINED))
+
+    def test_avoid_with_no_matching_prior_record_still_records_nothing(self):
+        """Unrelated Avoid prompts must not be affected by this fix — no
+        prior record to refine, so behaviour stays exactly as before."""
+        seg = FakeSam3()
+        seg.geo_rects = [DRAWN] + FAR_AWAY
+        session = _session(seg)
+
+        recs = session.add_box_selection(_norm_box(DRAWN), False, "avoid me")
+
+        assert recs == []
+        assert session.masks == []
+
+
 # ---------------------------------------------------------------------------
 # Selection, holding and captioning are independent
 # ---------------------------------------------------------------------------
@@ -601,6 +668,274 @@ class TestHeldBatchScrubbing:
         assert session.last_scrub is None
         with pytest.raises(ValueError):
             session.image_for_pass(1)
+
+
+# ---------------------------------------------------------------------------
+# LaMa's device: MPS, not SimpleLama's own cuda-or-cpu default
+# ---------------------------------------------------------------------------
+
+class TestLamaInpainterDeviceSelection:
+    """Fix regression: SimpleLama's own default only checks
+    torch.cuda.is_available() -- no MPS branch at all -- so on this
+    Apple Silicon machine it silently ran on CPU despite MPS being
+    available. Measured on the same page/mask TestLamaMaskDilation and
+    TestLamaPaddingCroppedBeforeNextPass use: 28.92s per scrub on CPU vs
+    1.76s on MPS (16.5x), output numerically equivalent (max channel diff
+    1/255 across 4.1M pixels). LamaInpainter.__init__ must pass an
+    explicit device rather than rely on that default.
+
+    Mocks SimpleLama's constructor rather than loading the real
+    multi-hundred-MB torchscript checkpoint -- this only needs to prove
+    LamaInpainter asks for the right device; the real inpaint() code path
+    (dilation, crop-back) is already covered by the other Lama test
+    classes via LamaInpainter.__new__, and end-to-end correctness on MPS
+    was verified live in the investigation, not re-proven here.
+    """
+
+    def _capture_simplelama_device(self, monkeypatch, device_str: str) -> dict:
+        import lora_trainer
+        import simple_lama_inpainting
+
+        monkeypatch.setattr(lora_trainer, "_device", lambda: device_str)
+        seen: dict = {}
+
+        class FakeSimpleLama:
+            def __init__(self, device):
+                seen["device"] = device
+
+        monkeypatch.setattr(simple_lama_inpainting, "SimpleLama", FakeSimpleLama)
+        return seen
+
+    def test_constructs_simplelama_with_mps_when_lora_trainer_selects_it(self, monkeypatch):
+        import torch
+
+        seen = self._capture_simplelama_device(monkeypatch, "mps")
+
+        sfe.LamaInpainter()
+
+        assert seen["device"] == torch.device("mps")
+
+    def test_follows_lora_trainers_cuda_and_cpu_selection_too(self, monkeypatch):
+        """Not just MPS -- LamaInpainter defers to _device()'s full
+        cuda->mps->cpu precedence, whatever it resolves to, rather than
+        hardcoding "mps" itself."""
+        import torch
+
+        for device_str in ("cuda", "cpu"):
+            seen = self._capture_simplelama_device(monkeypatch, device_str)
+            sfe.LamaInpainter()
+            assert seen["device"] == torch.device(device_str)
+
+
+# ---------------------------------------------------------------------------
+# LaMa's own padding: cropped back before it becomes a pass image
+# ---------------------------------------------------------------------------
+
+class TestLamaPaddingCroppedBeforeNextPass:
+    """Fix regression: simple_lama_inpainting pads its input to a multiple
+    of 8 before running the model (prepare_img_and_mask/pad_img_to_modulo,
+    padding added only at the bottom/right) and returns that padded output
+    as-is -- confirmed live on a real scrub: a 1791x2298 source came back
+    1792x2304. Left uncropped, that becomes the next pass's image via
+    set_image, silently shifting every later pass's mask coordinates
+    relative to the true image -- exactly what a recursive peel
+    (select-in-revealed-background -> hold -> scrub again) depends on being
+    correct.
+
+    `LamaInpainter.__init__` unconditionally constructs a real `SimpleLama`
+    (downloads/loads a torchscript checkpoint), so these tests bypass it
+    with `__new__` and swap in a fake `_lama` that reproduces the padding
+    behaviour without the real model -- exercising the actual `inpaint()`
+    crop this fix added, not a reimplementation of it.
+    """
+
+    ORIGINAL_SIZE = (1791, 2298)  # (width, height) -- same shape as the live case
+
+    def _padding_lama_inpainter(self) -> sfe.LamaInpainter:
+        inpainter = sfe.LamaInpainter.__new__(sfe.LamaInpainter)
+
+        def fake_lama(image, mask_image):
+            def ceil_modulo(x, mod):
+                return x if x % mod == 0 else (x // mod + 1) * mod
+            w, h = image.size
+            padded = Image.new("RGB", (ceil_modulo(w, 8), ceil_modulo(h, 8)), (0, 0, 0))
+            padded.paste(image, (0, 0))
+            return padded
+
+        inpainter._lama = fake_lama
+        return inpainter
+
+    def test_inpaint_crops_the_padded_result_back_to_the_input_size(self):
+        inpainter = self._padding_lama_inpainter()
+        image = Image.new("RGB", self.ORIGINAL_SIZE, (10, 20, 30))
+        mask = np.zeros((self.ORIGINAL_SIZE[1], self.ORIGINAL_SIZE[0]), dtype=bool)
+        mask[100:200, 100:200] = True
+
+        result = inpainter.inpaint(image, mask)
+
+        assert result.size == self.ORIGINAL_SIZE  # not (1792, 2304)
+        assert result.mode == "RGBA"
+
+    def test_scrub_produces_a_correctly_sized_next_pass_image(self):
+        """Through the real SFSession.run_lama_pass integration path, not
+        just the isolated crop -- this is the regression case the padding
+        bug would otherwise produce: a subsequent selection's pixel math
+        (in a real Sam3Processor) is computed against whatever size
+        `set_image` actually received, so that size has to be right too,
+        not just what `image_for_pass` later reports."""
+        seg = FakeSam3()
+        buf = io.BytesIO()
+        Image.new("RGB", self.ORIGINAL_SIZE, (5, 5, 5)).save(buf, format="PNG")
+        session = sfe.SFSession("sess-pad", sfe.ImmutableOriginal(buf.getvalue()), seg, seg.set_image(None))
+        assert session.image_for_pass(0).size == self.ORIGINAL_SIZE
+
+        a = _select_one(session, seg, "a", (0, 3, 0, 3))
+        session.set_held(a.mask_id, True)
+
+        session.run_lama_pass(self._padding_lama_inpainter())
+
+        assert session.image_for_pass(session.pass_).size == self.ORIGINAL_SIZE  # not padded
+        # What the (fake, but otherwise faithful) segmentor's set_image
+        # actually received -- a real Sam3Processor derives
+        # state["original_width"/"height"] from exactly this, which every
+        # later selection's pixel math is computed against.
+        assert seg.images_set[-1].size == self.ORIGINAL_SIZE
+
+
+class TestLamaMaskDilation:
+    """Regression: a scrubbed object left a crisp, correctly-shaped ghost
+    behind. Neither the frontend's segment list nor the engine's per-pass
+    records were at fault (both clear correctly) — the outline was baked
+    into LaMa's own output, because SAM3's mask stops at the object's
+    interior and its ink contour sits just OUTSIDE the mask, so inpainting
+    never touched it. The mask has to be grown before it reaches the model.
+    """
+
+    def _recording_inpainter(self):
+        """Real LamaInpainter with the checkpoint-loading __init__ skipped,
+        so the actual inpaint() path runs while `_lama` just records the
+        mask it was handed."""
+        inpainter = sfe.LamaInpainter.__new__(sfe.LamaInpainter)
+        seen: dict = {}
+
+        def fake_lama(image, mask_image):
+            seen["mask"] = np.array(mask_image)
+            return image
+
+        inpainter._lama = fake_lama
+        return inpainter, seen
+
+    def test_mask_reaching_lama_is_grown_past_the_object_edge(self):
+        inpainter, seen = self._recording_inpainter()
+        mask = np.zeros((60, 60), dtype=bool)
+        mask[20:40, 20:40] = True
+
+        inpainter.inpaint(Image.new("RGB", (60, 60), (255, 255, 255)), mask)
+
+        grown = seen["mask"] > 0
+        r = sfe._MASK_DILATION_PX
+        assert grown[mask].all(), "dilation must never drop any requested pixel"
+        assert int(grown.sum()) > int(mask.sum())
+        # Grown by exactly r in each direction — enough to clear the object's
+        # own contour, and no further (an over-grown mask eats unselected art).
+        assert grown[20 - r, 30] and grown[39 + r, 30]
+        assert grown[30, 20 - r] and grown[30, 39 + r]
+        assert not grown[20 - r - 1, 30]
+        assert not grown[30, 20 - r - 1]
+
+    def test_an_empty_mask_stays_empty(self):
+        """Dilating nothing must not invent a region to inpaint — an empty
+        held batch never reaches here (run_lama_pass skips the call), but a
+        mask that unions to nothing must not become a scrub of the page."""
+        inpainter, seen = self._recording_inpainter()
+
+        inpainter.inpaint(Image.new("RGB", (30, 30), (0, 0, 0)), np.zeros((30, 30), dtype=bool))
+
+        assert not (seen["mask"] > 0).any()
+
+
+class TestMaskDilationIsBoundingBoxScoped:
+    """Performance fix: the dilation above originally ran
+    ImageFilter.MaxFilter over the WHOLE page regardless of mask size —
+    fine at ~0.6s next to a ~29s CPU scrub, not fine next to a ~1.76s
+    MPS-accelerated one (roughly a third of it). `_dilate_mask` scopes the
+    filter to the mask's bounding box (+ the dilation radius as margin)
+    instead. This is a pure performance change — every assertion here is
+    about the two approaches producing IDENTICAL output, not new
+    behaviour, mirroring the same real mask (a 1791x2298 page, ~19.5k px
+    egg-shaped selection) the live investigation measured: full-page took
+    576.8ms there, bbox-scoped took 5.9ms — 98x, both bit-for-bit equal.
+    """
+
+    @staticmethod
+    def _full_page_dilate(mask_image: Image.Image, radius: int) -> Image.Image:
+        """The ORIGINAL implementation, kept only as this test's oracle."""
+        for _ in range(radius):
+            mask_image = mask_image.filter(ImageFilter.MaxFilter(3))
+        return mask_image
+
+    def _realistic_page_mask(self) -> Image.Image:
+        """Same scale and rough shape as the real mask this was measured
+        against (an ellipse standing in for the egg SAM3 selected) — built
+        synthetically so this test doesn't depend on a real image fixture,
+        but at a page/mask size where bbox-scoping actually matters."""
+        width, height = 1791, 2298
+        mask = np.zeros((height, width), dtype=np.uint8)
+        yy, xx = np.ogrid[:height, :width]
+        cx, cy, rx, ry = 717, 1135, 95, 67  # centre/radii approximating the real egg
+        ellipse = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2 <= 1
+        mask[ellipse] = 255
+        return Image.fromarray(mask, mode="L")
+
+    def test_identical_to_full_page_dilation_on_a_realistic_mask(self):
+        mask_image = self._realistic_page_mask()
+
+        full = np.array(self._full_page_dilate(mask_image.copy(), sfe._MASK_DILATION_PX))
+        bboxed = np.array(sfe._dilate_mask(mask_image.copy(), sfe._MASK_DILATION_PX))
+
+        np.testing.assert_array_equal(bboxed, full)
+
+    def test_identical_on_an_empty_mask(self):
+        empty = Image.new("L", (400, 300), 0)
+
+        full = np.array(self._full_page_dilate(empty.copy(), sfe._MASK_DILATION_PX))
+        bboxed = np.array(sfe._dilate_mask(empty.copy(), sfe._MASK_DILATION_PX))
+
+        np.testing.assert_array_equal(bboxed, full)
+        assert not (bboxed > 0).any()
+
+    def test_identical_on_a_mask_touching_the_image_edges(self):
+        """The crop clamps to the image bounds when the object is near an
+        edge — has to reproduce whatever edge behaviour full-page filtering
+        hits there too, not just the interior case."""
+        arr = np.zeros((200, 200), dtype=np.uint8)
+        arr[0:20, 0:20] = 255       # touches the top-left corner
+        arr[190:200, 190:200] = 255  # touches the bottom-right corner
+        edge_mask = Image.fromarray(arr, mode="L")
+
+        full = np.array(self._full_page_dilate(edge_mask.copy(), sfe._MASK_DILATION_PX))
+        bboxed = np.array(sfe._dilate_mask(edge_mask.copy(), sfe._MASK_DILATION_PX))
+
+        np.testing.assert_array_equal(bboxed, full)
+
+    def test_meaningfully_faster_on_a_small_mask_over_a_large_page(self):
+        """Not a hard perf gate (CI timing is noisy) — a wide, deliberately
+        conservative margin (>=5x) against a measured 98x, just enough to
+        catch someone accidentally reintroducing full-page filtering."""
+        mask_image = self._realistic_page_mask()
+
+        t0 = time.perf_counter()
+        self._full_page_dilate(mask_image.copy(), sfe._MASK_DILATION_PX)
+        full_page_seconds = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        sfe._dilate_mask(mask_image.copy(), sfe._MASK_DILATION_PX)
+        bbox_scoped_seconds = time.perf_counter() - t0
+
+        print(f"\n    full-page dilate:  {full_page_seconds*1000:7.1f} ms")
+        print(f"    bbox-scoped dilate: {bbox_scoped_seconds*1000:7.1f} ms"
+              f"  ({full_page_seconds/bbox_scoped_seconds:.1f}x)")
+        assert bbox_scoped_seconds * 5 < full_page_seconds
 
 
 # ---------------------------------------------------------------------------

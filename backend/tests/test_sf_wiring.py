@@ -71,6 +71,16 @@ class FakeProcessor:
         x, y = point
         return self.add_geometric_prompt([x, y, 0.05, 0.05], label, state)
 
+    def reset_all_prompts(self, state):
+        """Mirrors the real Sam3Processor.reset_all_prompts: drops the
+        accumulated geometric-prompt history and the last grounding result.
+        Was missing entirely until /reset's own test coverage needed it —
+        every prior test exercising /reset went through it via `_reset`
+        only implicitly, none actually asserted on its response."""
+        self._geo_boxes = []
+        for key in ("geometric_prompt", "boxes", "masks", "masks_logits", "scores"):
+            state.pop(key, None)
+
     @staticmethod
     def _to_px(cxcywh: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
         cx, cy, w, h = cxcywh
@@ -209,6 +219,63 @@ class TestHttpSelectHoldCaptionScrub:
 
         r = client.post("/mask/hold", json={"session_id": session_id, "mask_id": old_id, "held": True})
         assert r.status_code == 422
+
+    def test_delete_session_clears_the_sf_session_zombie(self, client):
+        """/mask/hold and /mask/caption call get_or_create_sf_session
+        directly — they never call get_session() first — and that method
+        checks the sf_sessions cache before anything else. If DELETE
+        /session/{id} only cleared `service.sessions`, both endpoints would
+        keep succeeding against the deleted session's stale SFSession
+        object indefinitely (only a process restart would actually clear
+        it). This is the exact zombie this test pins.
+        """
+        session_id = _upload(client)
+        mask_id = _box_select(client, session_id, [0.2, 0.2, 0.2, 0.2])
+        assert session_id in main.service.sf_sessions
+
+        r = client.delete(f"/session/{session_id}")
+        assert r.status_code == 200
+
+        assert session_id not in main.service.sessions
+        assert session_id not in main.service.sf_sessions
+
+        r = client.post("/mask/hold", json={"session_id": session_id, "mask_id": mask_id, "held": True})
+        assert r.status_code == 404
+
+        r = client.post("/mask/caption", json={"session_id": session_id, "mask_id": mask_id, "caption": "x"})
+        assert r.status_code == 404
+
+    def test_delete_unknown_session_is_404(self, client):
+        r = client.delete("/session/never-existed")
+        assert r.status_code == 404
+
+    def test_reset_clears_selected_mask_id_and_the_deleted_mask_404s(self, client):
+        """Confirmed live: after /reset, selected_mask_id kept echoing the
+        id of a mask reset had just discarded, in every later /segment/*
+        response, until the backend restarted -- because /reset discarded
+        the record but never cleared sf_session.last_touched_mask_id, the
+        field those responses echo."""
+        session_id = _upload(client)
+        mask_id = _box_select(client, session_id, [0.2, 0.2, 0.2, 0.2])
+
+        r = client.post("/reset", json={"session_id": session_id})
+        assert r.status_code == 200
+        assert r.json().get("selected_mask_id") is None
+
+        # The record itself is gone -- confirms this isn't just the
+        # top-level field being blanked while the object underneath survives.
+        r = client.post("/mask/hold", json={"session_id": session_id, "mask_id": mask_id, "held": True})
+        assert r.status_code == 404
+
+        r = client.post("/mask/caption", json={"session_id": session_id, "mask_id": mask_id, "caption": "x"})
+        assert r.status_code == 404
+
+        # A later no-op call (Avoid with nothing to match) must not revive
+        # the stale id either -- this is the exact case F/G replay from the
+        # investigation that originally surfaced it.
+        r = client.post("/segment/point", json={"session_id": session_id, "point": [0.9, 0.05], "label": False})
+        assert r.status_code == 200
+        assert r.json().get("selected_mask_id") is None
 
 
 class TestSaveReloadRoundTrip:

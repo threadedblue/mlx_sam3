@@ -37,7 +37,7 @@ from enum import Enum
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 import d4m_juliacall_bridge as bridge
 
@@ -107,6 +107,51 @@ class InpaintingEngine(Protocol):
     def inpaint(self, image: Image.Image, mask: np.ndarray) -> Image.Image: ...
 
 
+# Pixels the mask is grown by before it reaches LaMa. SAM3's masks stop at
+# the object's interior, leaving its own outline outside the mask: measured
+# on the page this was root-caused against, 455 dark "ink" pixels sat within
+# 1px outside the mask edge and 1288 within 3px. Inpainting an undilated
+# mask therefore preserves that outline verbatim, so a scrubbed object still
+# reads as a crisp, correctly-shaped ghost however good the fill is. Growing
+# the mask first is standard for LaMa pipelines. 6px clears the contour at
+# this page scale (~1800px wide) while growing the measured mask only ~23%,
+# which matters in the other direction: an over-grown mask eats neighbouring
+# art that was never selected.
+_MASK_DILATION_PX = 6
+
+
+def _dilate_mask(mask_image: Image.Image, radius: int) -> Image.Image:
+    """Grow `mask_image`'s white region by `radius` pixels, scoped to its
+    bounding box (+ `radius` margin) rather than filtering the whole page.
+
+    Iterated 3x3 max-filtering is local: a pixel's dilated value depends
+    only on pixels within `radius` of it, so cropping to the bbox expanded
+    by exactly `radius` on each side (clamped to the image edges — the
+    filter can't grow past a real edge either way, so clamping reproduces
+    the same edge condition full-page filtering would hit) gives every
+    dilated pixel access to everything it could possibly need, and nothing
+    outside that crop can affect the result. Confirmed pixel-identical to
+    full-page filtering on the real mask that found the ghost-artifact bug
+    (TestMaskDilationIsBoundingBoxScoped) and measured meaningfully faster
+    on it: filtering scales with the mask's size, not the page's, and a
+    ~20k px mask on a 1791x2298 page was previously ~0.6s of a ~1.76s
+    post-MPS scrub — a fraction of that page for a mask this size.
+    """
+    bbox = mask_image.getbbox()
+    if bbox is None:
+        return mask_image  # nothing set; nothing to grow
+    width, height = mask_image.size
+    x0, y0, x1, y1 = bbox
+    cx0, cy0 = max(0, x0 - radius), max(0, y0 - radius)
+    cx1, cy1 = min(width, x1 + radius), min(height, y1 + radius)
+    crop = mask_image.crop((cx0, cy0, cx1, cy1))
+    for _ in range(radius):
+        crop = crop.filter(ImageFilter.MaxFilter(3))
+    grown = Image.new("L", (width, height), 0)
+    grown.paste(crop, (cx0, cy0))
+    return grown
+
+
 class LamaInpainter:
     """LaMa (Large Mask Inpainting via Fast Fourier Convolutions).
 
@@ -117,13 +162,56 @@ class LamaInpainter:
     """
 
     def __init__(self) -> None:
+        import torch  # noqa: PLC0415
         from simple_lama_inpainting import SimpleLama  # noqa: PLC0415
 
-        self._lama = SimpleLama()
+        from lora_trainer import _device  # noqa: PLC0415
+
+        # SimpleLama's own default only checks torch.cuda.is_available() —
+        # no MPS branch at all (confirmed by reading its installed source)
+        # — so on this machine it silently ran on CPU despite MPS being
+        # available: 28.92s per scrub, measured on the same page/mask that
+        # found the mask-dilation ghost bug above, vs 1.76s on MPS (16.5x),
+        # with output numerically equivalent (max channel diff 1/255 across
+        # 4.1M pixels). LaMa's Fourier convolutions need FFT ops that are
+        # natively supported on MPS under this torch version — confirmed
+        # with PYTORCH_ENABLE_MPS_FALLBACK=0, so any unsupported op would
+        # have raised rather than silently falling back to CPU per-op.
+        #
+        # Device has to be supplied at construction, not set after:
+        # SimpleLama stores it and uses it to place INPUT tensors in
+        # prepare_img_and_mask, so a post-hoc `.to(device)` on the loaded
+        # module would move the weights but leave inputs on whatever
+        # device the default put them on — a device mismatch. Reusing
+        # lora_trainer's own _device() (same cuda->mps->cpu precedence
+        # already used for the training path) rather than writing new
+        # device-selection logic here. _dtype() is NOT reused: the
+        # checkpoint is float32, and _dtype()'s own comment notes fp16 is
+        # unsafe on MPS regardless.
+        self._lama = SimpleLama(device=torch.device(_device()))
 
     def inpaint(self, image: Image.Image, mask: np.ndarray) -> Image.Image:
         mask_image = Image.fromarray((mask > 0).astype(np.uint8) * 255, mode="L")
+        # Grow the mask past the object's own edge — see _MASK_DILATION_PX
+        # and _dilate_mask. Done here rather than in
+        # `_union_mask`/`run_lama_pass` because it is a property of what
+        # this inpainter needs, not of what the user selected: the
+        # engine's union stays exactly the held set, which is what its own
+        # tests pin (with fake inpainters that need no such margin).
+        mask_image = _dilate_mask(mask_image, _MASK_DILATION_PX)
         result = self._lama(image.convert("RGB"), mask_image)
+        # simple_lama_inpainting pads its input to a multiple of 8
+        # (pad_img_to_modulo, padding added only at the bottom/right — see
+        # its prepare_img_and_mask) and returns the padded output as-is,
+        # with no crop-back step of its own. Confirmed live: a 1791x2298
+        # source came back as 1792x2304. Left uncropped, this result
+        # becomes the next pass's image via set_image, silently shifting
+        # every subsequent pass's mask coordinates relative to the
+        # original — the exact case a recursive peel (select in revealed
+        # background -> hold -> scrub again) depends on being correct.
+        # Padding is on the end, not the start, so a top-left crop back to
+        # the pre-padding size recovers the original-registered pixels.
+        result = result.crop((0, 0, image.width, image.height))
         return result.convert("RGBA")
 
 
@@ -468,13 +556,6 @@ class SFSession:
         """
         self.state = apply(self.state)
 
-        # A negative ("Avoid") prompt is a grounding hint, not a selection —
-        # it tells SAM3 what to exclude from the concept. Recording a mask
-        # for it would mint a phantom selection over a region the user was
-        # explicitly ruling out, so the state updates but nothing is logged.
-        if not label:
-            return []
-
         raw_masks = self.state.get("masks")
         raw_masks = [] if raw_masks is None else raw_masks
         raw_boxes = self.state.get("boxes")
@@ -486,26 +567,60 @@ class SFSession:
         if not geometries:
             return []
 
+        # Reconcile EVERY raw instance against this pass's existing records
+        # by geometry (IoU) — regardless of `label`. `add_geometric_prompt`
+        # re-runs grounding over the whole accumulated prompt set on every
+        # call (aa_persistence.py's module docstring), so an Avoid prompt
+        # can refine an already-recorded object's boundary (e.g.
+        # suppressing a neighbour that previously bled into it) even though
+        # it creates no new selection of its own. Returning before this ran
+        # for label=False left the refined geometry stranded in raw SAM3
+        # output forever, with the recorded MaskRecord frozen pre-refinement
+        # — confirmed live: an Avoid point shrank an already-selected
+        # figure's own raw mask (2317px -> 2297px, IoU 0.987) while the
+        # recorded copy stayed byte-identical. Same matching this module's
+        # `_select` already uses for text prompts, applied here too: only
+        # the geometry changes on a match (`replace(match, geometry=...)`),
+        # so mask_id/dataset_status/held/caption all survive untouched.
+        # `matched_mask_id_by_index` records which prior mask_id (if any)
+        # each geometry index resolved to, so the later `pick(...)` step can
+        # tell whether the drawn box/point's own instance was one of them.
+        prior = [m for m in self.masks if m.pass_ == self._pass]
+        taken: set[str] = set()
+        refreshed: dict[str, MaskRecord] = {}
+        matched_mask_id_by_index: dict[int, str] = {}
+        for i, geometry in enumerate(geometries):
+            match = _best_match(geometry, prior, taken)
+            if match is not None:
+                taken.add(match.mask_id)
+                refreshed[match.mask_id] = replace(match, geometry=geometry)
+                matched_mask_id_by_index[i] = match.mask_id
+        if refreshed:
+            self.masks = [refreshed.get(m.mask_id, m) for m in self.masks]
+
+        # A negative ("Avoid") prompt is a grounding hint, not a selection —
+        # it tells SAM3 what to exclude from the concept. The reconciliation
+        # above already applied any resulting geometry refinement to
+        # existing records; nothing new is logged, and focus (below) is
+        # left wherever it was — an Avoid call doesn't by itself say which
+        # object the user now means to focus on.
+        if not label:
+            return []
+
         width = self.state.get("original_width") or self.original.size[0]
         height = self.state.get("original_height") or self.original.size[1]
         idx = pick(geometries, raw_boxes, raw_scores, width, height)
         if idx is None:
             return []
 
+        # The drawn box/point's own instance was already reconciled above
+        # (it refined an existing record) — not a new selection.
+        if idx in matched_mask_id_by_index:
+            self.last_touched_mask_id = matched_mask_id_by_index[idx]
+            return []
+
         geometry = geometries[idx]
         score = float(np.array(raw_scores[idx])) if idx < len(raw_scores) else None
-
-        # Re-selecting an object already recorded in this pass refreshes its
-        # geometry rather than minting a duplicate record.
-        prior = [m for m in self.masks if m.pass_ == self._pass]
-        match = _best_match(geometry, prior, set())
-        if match is not None:
-            self.masks = [
-                replace(m, geometry=geometry) if m.mask_id == match.mask_id else m
-                for m in self.masks
-            ]
-            self.last_touched_mask_id = match.mask_id
-            return []
 
         record = MaskRecord(
             mask_id=f"{self._pass}:{uuid.uuid4()}",

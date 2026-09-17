@@ -70,7 +70,13 @@ class LBSCard extends StatelessWidget {
                 // height is theme-default (no explicit height set), which
                 // is why this doesn't set one either.
                 child: ElevatedButton(
-                  onPressed: isScrubbing ? null : onScrub,
+                  // Disabled with nothing held, not just while a scrub is
+                  // in flight — /lama/scrub still succeeds and advances the
+                  // pass counter on an empty batch (sf-model-v2-design.md
+                  // §3/§4: no "already scrubbed" state to reject), so
+                  // without this a stray click on an empty pending count
+                  // silently walks the pass forward for no visible effect.
+                  onPressed: (isScrubbing || pendingCount == 0) ? null : onScrub,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF007F00),
                     foregroundColor: Colors.white,

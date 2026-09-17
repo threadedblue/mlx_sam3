@@ -607,6 +607,14 @@ async def reset_prompts(request: SessionRequest):
         sf_session = service.get_or_create_sf_session(request.session_id)
         if sf_session is not None:
             sf_session.masks = [m for m in sf_session.masks if m.pass_ != sf_session.pass_]
+            # The mask `last_touched_mask_id` names may no longer exist
+            # after the line above discards this pass's recorded
+            # selections — confirmed live: it kept echoing a deleted mask's
+            # id in every later /segment/* response's `selected_mask_id`
+            # until the backend restarted, so a UI still focused on it
+            # could route a Hold/Caption call at a dangling id instead of a
+            # reset being a clean slate.
+            sf_session.last_touched_mask_id = None
 
         results = serialize_sf_masks(sf_session, state) if sf_session is not None else serialize_state(state)
 
@@ -615,6 +623,7 @@ async def reset_prompts(request: SessionRequest):
             "session_id": request.session_id,
             "message": "All prompts reset",
             "results": results,
+            "selected_mask_id": sf_session.last_touched_mask_id if sf_session is not None else None,
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2)
         }

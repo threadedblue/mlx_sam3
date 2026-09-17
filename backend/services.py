@@ -442,11 +442,19 @@ class SegmentationService:
         return response
 
     def delete_session_memory(self, session_id: str) -> bool:
-        """Remove session from memory."""
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-            return True
-        return False
+        """Remove session from memory — both caches, not just `self.sessions`.
+
+        `self.sf_sessions` used to survive this: `/mask/hold` and
+        `/mask/caption` call `get_or_create_sf_session` directly, which
+        checks `self.sf_sessions` FIRST, before ever consulting
+        `self.sessions` — so leaving the SFSession behind let those two
+        endpoints keep succeeding against a "deleted" session's zombie
+        object indefinitely (only a process restart actually cleared it).
+        Returns True if either cache held something to remove.
+        """
+        had_session = self.sessions.pop(session_id, None) is not None
+        had_sf_session = self.sf_sessions.pop(session_id, None) is not None
+        return had_session or had_sf_session
 
     def list_disk_sessions(self) -> List[str]:
         """List all sessions saved to disk."""
