@@ -19,6 +19,7 @@ Run with:  pytest backend/tests/test_sf_engine.py -v
 
 from __future__ import annotations
 
+import base64
 import io
 import time
 
@@ -1013,4 +1014,113 @@ class TestExport:
 
         rows = _payload_rows(*sfe.build_sf_payload(session))
 
-        assert set(rows[f"sess-1:{rec.mask_id}"]) == {"pass", "caption", "mask_png_bytes"}
+        assert set(rows[f"sess-1:{rec.mask_id}"]) == {"pass", "caption", "crop_png_bytes"}
+
+
+class TestExportCropBytesNotMaskGeometry:
+    """Regression: build_sf_payload used to export mask_png_bytes — a
+    binary black/white silhouette of the mask geometry — instead of the
+    segmented object itself. Real training/handoff data needs the object
+    as it actually appears, cut out via the mask as an alpha channel,
+    matching aa_persistence.py's own _crop_png_bytes (this module's
+    _crop_png_bytes is a faithful port, not a shared import — see its own
+    docstring for why the import can't go the other way).
+
+    Assertions here check actual pixel VALUES against the source image, not
+    just "the bytes changed" or "the key is present" — a geometry export
+    also produces valid, differently-shaped PNG bytes under any key name,
+    so only checking for non-mask-like content can catch a regression back
+    to exporting geometry.
+    """
+
+    @staticmethod
+    def _patterned_png(width: int, height: int) -> bytes:
+        """A non-uniform image — each pixel's colour is a function of its
+        own (x, y) — so a correctly-cropped region's pixel values can be
+        checked against this image's ACTUAL content at those coordinates.
+        A flat-colour test image couldn't distinguish "real pixels" from
+        "a coincidentally-matching flat fill"."""
+        arr = np.zeros((height, width, 3), dtype=np.uint8)
+        for y in range(height):
+            for x in range(width):
+                arr[y, x] = (x * 20 % 256, y * 25 % 256, (x + y) * 15 % 256)
+        buf = io.BytesIO()
+        Image.fromarray(arr, mode="RGB").save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_exported_crop_shows_the_objects_real_pixels(self, passthrough_bridge):
+        seg = FakeSam3()
+        seg.geo_rects = [DRAWN]
+        original_bytes = self._patterned_png(SHAPE[1], SHAPE[0])
+        session = sfe.SFSession(
+            "sess-crop", sfe.ImmutableOriginal(original_bytes), seg, seg.set_image(None))
+        rec = session.add_box_selection(_norm_box(DRAWN), True)[0]
+        session.attach_caption(rec.mask_id, "a widget")
+
+        rows = _payload_rows(*sfe.build_sf_payload(session))
+        row = rows[f"sess-crop:{rec.mask_id}"]
+
+        assert "crop_png_bytes" in row
+        assert "mask_png_bytes" not in row  # old key must be gone, not kept alongside the new one
+
+        crop = Image.open(io.BytesIO(base64.b64decode(row["crop_png_bytes"])))
+        assert crop.mode == "RGBA"
+
+        original = Image.open(io.BytesIO(original_bytes)).convert("RGBA")
+        mask = rec.geometry.astype(bool)
+        ys, xs = np.nonzero(mask)
+        assert len(xs) > 0
+
+        # Inside the mask: opaque, and colour matches the ORIGINAL's actual
+        # pixels at that coordinate — not a flat fill a geometry export
+        # (or a wrong-but-plausible constant colour) would produce.
+        for y, x in zip(ys, xs):
+            assert crop.getpixel((int(x), int(y))) == (*original.getpixel((int(x), int(y)))[:3], 255)
+
+        # The masked region is genuinely non-constant (the pattern varies
+        # over it) — a flat binary mask fill, or any single wrong colour,
+        # could never produce this.
+        masked_colors = {crop.getpixel((int(x), int(y)))[:3] for y, x in zip(ys, xs)}
+        assert len(masked_colors) > 1
+
+        # Outside the mask: fully transparent.
+        ys_out, xs_out = np.nonzero(~mask)
+        oy, ox = int(ys_out[0]), int(xs_out[0])
+        assert crop.getpixel((ox, oy))[3] == 0
+
+    def test_a_mask_kept_in_a_later_pass_is_cropped_from_that_passs_image(self, passthrough_bridge):
+        """Not pass 0's original — a scrub between pass 0 and the mask's
+        own pass can repaint pixels; a wrong-pass crop would silently
+        export stale content. FakeSam3's masks aren't real SAM3 geometry
+        (background_image_bytes-style pass images stand in fine here), so
+        this checks the crop against session.image_for_pass(1) directly
+        rather than needing meaningful patterned art in the scrubbed
+        region."""
+        seg = FakeSam3()
+        session = _session(seg)
+        front = _select_one(session, seg, "front", (0, 5, 0, 5))
+        session.set_held(front.mask_id, True)
+        # Paints pass 1's image red exactly where `front` was — pass 0
+        # stays the flat black _tiny_png() original everywhere.
+        session.run_lama_pass(PaintingInpainter(color=(255, 0, 0, 255)))
+
+        # "revealed" sits at the same location `front` occupied — exactly
+        # the recursive-peel case (design doc §1.5/§3): captioned in the
+        # pass that now shows the scrub's repainted pixels there, not
+        # pass 0's original ones.
+        revealed = _select_one(session, seg, "revealed", (1, 4, 1, 4))
+        assert revealed.pass_ == 1
+        session.attach_caption(revealed.mask_id, "a lamp behind the balloon")
+
+        rows = _payload_rows(*sfe.build_sf_payload(session))
+        crop = Image.open(io.BytesIO(base64.b64decode(rows[f"sess-1:{revealed.mask_id}"]["crop_png_bytes"])))
+
+        pass1_image = session.image_for_pass(1)
+        ys, xs = np.nonzero(revealed.geometry)
+        for y, x in zip(ys, xs):
+            y, x = int(y), int(x)
+            assert crop.getpixel((x, y)) == pass1_image.getpixel((x, y))
+            # Confirms this is actually pinning something: pass 0's
+            # original was flat black here, pass 1's is the scrub's red —
+            # if build_sf_payload wrongly used pass 0, this would fail.
+            assert crop.getpixel((x, y))[:3] == (255, 0, 0)

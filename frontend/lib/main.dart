@@ -18,8 +18,10 @@ import 'package:http/http.dart' as http;
 
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:aa_preview_table/aa_preview_table.dart';
 
 import 'services/api_service.dart';
+import 'services/sf_aa_preview_adapter.dart';
 import 'segment_layers_card.dart';
 import 'package:provider/provider.dart';
 import 'layered_segmentation_canvas.dart';
@@ -1187,7 +1189,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
 
-          // Main Canvas
+          // Main display area: Canvas / AA Preview tabs
           Expanded(
             child: Container(
               margin: const EdgeInsets.fromLTRB(0, 16, 16, 16),
@@ -1197,28 +1199,16 @@ class _HomeScreenState extends State<HomeScreen> {
                 border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
               ),
               clipBehavior: Clip.antiAlias,
-              child: (_imageBytes == null)
-                      ? Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(Icons.image_outlined, size: 64, color: Theme.of(context).colorScheme.onSurfaceVariant),
-                              const SizedBox(height: 16),
-                              Text("Enter an Image URL to start", style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant)),
-                            ],
-                          ),
-                        )
-                      : (_uiImage == null)
-                          ? const Center(child: CircularProgressIndicator())
-                          : SegmentationCanvas(
-                              uiImage: _uiImage!,
-                              segments: _segments,
-                              result: _result,
-                              isLoading: _isLoading,
-                              mode: _selectedMode,
-                              onBoxDrawn: _sendBoxPrompt,
-                              onPointDrawn: _sendPointPrompt,
-                            ),
+              child: DisplayAreaTabs(
+                imageBytes: _imageBytes,
+                uiImage: _uiImage,
+                segments: _segments,
+                result: _result,
+                isLoading: _isLoading,
+                mode: _selectedMode,
+                onBoxDrawn: _sendBoxPrompt,
+                onPointDrawn: _sendPointPrompt,
+              ),
             ),
           ),
         ],
@@ -1727,6 +1717,121 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+}
+
+/// The main display area: a "Canvas" tab (unchanged
+/// [LayeredSegmentationCanvas] behaviour via [SegmentationCanvas]) and an
+/// "AA Preview" tab (the shared `aa_preview_table` package, via
+/// [sfResultToAaPayload]).
+///
+/// A standalone widget rather than inline in [_HomeScreenState.build] for
+/// two reasons: it owns its own [TabController] (a ticker, needing its own
+/// `SingleTickerProviderStateMixin`/dispose — no reason to put that on the
+/// much bigger [_HomeScreenState]), and it's directly testable the same
+/// way [SegmentationCanvas] already is, by rebuilding it with new [result]
+/// values rather than driving all of [HomeScreen]'s network/timer setup.
+class DisplayAreaTabs extends StatefulWidget {
+  final Uint8List? imageBytes;
+  final ui.Image? uiImage;
+  final List<Segment> segments;
+  final Map<String, dynamic>? result;
+  final bool isLoading;
+  final SelectionMode? mode;
+  final void Function(List<double>) onBoxDrawn;
+  final void Function(List<double>) onPointDrawn;
+
+  const DisplayAreaTabs({
+    super.key,
+    required this.imageBytes,
+    required this.uiImage,
+    required this.segments,
+    required this.result,
+    required this.isLoading,
+    required this.mode,
+    required this.onBoxDrawn,
+    required this.onPointDrawn,
+  });
+
+  @override
+  State<DisplayAreaTabs> createState() => _DisplayAreaTabsState();
+}
+
+class _DisplayAreaTabsState extends State<DisplayAreaTabs> with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: "Canvas"),
+            Tab(text: "AA Preview"),
+          ],
+        ),
+        Expanded(
+          child: TabBarView(
+            controller: _tabController,
+            children: [
+              _buildCanvasTab(context),
+              // Built directly from `widget.result` on every rebuild of
+              // THIS widget — not computed once and cached — so every
+              // mutation the parent already calls setState() for (select,
+              // hold, caption, scrub) reaches this tab via the ordinary
+              // "new widget, new build()" path, no separate refresh
+              // mechanism. TabBarView builds all of its children up front
+              // (it's a PageView under the hood, not lazy per active tab),
+              // so this recomputes whether or not the tab is currently
+              // visible; for SF's per-pass mask counts that's negligible,
+              // and simpler than gating it on `_tabController.index`,
+              // which would need its own listener for no real benefit.
+              AaPreviewTableWidget(aa: sfResultToAaPayload(widget.result)),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCanvasTab(BuildContext context) {
+    if (widget.imageBytes == null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.image_outlined, size: 64, color: Theme.of(context).colorScheme.onSurfaceVariant),
+            const SizedBox(height: 16),
+            Text("Enter an Image URL to start", style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant)),
+          ],
+        ),
+      );
+    }
+    if (widget.uiImage == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    return SegmentationCanvas(
+      uiImage: widget.uiImage!,
+      segments: widget.segments,
+      result: widget.result,
+      isLoading: widget.isLoading,
+      mode: widget.mode,
+      onBoxDrawn: widget.onBoxDrawn,
+      onPointDrawn: widget.onPointDrawn,
+    );
+  }
 }
 
 class SegmentationCanvas extends StatefulWidget {

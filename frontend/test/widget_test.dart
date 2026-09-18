@@ -1,3 +1,4 @@
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -301,6 +302,128 @@ void main() {
 
       expect(points, isEmpty);
       expect(boxes, isEmpty);
+    });
+  });
+
+  group('DisplayAreaTabs', () {
+    // Tests the tab wiring + live-reactivity mechanism this widget adds,
+    // NOT the shared aa_preview_table package's own rendering/pagination
+    // logic (that has its own 14-test suite) and not SegmentationCanvas's
+    // own selection-mode behaviour (covered above, unchanged by this
+    // widget existing).
+    late ui.Image image;
+
+    setUpAll(() async {
+      image = await _solidImage(200, 200);
+    });
+
+    Widget pumpTabs({
+      Map<String, dynamic>? result,
+      Uint8List? imageBytes,
+    }) =>
+        _wrap(DisplayAreaTabs(
+          imageBytes: imageBytes,
+          uiImage: image,
+          segments: const <Segment>[],
+          result: result,
+          isLoading: false,
+          mode: null,
+          onBoxDrawn: (_) {},
+          onPointDrawn: (_) {},
+        ));
+
+    // AaPreviewTableWidget reloads via AaPreviewWorker's real Isolate.run()
+    // on every non-empty payload (initial mount AND update, via
+    // didUpdateWidget) — genuine async I/O that, like dart:ui rasterization
+    // elsewhere in this file, never advances inside testWidgets' fake-async
+    // zone. While it's pending, the widget shows an indeterminate spinner
+    // (CircularProgressIndicator on first load, LinearProgressIndicator on
+    // a reload), which tickers forever and makes a bare pumpAndSettle()
+    // time out. Only needed once the payload is non-empty — the empty-AA
+    // short-circuit in AaPreviewTableWidget.build() never reaches that
+    // spinner code at all, which is why the earlier empty-state tests don't
+    // need this.
+    Future<void> settleAfterAaLoad(WidgetTester tester) async {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 500)));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('Canvas tab is selected by default and shows the canvas', (tester) async {
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), result: null));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Canvas'), findsOneWidget);
+      expect(find.text('AA Preview'), findsOneWidget);
+      expect(find.byType(SegmentationCanvas), findsOneWidget);
+    });
+
+    testWidgets('AA Preview tab regression check: zero masks shows the '
+        "shared widget's existing empty state", (tester) async {
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), result: null));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('AA Preview'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Empty associative array'), findsOneWidget);
+    });
+
+    testWidgets('AA Preview tab updates live on rebuild, without leaving and returning to the tab',
+        (tester) async {
+      // Starts empty (no selections yet).
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), result: null));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('AA Preview'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Empty associative array'), findsOneWidget);
+
+      // Simulates what _sendBoxPrompt's setState() does in main.dart: a new
+      // `result` map reaches this widget via an ordinary rebuild — nothing
+      // re-taps into the AA Preview tab, it's already the active one.
+      await tester.pumpWidget(pumpTabs(
+        imageBytes: Uint8List(0),
+        result: {
+          'mask_ids': ['0:abc', '0:def'],
+          'dataset_statuses': ['keep', 'unassigned'],
+          'held_flags': [true, false],
+          'passes': [0, 0],
+        },
+      ));
+      await settleAfterAaLoad(tester);
+
+      expect(find.textContaining('Empty associative array'), findsNothing);
+      expect(find.textContaining('2 rows'), findsOneWidget);
+    });
+
+    testWidgets('a scrub (pass transition) is reflected the same way', (tester) async {
+      // Starts empty, same as the real app: _result is genuinely null
+      // before any selection has been made, on both the Canvas and
+      // AA Preview tabs — mounting straight into a populated tab isn't a
+      // sequence that happens in the real app either, only a rebuild
+      // reaching an already-mounted tree does.
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), result: null));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('AA Preview'));
+      await tester.pumpAndSettle();
+
+      await tester.pumpWidget(pumpTabs(
+        imageBytes: Uint8List(0),
+        result: {
+          'mask_ids': ['0:abc'],
+          'dataset_statuses': ['keep'],
+          'passes': [0],
+        },
+      ));
+      await settleAfterAaLoad(tester);
+      expect(find.textContaining('1 rows'), findsOneWidget);
+
+      // _scrubLamaBackground's setState() clears _result to null on a
+      // successful scrub (see main.dart) before the next pass's selections
+      // arrive — confirm that reaches this tab too, live.
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), result: null));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Empty associative array'), findsOneWidget);
     });
   });
 }

@@ -143,6 +143,14 @@ def serialize_sf_masks(sf_session, state: dict) -> dict:
         "held_flags": [m.held for m in records],
         "captions": [m.caption for m in records],
         "text_tags": [m.text_tag for m in records],
+        # Every record here is already filtered to sf_session.pass_ (see the
+        # comprehension above) — an unbounded plain int in the v2 model, not
+        # the old two-value enum — so this is a constant repeated once per
+        # record, not per-record data. Included anyway, parallel to the
+        # other fields, because the AA preview table (SegForge/frontend's
+        # sf_aa_preview_adapter.dart) has no other way to know which pass
+        # a row belongs to; nothing before this consumed a `pass` field.
+        "passes": [sf_session.pass_ for _ in records],
     }
     if "prompted_boxes" in state:
         result["prompted_boxes"] = state["prompted_boxes"]

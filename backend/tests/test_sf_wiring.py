@@ -190,6 +190,28 @@ class TestHttpSelectHoldCaptionScrub:
         assert sf_session.get_mask(keeper_id).dataset_status == sf_engine.DatasetStatus.KEEP
         assert sf_session.get_mask(balloon_id).dataset_status == sf_engine.DatasetStatus.UNASSIGNED
 
+    def test_results_include_the_current_pass_number(self, client):
+        """Fix: serialize_sf_masks never returned a pass number at all —
+        every record in a response is implicitly "whatever pass the
+        session is currently at", but nothing surfaced that number itself.
+        Needed by SegForge/frontend's AA preview adapter, which has no
+        other way to label which pass a row belongs to."""
+        session_id = _upload(client)
+
+        r = client.post("/segment/box", json={"session_id": session_id, "box": [0.2, 0.2, 0.2, 0.2], "label": True})
+        assert r.json()["results"]["passes"] == [0]
+
+        _box_select(client, session_id, [0.7, 0.7, 0.2, 0.2])
+        r = client.post("/segment/box", json={"session_id": session_id, "box": [0.2, 0.2, 0.2, 0.2], "label": True})
+        # Both current-pass records report the same pass — a constant
+        # repeated once per row, not per-record data — matching
+        # serialize_sf_masks' own current-pass-only filter.
+        assert r.json()["results"]["passes"] == [0, 0]
+
+        client.post("/lama/scrub", json={"session_id": session_id})
+        r = client.post("/segment/box", json={"session_id": session_id, "box": [0.5, 0.5, 0.1, 0.1], "label": True})
+        assert r.json()["results"]["passes"] == [1]
+
     def test_scrub_is_repeatable_no_two_pass_cap(self, client):
         session_id = _upload(client)
         for _ in range(3):

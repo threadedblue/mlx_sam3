@@ -291,8 +291,21 @@ def _png_bytes(image: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def _mask_png_bytes(mask: np.ndarray) -> bytes:
-    return _png_bytes(Image.fromarray(mask * 255, mode="L"))
+def _crop_png_bytes(original_image: Image.Image, mask: np.ndarray) -> bytes:
+    """The object as it actually appears — `original_image` cut out via
+    `mask` used as an alpha channel — RGBA PNG bytes.
+
+    A faithful port of `aa_persistence.py`'s function of the same name, not
+    a shared import: `aa_persistence` already imports this module at
+    module level, so the reverse import would be circular. Keep this in
+    sync with that copy if either ever changes — same logic, same
+    `_binary_mask`-equivalent normalisation (this module's own
+    `_binary_mask`, already used identically elsewhere in this file).
+    """
+    mask_image = Image.fromarray(_binary_mask(mask) * 255, mode="L")
+    segment_image = Image.new("RGBA", original_image.size, (0, 0, 0, 0))
+    segment_image.paste(original_image, (0, 0), mask_image)
+    return _png_bytes(segment_image)
 
 
 def _norm_cxcywh_to_pixel_xyxy(box: Sequence[float], width: int, height: int) -> tuple[float, float, float, float]:
@@ -767,6 +780,11 @@ def build_sf_payload(session: SFSession) -> tuple[list[str], list[str], list]:
     is written as a numeric string. Absent values are omitted rather than
     written empty: `background_image_bytes` at pass 0 (nothing scrubbed yet)
     and `text_tag` on a box/point selected with no text_substitute.
+
+    `crop_png_bytes` is the segmented object itself — `original_image`
+    (or the relevant pass's image; see below) cut out via the mask as an
+    alpha channel — not mask geometry. Real training/handoff data needs to
+    see the object as it actually looks, not a binary black/white silhouette.
     """
     context_row = f"{session.session_id}:context"
     rows: list[str] = [context_row]
@@ -777,13 +795,27 @@ def build_sf_payload(session: SFSession) -> tuple[list[str], list[str], list]:
         cols.append("background_image_bytes")
         vals.append(_b64(_png_bytes(session.image_for_pass(session.pass_))))
 
+    # Decoded once per pass and reused across every mask row below, not
+    # re-decoded per mask — matches aa_persistence.py's own
+    # _build_segments_from_masks. Keyed by pass, not just pass 0: a mask
+    # kept from an earlier pass has to be cropped from THAT pass's image,
+    # since a later scrub can repaint pixels a kept mask's own crop must
+    # not pick up (session.image_for_pass already retains every pass's
+    # image for exactly this reason — see its own docstring).
+    pass_images: dict[int, Image.Image] = {
+        ORIGINAL_PASS: Image.open(io.BytesIO(session.original.bytes)).convert("RGBA"),
+    }
+    for p in range(1, session.pass_ + 1):
+        pass_images[p] = session.image_for_pass(p).convert("RGBA")
+
     for mask in session.masks:
         if mask.dataset_status != DatasetStatus.KEEP:
             continue
+        base_image = pass_images.get(mask.pass_, pass_images[ORIGINAL_PASS])
         row_key = f"{session.session_id}:{mask.mask_id}"
         rows += [row_key, row_key, row_key]
-        cols += ["pass", "caption", "mask_png_bytes"]
-        vals += [str(mask.pass_), mask.caption, _b64(_mask_png_bytes(mask.geometry))]
+        cols += ["pass", "caption", "crop_png_bytes"]
+        vals += [str(mask.pass_), mask.caption, _b64(_crop_png_bytes(base_image, mask.geometry))]
         if mask.text_tag:
             rows.append(row_key)
             cols.append("text_tag")
