@@ -157,6 +157,49 @@ def serialize_sf_masks(sf_session, state: dict) -> dict:
     return result
 
 
+def serialize_sf_masks_all_passes(sf_session) -> dict:
+    """Every `SFSession` mask record, across every pass — not filtered to
+    the current one like `serialize_sf_masks`.
+
+    For the AA Preview tab (SegForge/frontend's sf_aa_preview_adapter.dart),
+    which previews session-wide status, not what's paintable on the canvas
+    right now. `serialize_sf_masks`'s current-pass-only filter exists
+    because its geometry has to match the image the canvas is currently
+    displaying — mixing passes there would draw one pass's mask shapes
+    over another pass's picture. That constraint doesn't apply here: this
+    payload carries no geometry/masks/boxes at all, only per-record status
+    fields, so there's nothing to draw "over" anything.
+
+    Confirmed live: a mask held, captioned (dataset_status -> keep), then
+    scrubbed vanished from every subsequent serialize_sf_masks response —
+    correct for that function's own current-pass contract, but it left the
+    AA Preview tab with no way to ever show the very data it exists to
+    preview, since the moment something is scrubbed is exactly when it
+    stops being "the current pass". This function is the fix: called
+    fresh after every mutation, independent of which pass is current.
+
+    No dataset_status filter of its own, unlike `build_sf_payload`: a mask
+    that was held and scrubbed without ever being captioned still appears
+    here (dataset_status "unassigned", held False) rather than
+    disappearing — implicit discard is an EXPORT-time filter
+    (`build_sf_payload`'s keep-only pass), never a deletion from
+    `SFSession.masks`, which keeps every record as a permanent audit
+    trail. This ledger is meant to show that trail, not just what will
+    eventually be exported.
+    """
+    records = sf_session.masks
+    return {
+        "mask_ids": [m.mask_id for m in records],
+        "dataset_statuses": [m.dataset_status.value for m in records],
+        "held_flags": [m.held for m in records],
+        "captions": [m.caption for m in records],
+        "text_tags": [m.text_tag for m in records],
+        "scores": [float(m.score) if m.score is not None else 0.0 for m in records],
+        "boxes": [_bbox_from_geometry(m.geometry) for m in records],
+        "passes": [m.pass_ for m in records],
+    }
+
+
 class SegmentationService:
     ORIGINAL_IMAGE_FILENAME = "original.png"
 
@@ -435,6 +478,21 @@ class SegmentationService:
                 "masks": masks_rle,
                 "boxes": boxes,
                 "scores": scores,
+            },
+            # Same shape/purpose as serialize_sf_masks_all_passes' field of
+            # the same name on the live endpoints — a reloaded session's AA
+            # Preview tab needs this too, not just a live in-progress one.
+            # `segment["segment_id"]` is already the bare mask_id (the
+            # session_id prefix is stripped by read_session_raw).
+            "all_masks": {
+                "mask_ids": [seg["segment_id"] for seg in raw["segments"]],
+                "dataset_statuses": [seg["dataset_status"] for seg in raw["segments"]],
+                "held_flags": [seg["held"] for seg in raw["segments"]],
+                "captions": [seg["caption"] for seg in raw["segments"]],
+                "text_tags": [seg["text_tag"] or None for seg in raw["segments"]],
+                "scores": [seg["score"] or 0.0 for seg in raw["segments"]],
+                "boxes": [seg["bbox"] for seg in raw["segments"]],
+                "passes": [seg["pass"] for seg in raw["segments"]],
             },
             "prompts": raw["prompts"],
             "created_at": raw["created_at"],

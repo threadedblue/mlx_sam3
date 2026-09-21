@@ -10,6 +10,7 @@ import 'package:frontend/layer_state.dart';
 import 'package:frontend/layered_segmentation_canvas.dart';
 import 'package:frontend/widgets/include_exclude_toggle.dart';
 import 'package:frontend/widgets/lbs_card.dart';
+import 'package:frontend/widgets/objects_selected_card.dart';
 
 /// A solid-colour image to hand to [SegmentationCanvas].
 Future<ui.Image> _solidImage(int width, int height) {
@@ -109,6 +110,122 @@ void main() {
 
       expect(find.text('Scrub Selected Regions'), findsNothing); // spinner replaces the label
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    });
+  });
+
+  group('ObjectsSelectedCard', () {
+    // Fix regression: the Hold checkbox used to be gated on a single
+    // focused mask, which a text prompt never sets (only box/point
+    // selection does) — a multi-object text search made the checkbox
+    // disappear ENTIRELY, not just for the unfocused objects, leaving no
+    // way to hold any of the results. One checkbox per mask fixes this.
+    Segment segmentWith(String maskId, {bool held = false}) =>
+        Segment(path: Path(), maskId: maskId, datasetStatus: 'unassigned', held: held);
+
+    testWidgets('a multi-object selection shows a checkbox for every mask, not zero', (tester) async {
+      final calls = <(String, bool)>[];
+      await tester.pumpWidget(_wrap(ObjectsSelectedCard(
+        maskCount: 4,
+        segments: [
+          // Realistic shape: f"{pass}:{uuid4()}" (backend/sf_engine.py).
+          segmentWith('0:80aa20b5-2554-4dee-b46a-06cdd3dc9bb7'),
+          segmentWith('0:1a2b3c4d-0000-0000-0000-000000000001'),
+          segmentWith('0:1a2b3c4d-0000-0000-0000-000000000002'),
+          segmentWith('0:1a2b3c4d-0000-0000-0000-000000000003'),
+        ],
+        enabled: true,
+        onSetHeld: (id, held) => calls.add((id, held)),
+        onClearPrompts: () {},
+      )));
+
+      expect(find.byType(CheckboxListTile), findsNWidgets(4));
+    });
+
+    testWidgets('checking one mask\'s box reports that mask\'s id, not another one\'s', (tester) async {
+      final calls = <(String, bool)>[];
+      await tester.pumpWidget(_wrap(ObjectsSelectedCard(
+        maskCount: 2,
+        segments: [
+          segmentWith('0:1a2b3c4d-0000-0000-0000-0000000000f1'),
+          segmentWith('0:1a2b3c4d-0000-0000-0000-0000000000f2'),
+        ],
+        enabled: true,
+        onSetHeld: (id, held) => calls.add((id, held)),
+        onClearPrompts: () {},
+      )));
+
+      final checkboxes = find.byType(CheckboxListTile);
+      await tester.tap(checkboxes.at(1)); // the SECOND mask's checkbox
+      await tester.pump();
+
+      expect(calls, [('0:1a2b3c4d-0000-0000-0000-0000000000f2', true)]);
+    });
+
+    testWidgets('a mask id shorter than the truncation length does not crash '
+        '(hand-built/mocked ids only -- real ids are always well over 8 chars)', (tester) async {
+      await tester.pumpWidget(_wrap(ObjectsSelectedCard(
+        maskCount: 2,
+        segments: [segmentWith('0:a'), segmentWith('0:bb')],
+        enabled: true,
+        onSetHeld: (_, __) {},
+        onClearPrompts: () {},
+      )));
+
+      expect(tester.takeException(), isNull);
+      expect(find.textContaining('Hold a for next scrub'), findsOneWidget);
+      expect(find.textContaining('Hold bb for next scrub'), findsOneWidget);
+    });
+
+    testWidgets('a single-object selection still works (no regression for the common case)', (tester) async {
+      final calls = <(String, bool)>[];
+      await tester.pumpWidget(_wrap(ObjectsSelectedCard(
+        maskCount: 1,
+        segments: [segmentWith('0:only', held: true)],
+        enabled: true,
+        onSetHeld: (id, held) => calls.add((id, held)),
+        onClearPrompts: () {},
+      )));
+
+      final checkbox = find.byType(CheckboxListTile);
+      expect(checkbox, findsOneWidget);
+      expect(tester.widget<CheckboxListTile>(checkbox).value, true);
+
+      await tester.tap(checkbox);
+      await tester.pump();
+      expect(calls, [('0:only', false)]);
+    });
+
+    testWidgets('segments with no v2 identity (no maskId) get no checkbox', (tester) async {
+      await tester.pumpWidget(_wrap(ObjectsSelectedCard(
+        maskCount: 1,
+        segments: [Segment(path: Path())], // bbox-fallback path: no maskId
+        enabled: true,
+        onSetHeld: (_, __) {},
+        onClearPrompts: () {},
+      )));
+
+      expect(find.byType(CheckboxListTile), findsNothing);
+    });
+
+    testWidgets('disabled disables every checkbox and the Clear Prompts button', (tester) async {
+      var setHeldCalls = 0;
+      var clearCalls = 0;
+      await tester.pumpWidget(_wrap(ObjectsSelectedCard(
+        maskCount: 2,
+        segments: [segmentWith('0:a'), segmentWith('0:b')],
+        enabled: false,
+        onSetHeld: (_, __) => setHeldCalls++,
+        onClearPrompts: () => clearCalls++,
+      )));
+
+      for (final cb in tester.widgetList<CheckboxListTile>(find.byType(CheckboxListTile))) {
+        expect(cb.onChanged, isNull);
+      }
+      await tester.tap(find.text('Clear Prompts'));
+      await tester.pump();
+
+      expect(setHeldCalls, 0);
+      expect(clearCalls, 0);
     });
   });
 
@@ -319,6 +436,7 @@ void main() {
 
     Widget pumpTabs({
       Map<String, dynamic>? result,
+      Map<String, dynamic>? aaPreviewData,
       Uint8List? imageBytes,
     }) =>
         _wrap(DisplayAreaTabs(
@@ -326,6 +444,7 @@ void main() {
           uiImage: image,
           segments: const <Segment>[],
           result: result,
+          aaPreviewData: aaPreviewData,
           isLoading: false,
           mode: null,
           onBoxDrawn: (_) {},
@@ -371,18 +490,18 @@ void main() {
     testWidgets('AA Preview tab updates live on rebuild, without leaving and returning to the tab',
         (tester) async {
       // Starts empty (no selections yet).
-      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), result: null));
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), aaPreviewData: null));
       await tester.pumpAndSettle();
       await tester.tap(find.text('AA Preview'));
       await tester.pumpAndSettle();
       expect(find.textContaining('Empty associative array'), findsOneWidget);
 
       // Simulates what _sendBoxPrompt's setState() does in main.dart: a new
-      // `result` map reaches this widget via an ordinary rebuild — nothing
-      // re-taps into the AA Preview tab, it's already the active one.
+      // `aaPreviewData` map reaches this widget via an ordinary rebuild —
+      // nothing re-taps into the AA Preview tab, it's already the active one.
       await tester.pumpWidget(pumpTabs(
         imageBytes: Uint8List(0),
-        result: {
+        aaPreviewData: {
           'mask_ids': ['0:abc', '0:def'],
           'dataset_statuses': ['keep', 'unassigned'],
           'held_flags': [true, false],
@@ -395,17 +514,43 @@ void main() {
       expect(find.textContaining('2 rows'), findsOneWidget);
     });
 
-    testWidgets('a scrub (pass transition) is reflected the same way', (tester) async {
-      // Starts empty, same as the real app: _result is genuinely null
-      // before any selection has been made, on both the Canvas and
-      // AA Preview tabs — mounting straight into a populated tab isn't a
-      // sequence that happens in the real app either, only a rebuild
-      // reaching an already-mounted tree does.
-      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), result: null));
+    testWidgets('a scrub does NOT clear the AA Preview tab, even though it clears the canvas',
+        (tester) async {
+      // Regression: a captioned/kept mask used to vanish from this tab the
+      // moment its pass was scrubbed past, because the adapter read
+      // `result` (current-pass-only, nulled by _scrubLamaBackground's own
+      // setState on every scrub) instead of the session-wide ledger.
+      // Confirmed live: "I did a selection with a prompt... I did the
+      // scrub. AA preview shows nothing" -- reproduced with a genuinely
+      // captioned mask, not just an uncaptioned one, since the report
+      // didn't distinguish. `aaPreviewData` (this test's whole point) is
+      // main.dart's `_aaPreviewData` -- deliberately NOT reset alongside
+      // `result`/`_segments` in _scrubLamaBackground; see its own comment.
+      // First build of AaPreviewTableWidget MUST be empty: its Isolate.run()
+      // reload never resolves in this test harness when kicked off from
+      // initState() (a hard limitation of this environment, confirmed
+      // directly — real dart:ui rasterization has the same class of issue
+      // elsewhere in this file), only when kicked off from didUpdateWidget()
+      // on an already-mounted widget. The empty-AA short-circuit in
+      // AaPreviewTableWidget.build() means an empty initState() load is
+      // harmless (never reaches the spinner, so nothing needs waiting on) —
+      // so the actual "starts with real data" case is modelled by mounting
+      // empty, then rebuilding with data, exactly like the live app's own
+      // sequence (nothing is ever selected before the first render either).
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), result: null, aaPreviewData: null));
       await tester.pumpAndSettle();
       await tester.tap(find.text('AA Preview'));
-      await tester.pumpAndSettle();
+      await tester.pumpAndSettle(); // empty payload — trivial, no spinner involved
+      expect(find.textContaining('Empty associative array'), findsOneWidget);
 
+      // Regression: a captioned/kept mask used to vanish from this tab the
+      // moment its pass was scrubbed past, because the adapter read
+      // `result` (current-pass-only, nulled by _scrubLamaBackground's own
+      // setState on every scrub) instead of the session-wide ledger.
+      // Confirmed live: "I did a selection with a prompt... I did the
+      // scrub. AA preview shows nothing" -- reproduced here with a
+      // genuinely captioned mask, not just an uncaptioned one, since the
+      // report didn't distinguish.
       await tester.pumpWidget(pumpTabs(
         imageBytes: Uint8List(0),
         result: {
@@ -413,17 +558,91 @@ void main() {
           'dataset_statuses': ['keep'],
           'passes': [0],
         },
+        aaPreviewData: {
+          'mask_ids': ['0:abc'],
+          'dataset_statuses': ['keep'],
+          'captions': ['a grey egg'],
+          'passes': [0],
+        },
       ));
       await settleAfterAaLoad(tester);
       expect(find.textContaining('1 rows'), findsOneWidget);
 
-      // _scrubLamaBackground's setState() clears _result to null on a
-      // successful scrub (see main.dart) before the next pass's selections
-      // arrive — confirm that reaches this tab too, live.
-      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), result: null));
-      await tester.pumpAndSettle();
+      // Simulates _scrubLamaBackground's own setState(): `result` resets to
+      // null (correct — the new pass has no live geometry yet, matches
+      // serialize_sf_masks' current-pass-only contract) but `aaPreviewData`
+      // (main.dart's `_aaPreviewData`) carries forward the fresh `all_masks`
+      // response, which still includes the captioned mask from the pass
+      // that was just scrubbed — deliberately NOT reset alongside
+      // `result`/`_segments`, see that setState block's own comment.
+      await tester.pumpWidget(pumpTabs(
+        imageBytes: Uint8List(0),
+        result: null,
+        aaPreviewData: {
+          'mask_ids': ['0:abc'],
+          'dataset_statuses': ['keep'],
+          'captions': ['a grey egg'],
+          'passes': [0],
+        },
+      ));
+      await settleAfterAaLoad(tester);
 
+      expect(find.textContaining('Empty associative array'), findsNothing);
+      expect(find.textContaining('1 rows'), findsOneWidget);
+    });
+
+    testWidgets('an uncaptioned, scrubbed-away mask shows as unassigned, not absent '
+        '— this is the real audit trail, not the bug', (tester) async {
+      // The flip side of the fix above: the v2 model's implicit discard
+      // (held + scrubbed, never captioned) is real and intentional
+      // (backend/sf_engine.py's TestExport) — but it's an EXPORT-time
+      // filter (build_sf_payload's keep-only pass), never a deletion from
+      // SFSession.masks. Confirmed directly against the backend: the
+      // record stays forever as an audit trail (DatasetStatus has no
+      // discard value at all, only unassigned/keep), so `all_masks` keeps
+      // reporting it — correctly as unassigned/unheld, not absent. An
+      // earlier version of this test assumed it would disappear and was
+      // simply wrong; fixed after checking the real backend response
+      // rather than a hand-built assumption.
+      // First build empty, then tap, then rebuild with data — see the
+      // sibling test above for why (Isolate.run() from initState() never
+      // resolves in this harness; only a didUpdateWidget()-triggered
+      // reload does).
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), aaPreviewData: null));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('AA Preview'));
+      await tester.pumpAndSettle();
       expect(find.textContaining('Empty associative array'), findsOneWidget);
+
+      await tester.pumpWidget(pumpTabs(
+        imageBytes: Uint8List(0),
+        aaPreviewData: {
+          'mask_ids': ['0:abc'],
+          'dataset_statuses': ['unassigned'],
+          'held_flags': [true],
+          'passes': [0],
+        },
+      ));
+      await settleAfterAaLoad(tester);
+      expect(find.textContaining('1 rows'), findsOneWidget);
+
+      // Backend's all_masks after the scrub: the record survives with
+      // held cleared to false (matching a real /lama/scrub response —
+      // confirmed backend-side, see test_sf_wiring.py's
+      // test_all_masks_shows_an_uncaptioned_scrubbed_mask_as_unassigned_not_absent).
+      await tester.pumpWidget(pumpTabs(
+        imageBytes: Uint8List(0),
+        aaPreviewData: {
+          'mask_ids': ['0:abc'],
+          'dataset_statuses': ['unassigned'],
+          'held_flags': [false],
+          'passes': [0],
+        },
+      ));
+      await settleAfterAaLoad(tester);
+
+      expect(find.textContaining('Empty associative array'), findsNothing);
+      expect(find.textContaining('1 rows'), findsOneWidget);
     });
   });
 }

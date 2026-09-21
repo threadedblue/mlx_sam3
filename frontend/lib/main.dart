@@ -30,6 +30,7 @@ import 'models/result_datum.dart';
 import 'widgets/result_cell.dart';
 import 'widgets/include_exclude_toggle.dart';
 import 'widgets/lbs_card.dart';
+import 'widgets/objects_selected_card.dart';
 import 'launch_config.dart';
 
 void main() {
@@ -365,6 +366,15 @@ class _HomeScreenState extends State<HomeScreen> {
   Size? _imageSize; // Original size
 
   Map<String, dynamic>? _result;
+  // Session-wide mask ledger (every pass, not just the current one) for
+  // the AA Preview tab — see backend services.py's
+  // serialize_sf_masks_all_passes docstring for why this has to be a
+  // SEPARATE field from `_result`: `_result` is current-pass-only
+  // (matches what's paintable on the canvas right now), so a captioned/
+  // kept mask silently vanished from the AA Preview the moment its pass
+  // was scrubbed past, when `_result` reset to null — confirmed live, the
+  // exact case reported ("I did the scrub. AA preview shows nothing.").
+  Map<String, dynamic>? _aaPreviewData;
   List<Segment> _segments = [];
   bool _isLoading = false;
   String? _error;
@@ -767,6 +777,7 @@ class _HomeScreenState extends State<HomeScreen> {
           );
           _result = null;
           _segments = [];
+          _aaPreviewData = null; // fresh upload — new session/pass 0, nothing selected yet
           _imageSourceResult = [
             ResultDatum(label: url != null ? 'URL' : 'Session',
                 value: url ?? _sessionId ?? ''),
@@ -801,6 +812,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (response != null) {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
+          _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _textPromptResult = [const ResultDatum(label: 'Status', value: 'Done')];
         });
@@ -829,6 +841,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _patchMaskLocally(maskId, datasetStatus: response['dataset_status'] as String?);
         _textController.clear();
         setState(() {
+          _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _textPromptResult = [const ResultDatum(label: 'Status', value: 'Captioned')];
         });
       }
@@ -872,13 +885,32 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  Future<void> _setFocusedMaskHeld(bool held) async {
-    final maskId = _focusedMaskId;
-    if (_sessionId == null || maskId == null) return;
+  /// Sets `held` on any mask by id — not gated on `_focusedMaskId`.
+  ///
+  /// A text prompt returns several masks at once with none of them
+  /// focused (`_sendTextPrompt` never sets `_focusedMaskId` — only
+  /// box/point selection does, since text has no single "the" instance to
+  /// point at). The Hold checkbox used to be gated on `_focusedSegment`,
+  /// which meant a multi-object text selection had NO way to hold any of
+  /// its results without individually re-clicking each one via box/point
+  /// first — confirmed as a real gap, not a display bug, when investigated.
+  /// `_buildResultsCard` now renders one checkbox per selected mask, all
+  /// routed through here, instead of one checkbox for whichever mask
+  /// happened to be focused.
+  Future<void> _setMaskHeld(String maskId, bool held) async {
+    if (_sessionId == null) return;
     try {
       final response = await _api.setMaskHeld(_sessionId!, maskId, held);
       if (!mounted || response == null) return;
       _patchMaskLocally(maskId, held: response['held'] as bool?);
+      // Whichever mask the user just held is a reasonable thing to also
+      // focus — it's what makes the Prompt card's caption mode target the
+      // mask just interacted with, the same way box/point selection
+      // already sets focus as a side effect of touching a mask.
+      setState(() {
+        _focusedMaskId = maskId;
+        _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+      });
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
@@ -907,6 +939,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (response != null) {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
+          _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
           _boxResult = [ResultDatum(label: 'Status', value: _promptStatusLabel(_result))];
@@ -929,6 +962,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (response != null) {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
+          _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
           _pointResult = [ResultDatum(label: 'Status', value: _promptStatusLabel(_result))];
@@ -951,6 +985,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (response != null) {
         setState(() {
           _result = response['results'] as Map<String, dynamic>?;
+          _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _textController.clear();
           _updateSegmentsFromResult();
           // Deliberately NOT the `?? _focusedMaskId` fallback the box/point
@@ -1017,6 +1052,14 @@ class _HomeScreenState extends State<HomeScreen> {
           _focusedMaskId = null;
           _result = null;
           _segments = [];
+          // NOT nulled like _result — a scrub is exactly the moment a
+          // captioned/kept mask stops being "the current pass", so this
+          // has to keep reflecting the session-wide ledger, not reset with
+          // it. Confirmed live: without this, the AA Preview tab went
+          // empty after every scrub regardless of whether anything was
+          // captioned, defeating its purpose (previewing exportable data)
+          // precisely when the data became exportable.
+          _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
         });
       } else {
         // scrubLamaBackground doesn't rethrow (see ApiService) — a null
@@ -1204,6 +1247,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 uiImage: _uiImage,
                 segments: _segments,
                 result: _result,
+                aaPreviewData: _aaPreviewData,
                 isLoading: _isLoading,
                 mode: _selectedMode,
                 onBoxDrawn: _sendBoxPrompt,
@@ -1468,8 +1512,13 @@ class _HomeScreenState extends State<HomeScreen> {
     // times, never something to infer from what happens after submit —
     // see _sendTextPrompt's docstring for why.
     final captionMode = _isCaptionMode;
+    final focusedIdTail = _focusedSegment?.maskId?.split(':').last;
+    // Not a bare .substring(0, 8): real ids are f"{pass}:{uuid4()}"
+    // (backend/sf_engine.py), always well over 8 chars here, but nothing
+    // guarantees that for every possible maskId — same clamp as
+    // ObjectsSelectedCard's identical truncation.
     final headerLabel = captionMode
-        ? "Caption: ${_focusedSegment?.maskId?.split(':').last.substring(0, 8) ?? ''}"
+        ? "Caption: ${focusedIdTail == null ? '' : (focusedIdTail.length <= 8 ? focusedIdTail : focusedIdTail.substring(0, 8))}"
         : "Prompt";
 
     return _buildBorderedCard(
@@ -1594,57 +1643,12 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildResultsCard() {
-    final maskCount = (_result?['masks'] as List?)?.length ?? 0;
-    final focused = _focusedSegment;
-
-    return _buildBorderedCard(
-      Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Row(
-              children: [
-                Icon(Icons.data_usage, size: 16),
-                SizedBox(width: 8),
-                Text("Objects Selected", style: TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            _buildResultRow("Object count", maskCount.toString()),
-            // A control to toggle `held` on the focused mask — deliberately
-            // its own row, not folded into the Prompt card's two modes.
-            if (focused != null) ...[
-              const SizedBox(height: 8),
-              CheckboxListTile(
-                value: focused.held,
-                onChanged: (_sessionId == null || _isLoading)
-                    ? null
-                    : (checked) => _setFocusedMaskHeld(checked ?? false),
-                controlAffinity: ListTileControlAffinity.leading,
-                contentPadding: EdgeInsets.zero,
-                dense: true,
-                title: const Text("Hold for next scrub"),
-              ),
-            ],
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton(
-                onPressed: (_sessionId == null || _isLoading) ? null : _reset,
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.white,
-                  side: const BorderSide(color: Colors.white),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(24),
-                  ),
-                ),
-                child: const Text("Clear Prompts"),
-              ),
-            ),
-          ],
-        ),
-      ),
+    return ObjectsSelectedCard(
+      maskCount: (_result?['masks'] as List?)?.length ?? 0,
+      segments: _segments,
+      enabled: _sessionId != null && !_isLoading,
+      onSetHeld: _setMaskHeld,
+      onClearPrompts: _reset,
     );
   }
 
@@ -1704,18 +1708,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildResultRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: TextStyle(fontSize: 13, color: Theme.of(context).colorScheme.onSurfaceVariant)),
-          Text(value, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
-        ],
-      ),
-    );
-  }
 
 }
 
@@ -1735,6 +1727,12 @@ class DisplayAreaTabs extends StatefulWidget {
   final ui.Image? uiImage;
   final List<Segment> segments;
   final Map<String, dynamic>? result;
+  // Session-wide mask ledger (every pass), separate from `result` (current
+  // pass only, what the canvas paints) — see main.dart's `_aaPreviewData`
+  // field doc comment for why these can't be the same value: `result`
+  // resets to null on every scrub, which silently dropped captioned/kept
+  // masks from the AA Preview the moment their pass was scrubbed past.
+  final Map<String, dynamic>? aaPreviewData;
   final bool isLoading;
   final SelectionMode? mode;
   final void Function(List<double>) onBoxDrawn;
@@ -1746,6 +1744,7 @@ class DisplayAreaTabs extends StatefulWidget {
     required this.uiImage,
     required this.segments,
     required this.result,
+    required this.aaPreviewData,
     required this.isLoading,
     required this.mode,
     required this.onBoxDrawn,
@@ -1787,18 +1786,25 @@ class _DisplayAreaTabsState extends State<DisplayAreaTabs> with SingleTickerProv
             controller: _tabController,
             children: [
               _buildCanvasTab(context),
-              // Built directly from `widget.result` on every rebuild of
-              // THIS widget — not computed once and cached — so every
-              // mutation the parent already calls setState() for (select,
-              // hold, caption, scrub) reaches this tab via the ordinary
-              // "new widget, new build()" path, no separate refresh
-              // mechanism. TabBarView builds all of its children up front
-              // (it's a PageView under the hood, not lazy per active tab),
-              // so this recomputes whether or not the tab is currently
-              // visible; for SF's per-pass mask counts that's negligible,
-              // and simpler than gating it on `_tabController.index`,
-              // which would need its own listener for no real benefit.
-              AaPreviewTableWidget(aa: sfResultToAaPayload(widget.result)),
+              // Built directly from `widget.aaPreviewData` on every
+              // rebuild of THIS widget — not computed once and cached —
+              // so every mutation the parent already calls setState() for
+              // (select, hold, caption, scrub) reaches this tab via the
+              // ordinary "new widget, new build()" path, no separate
+              // refresh mechanism. Deliberately NOT `widget.result`: that
+              // field is current-pass-only (what the canvas paints) and
+              // resets to null on every scrub, which silently dropped
+              // captioned/kept masks from this tab the moment their pass
+              // was scrubbed past — confirmed live, see
+              // serialize_sf_masks_all_passes' docstring (backend
+              // services.py) for the full story. TabBarView builds all of
+              // its children up front (it's a PageView under the hood, not
+              // lazy per active tab), so this recomputes whether or not
+              // the tab is currently visible; for SF's per-session mask
+              // counts that's negligible, and simpler than gating it on
+              // `_tabController.index`, which would need its own listener
+              // for no real benefit.
+              AaPreviewTableWidget(aa: sfResultToAaPayload(widget.aaPreviewData)),
             ],
           ),
         ),

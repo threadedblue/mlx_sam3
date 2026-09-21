@@ -36,7 +36,12 @@ from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 from dotenv import load_dotenv
 
-from services import SegmentationService, serialize_state, serialize_sf_masks
+from services import (
+    SegmentationService,
+    serialize_state,
+    serialize_sf_masks,
+    serialize_sf_masks_all_passes,
+)
 import aa_persistence
 import sf_engine
 import compile_training_set
@@ -317,6 +322,11 @@ async def segment_with_text(request: TextPromptRequest):
             "session_id": request.session_id,
             "prompt": request.prompt,
             "results": results,
+            # Session-wide status ledger, all passes — see its own
+            # docstring for why the AA Preview tab needs this instead of
+            # `results` (current-pass-only, so a captioned mask silently
+            # vanishes from it the moment its pass is scrubbed past).
+            "all_masks": serialize_sf_masks_all_passes(sf_session),
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2)
         }
@@ -390,6 +400,7 @@ async def add_box_prompt(request: BoxPromptRequest):
             # there's nothing new to focus — the previous selection, if
             # any, stays focused rather than being cleared).
             "selected_mask_id": sf_session.last_touched_mask_id,
+            "all_masks": serialize_sf_masks_all_passes(sf_session),
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2)
         }
@@ -456,6 +467,7 @@ async def add_point_prompt(request: PointPromptRequest):
             "point_type": "positive" if request.label else "negative",
             "results": results,
             "selected_mask_id": sf_session.last_touched_mask_id,
+            "all_masks": serialize_sf_masks_all_passes(sf_session),
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2),
         }
@@ -507,6 +519,10 @@ async def lama_scrub(request: LamaScrubRequest):
         "from_pass": scrub.from_pass,
         "to_pass": scrub.to_pass,
         "scrubbed_mask_ids": list(scrub.mask_ids),
+        # A scrub is exactly the moment a captioned/kept mask stops being
+        # "the current pass" — the AA Preview tab needs this response to
+        # keep seeing it, not just the /segment/* responses.
+        "all_masks": serialize_sf_masks_all_passes(sf_session),
     }
 
 
@@ -533,6 +549,7 @@ async def set_mask_held(request: SetHeldRequest):
         "session_id": request.session_id,
         "mask_id": record.mask_id,
         "held": record.held,
+        "all_masks": serialize_sf_masks_all_passes(sf_session),
     }
 
 
@@ -561,6 +578,7 @@ async def attach_mask_caption(request: AttachCaptionRequest):
         "mask_id": record.mask_id,
         "dataset_status": record.dataset_status.value,
         "caption": record.caption,
+        "all_masks": serialize_sf_masks_all_passes(sf_session),
     }
 
 
@@ -624,6 +642,7 @@ async def reset_prompts(request: SessionRequest):
             "message": "All prompts reset",
             "results": results,
             "selected_mask_id": sf_session.last_touched_mask_id if sf_session is not None else None,
+            "all_masks": serialize_sf_masks_all_passes(sf_session) if sf_session is not None else None,
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2)
         }

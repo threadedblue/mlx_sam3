@@ -212,6 +212,66 @@ class TestHttpSelectHoldCaptionScrub:
         r = client.post("/segment/box", json={"session_id": session_id, "box": [0.5, 0.5, 0.1, 0.1], "label": True})
         assert r.json()["results"]["passes"] == [1]
 
+    def test_all_masks_is_a_session_wide_ledger_that_survives_a_scrub(self, client):
+        """Fix: reported live -- "I did a selection with a prompt... I did
+        the scrub. AA preview shows nothing" -- reproduced and confirmed:
+        a captioned/kept mask vanished from every endpoint's `results` the
+        moment its pass was scrubbed past. Correct for `results` (current-
+        pass-only, matches what the canvas is currently painting — see
+        serialize_sf_masks' own docstring), but it left the AA Preview tab
+        with no way to ever show the data it exists to preview, since the
+        moment something is scrubbed is exactly when it stops being "the
+        current pass". `all_masks` is the fix: present on every mutation
+        endpoint's response, spans every pass, never resets on a scrub."""
+        session_id = _upload(client)
+        keeper_id = _box_select(client, session_id, [0.2, 0.2, 0.2, 0.2])
+        _hold(client, session_id, keeper_id, True)
+        cap = _caption(client, session_id, keeper_id, "a grey egg")
+        assert "all_masks" in cap
+        assert keeper_id in cap["all_masks"]["mask_ids"]
+
+        r = client.post("/lama/scrub", json={"session_id": session_id})
+        assert r.status_code == 200
+        body = r.json()
+        assert "all_masks" in body
+        idx = body["all_masks"]["mask_ids"].index(keeper_id)
+        assert body["all_masks"]["dataset_statuses"][idx] == "keep"
+        assert body["all_masks"]["captions"][idx] == "a grey egg"
+        # The pass it was traced against, not the new current pass (1).
+        assert body["all_masks"]["passes"][idx] == 0
+
+        # A LATER, unrelated action at the NEW pass must still report it
+        # too — not just the scrub response itself.
+        r = client.post("/segment/point", json={"session_id": session_id, "point": [0.9, 0.05], "label": False})
+        assert keeper_id in r.json()["all_masks"]["mask_ids"]
+        # But NOT in the current-pass-only `results` — that field's scope
+        # is deliberately unchanged by this fix.
+        assert keeper_id not in r.json()["results"]["mask_ids"]
+
+    def test_all_masks_shows_an_uncaptioned_scrubbed_mask_as_unassigned_not_absent(self, client):
+        """The flip side: implicit discard (held + scrubbed, never
+        captioned) is real and intentional (sf_engine.py's TestExport) —
+        but it's an EXPORT-time filter (build_sf_payload's keep-only pass),
+        never a deletion from SFSession.masks. The record stays forever as
+        an audit trail (confirmed directly: DatasetStatus has no discard
+        value, only unassigned/keep), so all_masks — which mirrors
+        SFSession.masks with no dataset_status filter of its own — must
+        keep showing it, just correctly as unassigned/unheld, not silently
+        drop it. Dropping records `build_sf_payload` will never export
+        would defeat the point of a session-wide ledger just as much as
+        the original bug did."""
+        session_id = _upload(client)
+        balloon_id = _box_select(client, session_id, [0.7, 0.7, 0.2, 0.2])
+        _hold(client, session_id, balloon_id, True)
+
+        r = client.post("/lama/scrub", json={"session_id": session_id})
+        all_masks = r.json()["all_masks"]
+        assert balloon_id in all_masks["mask_ids"]
+        idx = all_masks["mask_ids"].index(balloon_id)
+        assert all_masks["dataset_statuses"][idx] == "unassigned"
+        assert all_masks["held_flags"][idx] is False  # cleared by the scrub
+        assert all_masks["captions"][idx] is None
+
     def test_scrub_is_repeatable_no_two_pass_cap(self, client):
         session_id = _upload(client)
         for _ in range(3):
