@@ -138,6 +138,34 @@ void main() {
       expect(withoutPasses.cols, isNot(contains('pass')));
     });
 
+    test('crop_png_bytes is emitted as its own column, present-only like the other fields', () {
+      final result = {
+        'mask_ids': ['0:abc', '0:def'],
+        'dataset_statuses': ['keep', 'unassigned'],
+        'crop_png_bytes': ['aGVsbG8=', null],
+      };
+
+      final aa = sfResultToAaPayload(result);
+
+      Object? cell(String row, String col) {
+        for (var i = 0; i < aa.rows.length; i++) {
+          if (aa.rows[i] == row && aa.cols[i] == col) return aa.vals[i];
+        }
+        return null;
+      }
+
+      expect(cell('0:abc', 'crop_png_bytes'), 'aGVsbG8=');
+      expect(cell('0:def', 'crop_png_bytes'), null); // never emitted — no triple
+
+      // Absent entirely (older backend response) -> no crop_png_bytes
+      // triples at all, same present-only convention as the other fields.
+      final withoutCrops = sfResultToAaPayload({
+        'mask_ids': ['0:xyz'],
+        'dataset_statuses': ['unassigned'],
+      });
+      expect(withoutCrops.cols, isNot(contains('crop_png_bytes')));
+    });
+
     test('a scrub advancing the pass changes what later rows report', () {
       final passZero = sfResultToAaPayload({
         'mask_ids': ['0:abc'],

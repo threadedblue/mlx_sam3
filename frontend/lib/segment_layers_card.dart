@@ -39,7 +39,7 @@ class SegmentLayersCard extends StatelessWidget {
               _buildLayerCheckbox('Original', layerState.showOriginal, layerState.setOriginal),
               _buildLayerCheckbox('Masks', layerState.showMasks, layerState.setMasks),
               _buildLayerCheckbox('Raw', layerState.showRaw, layerState.setRaw),
-              _buildLayerCheckbox('Final', layerState.showFinal, layerState.setFinal),
+              _buildLayerCheckbox('Current', layerState.showCurrent, layerState.setCurrent),
             ],
           );
         }),

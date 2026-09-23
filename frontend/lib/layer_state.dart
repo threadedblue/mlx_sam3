@@ -4,12 +4,12 @@ class LayerState with ChangeNotifier {
   bool _showOriginal = true;
   bool _showMasks = true;
   bool _showRaw = true;
-  bool _showFinal = true;
+  bool _showCurrent = true;
 
   bool get showOriginal => _showOriginal;
   bool get showMasks => _showMasks;
   bool get showRaw => _showRaw;
-  bool get showFinal => _showFinal;
+  bool get showCurrent => _showCurrent;
 
   void setOriginal(bool value) {
     if (_showOriginal == value) return;
@@ -29,9 +29,9 @@ class LayerState with ChangeNotifier {
     notifyListeners();
   }
 
-  void setFinal(bool value) {
-    if (_showFinal == value) return;
-    _showFinal = value;
+  void setCurrent(bool value) {
+    if (_showCurrent == value) return;
+    _showCurrent = value;
     notifyListeners();
   }
 }

@@ -110,6 +110,59 @@ def _bbox_from_geometry(mask: np.ndarray) -> List[float]:
     return [float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1)]
 
 
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+# Process-lifetime cache of each mask's crop PNG, keyed by mask_id — not
+# per-session, so it survives independently of any one SFSession object's
+# own lifetime. Stores the base64-encoded string, matching every other
+# image field on the wire (`_b64(...)`), so a cache HIT never re-encodes,
+# only a genuine miss does. Crop generation (compositing the mask as an
+# alpha channel over its pass's image) is the expensive part of rebuilding
+# the AA preview on every mutation; mask_ids are unique per selection
+# (minted as f"{pass}:{uuid4()}", never reused), so once computed a crop is
+# valid forever UNLESS that same mask_id's geometry is later refreshed in
+# place by an Avoid-refinement (see SFSession.last_refreshed_mask_ids) —
+# caption/hold/dataset_status changes never touch geometry and must not
+# evict this, or the cache would recompute on every table rebuild, defeating
+# the point.
+_crop_cache: Dict[str, str] = {}
+
+
+def _cached_crop_png_b64(sf_session, mask: "sf_engine.MaskRecord") -> str:
+    """This mask's crop PNG, base64-encoded — computed once per mask_id for
+    the life of the process, reused after that.
+
+    Pass-aware like `build_sf_payload`'s own crop step (`sf_engine.py`):
+    crops from the image `mask.pass_` was actually traced against, not
+    always pass 0 — `SFSession.image_for_pass` retains every pass's image
+    for exactly this reason, and a wrong-pass crop would silently show
+    stale content for a mask kept in an earlier pass.
+    """
+    cached = _crop_cache.get(mask.mask_id)
+    if cached is None:
+        base_image = sf_session.image_for_pass(mask.pass_).convert("RGBA")
+        cached = _b64(sf_engine._crop_png_bytes(base_image, mask.geometry))
+        _crop_cache[mask.mask_id] = cached
+    return cached
+
+
+def _invalidate_stale_crops(sf_session) -> None:
+    """Evict any cached crop whose mask_id had its geometry refreshed since
+    the last call.
+
+    Drains `SFSession.last_refreshed_mask_ids` (set fresh by `_select`/
+    `_select_single` on every text/box/point call) rather than reading it
+    non-destructively, so a mask_id already invalidated once isn't
+    re-invalidated — and therefore re-cropped — on every subsequent
+    unrelated mutation.
+    """
+    for mask_id in sf_session.last_refreshed_mask_ids:
+        _crop_cache.pop(mask_id, None)
+    sf_session.last_refreshed_mask_ids = set()
+
+
 def serialize_sf_masks(sf_session, state: dict) -> dict:
     """Wire shape for the /segment/* responses, built from SFSession's
     *recorded selections* rather than raw `state["masks"]`.
@@ -130,7 +183,15 @@ def serialize_sf_masks(sf_session, state: dict) -> dict:
     Only the current pass's records are emitted: an earlier pass's masks
     were traced against a different image than the current pass's, so
     mixing them would draw one pass's geometry over another's picture.
+
+    `crop_png_bytes` is the segmented object itself, same convention as
+    `build_sf_payload`'s export column — the AA Preview tab renders it
+    inline per mask. Pulled from the process-lifetime cache
+    (`_cached_crop_png_b64`), not recomputed here on every call; stale
+    entries from an in-place geometry refresh are evicted first so a
+    refined Avoid selection never serves a pre-refinement crop.
     """
+    _invalidate_stale_crops(sf_session)
     records = [m for m in sf_session.masks if m.pass_ == sf_session.pass_]
     result = {
         "original_width": state.get("original_width"),
@@ -143,6 +204,7 @@ def serialize_sf_masks(sf_session, state: dict) -> dict:
         "held_flags": [m.held for m in records],
         "captions": [m.caption for m in records],
         "text_tags": [m.text_tag for m in records],
+        "crop_png_bytes": [_cached_crop_png_b64(sf_session, m) for m in records],
         # Every record here is already filtered to sf_session.pass_ (see the
         # comprehension above) — an unbounded plain int in the v2 model, not
         # the old two-value enum — so this is a constant repeated once per
@@ -368,6 +430,31 @@ class SegmentationService:
             }
             self.sessions[session_id] = session_data
             self.sf_sessions[session_id] = self._reconstruct_sf_session(session_id, raw, state)
+
+            # Restore the single-object invariant most of this codebase
+            # already assumes (session["state"] and sf_session.state are
+            # the SAME object — see e.g. _reconstruct_sf_session's own
+            # docstring). For a session resumed at pass 0 this is already
+            # true (`state` above IS `replayed_state`, unchanged). For
+            # pass > 0, `_reconstruct_sf_session` re-`set_image`s onto that
+            # pass's actual image and returns a DIFFERENT state object —
+            # `session_data["state"]` above still points at the stale,
+            # pass-0-shaped replay. Confirmed live this was never a
+            # correctness risk (every live selection/scrub/save handler
+            # rebinds `state = sf_session.state` before doing anything
+            # real, so they self-healed it on first use) but it did leak
+            # through /reset (which reads `session["state"]` directly and
+            # never re-aliases, so Clear Prompts silently operated on the
+            # wrong object) and dropped the very first prompted_boxes
+            # display marker after a pass>0 resume (appended to the stale
+            # object, then serialized from the correct one). Re-aliasing
+            # here, once, closes both — and removes the fragility in
+            # `get_or_create_sf_session`, which would otherwise rebuild a
+            # brand-new, MASKLESS SFSession from this stale state if
+            # `self.sf_sessions` and `self.sessions` were ever evicted
+            # asymmetrically.
+            session_data["state"] = self.sf_sessions[session_id].state
+
             print(f"Successfully loaded session {session_id} from disk into memory.")
             return session_data
         except Exception as e:
@@ -397,7 +484,26 @@ class SegmentationService:
         from its very first selection, not just retroactively. Sessions that already
         had masks before this feature existed only get one on disk reload,
         via `_reconstruct_sf_session`'s migration path.
+
+        Defense in depth: this merges into whatever is already cached for
+        `session_id` rather than replacing it (`.update()` below, and the
+        `session_id not in self.sf_sessions` guard further down) — but that
+        alone only protects state already IN MEMORY. A caller that reaches
+        this (via /upload) for a session that's genuinely saved on disk but
+        not yet cached — e.g. one that skips /loadSession, whose own call
+        into `get_session` is what normally warms this first — would
+        otherwise still see `session_id not in self.sessions` as vacuously
+        true and overwrite real name/description/prompts/masks with a
+        blank session and a fresh, empty SFSession. Confirmed live: this is
+        exactly what destroyed a session's data on every resume before
+        /loadSession was fixed to warm the cache. Restoring from disk FIRST
+        when nothing is cached yet closes that gap independently of
+        whatever the caller did or didn't call beforehand; for a genuinely
+        new session_id (nothing on disk), `get_session` returns None and
+        this is a harmless no-op.
         """
+        if session_id not in self.sessions:
+            self.get_session(session_id)
         if session_id not in self.sessions:
             self.sessions[session_id] = {}
         self.sessions[session_id].update(data)
@@ -430,7 +536,23 @@ class SegmentationService:
             print(f"Warning: Cannot save state for non-existent in-memory session {session_id}")
             return
 
-        aa_persistence.save_session(session_id, session, self.sf_sessions.get(session_id))
+        # TEMP DEBUG (2/4) — the single most important log point: is there
+        # an SFSession for this session_id at all, and does it actually
+        # have masks? _build_segments_from_masks reads sf_session.masks
+        # directly with no filter, so this tells us whether the bug is
+        # upstream of this call (masks missing/SFSession absent here) or
+        # downstream (masks present here but still nothing gets written).
+        sf_session = self.sf_sessions.get(session_id)
+        if sf_session is None:
+            print(f"[SAVE-DEBUG 2] save_session_to_disk: session_id={session_id!r} — "
+                  f"no SFSession found for this session_id (self.sf_sessions.get returned None)")
+        else:
+            print(f"[SAVE-DEBUG 2] save_session_to_disk: session_id={session_id!r} — "
+                  f"SFSession found: len(sf_session.masks)={len(sf_session.masks)}, "
+                  f"pass_={sf_session.pass_}, "
+                  f"mask_ids={[m.mask_id for m in sf_session.masks]}")
+
+        aa_persistence.save_session(session_id, session, sf_session)
 
     def save_session_settings(self, session_id: str, settings: Dict[str, Any]):
         """Merges UI-specific settings into the session's persisted registry."""
@@ -442,7 +564,25 @@ class SegmentationService:
         Reconstructs the same wire shape the old JSON+PNG flow produced:
         image_b64, width/height, results (masks as RLE / boxes / scores),
         prompts, name/description/image_url/created_at.
+
+        Also warms the in-memory caches (`self.sessions`/`self.sf_sessions`)
+        as a side effect, via `get_session` — the same restoration
+        `_load_session_into_memory` already gives any other caller (real
+        SAM3 state, replayed prompts, and a reconstructed SFSession with
+        every persisted mask). Confirmed live: without this, /loadSession
+        left both caches empty, so the frontend's follow-up /upload call
+        (which only exists to (re-)initialize SAM3's in-memory state — see
+        main.dart's `_loadImageFromUrl`) found nothing here to merge into
+        and rebuilt the session from scratch, then auto-saved that empty
+        result over the correct on-disk data — silently destroying a
+        session's name, description, prompts and masks on every resume,
+        before the user touched anything. `get_session` returning None
+        here (a session staged via /initSession but never uploaded to, or
+        one with no image at all) is fine — the raw-based response below
+        already handles that case on its own.
         """
+        self.get_session(session_id)
+
         raw = aa_persistence.read_session_raw(session_id)
         if raw is None:
             raise FileNotFoundError(f"State file not found for session {session_id}")

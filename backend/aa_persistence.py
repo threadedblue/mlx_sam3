@@ -336,10 +336,25 @@ def save_session(
 
     seg_path = d / "segment.parquet"
     seg_rows, seg_cols, seg_vals = _build_segments(session_id, session, sf_session)
+    # TEMP DEBUG (3/4) — what _build_segments actually returned, before it
+    # reaches bridge.save_parquet, plus which branch (write vs. delete-
+    # stale) is about to fire. If seg_rows is empty here and the file
+    # already had content, the "unlink" branch below is exactly what
+    # would silently make segment.parquet vanish with no error at all.
+    seg_path_existed = seg_path.exists()
+    print(f"[SAVE-DEBUG 3] save_session: session_id={session_id!r} — "
+          f"_build_segments returned rows={len(seg_rows)}, cols={len(seg_cols)}, vals={len(seg_vals)} "
+          f"(sf_session={'present' if sf_session is not None else 'None'}); "
+          f"segment.parquet currently exists on disk: {seg_path_existed}")
     if seg_rows:
+        print(f"[SAVE-DEBUG 3] save_session: WRITE branch — calling bridge.save_parquet for "
+              f"{seg_path} with {len(seg_rows)} rows")
         bridge.save_parquet(str(seg_path), seg_rows, seg_cols, seg_vals)
         written.append("segment.parquet")
+        print(f"[SAVE-DEBUG 3] save_session: bridge.save_parquet for segment.parquet RETURNED")
     else:
+        print(f"[SAVE-DEBUG 3] save_session: EMPTY branch — seg_rows is empty, "
+              f"{'DELETING existing segment.parquet (had real content!)' if seg_path_existed else 'unlinking (file did not exist / already absent — no-op)'}")
         seg_path.unlink(missing_ok=True)
 
     link_path = d / "linkage.parquet"

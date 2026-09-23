@@ -14,12 +14,17 @@ import 'package:aa_preview_table/aa_preview_table.dart';
 /// so the conversion happens here, in SF's own codebase, not there.
 ///
 /// `result['mask_ids']`/`dataset_statuses`/`held_flags`/`captions`/
-/// `text_tags`/`scores`/`boxes`/`passes` are parallel lists (one entry per
-/// *current-pass* mask — `serialize_sf_masks` never returns another
-/// pass's records, so every value in `passes` is the same constant,
-/// repeated once per row — but it's still surfaced as its own column
-/// rather than assumed, since nothing else in this payload tells a viewer
-/// which pass they're looking at).
+/// `text_tags`/`scores`/`boxes`/`passes`/`crop_png_bytes` are parallel
+/// lists (one entry per *current-pass* mask — `serialize_sf_masks` never
+/// returns another pass's records, so every value in `passes` is the same
+/// constant, repeated once per row — but it's still surfaced as its own
+/// column rather than assumed, since nothing else in this payload tells a
+/// viewer which pass they're looking at).
+///
+/// `crop_png_bytes` carries the mask's cached crop, base64-encoded
+/// (`services.py`'s process-lifetime crop cache) — the column
+/// `DisplayAreaTabs` passes as `AaPreviewTableWidget.imageColumn` so the AA
+/// Preview tab renders it inline instead of as a wall of base64 text.
 ///
 /// A field is only emitted as a triple when it has a real value — an
 /// unassigned mask's absent caption, for instance, produces no `caption`
@@ -36,6 +41,7 @@ AaPayload sfResultToAaPayload(Map<String, dynamic>? result) {
   final scores = (result['scores'] as List?) ?? const [];
   final boxes = (result['boxes'] as List?) ?? const [];
   final passes = (result['passes'] as List?) ?? const [];
+  final cropPngBytes = (result['crop_png_bytes'] as List?) ?? const [];
 
   final rows = <String>[];
   final cols = <String>[];
@@ -63,6 +69,7 @@ AaPayload sfResultToAaPayload(Map<String, dynamic>? result) {
       emit(rowKey, 'bbox', (boxes[i] as List).toString());
     }
     emit(rowKey, 'pass', i < passes.length ? passes[i] as int? : null);
+    emit(rowKey, 'crop_png_bytes', i < cropPngBytes.length ? cropPngBytes[i] as String? : null);
   }
 
   return AaPayload(rows: rows, cols: cols, vals: vals);

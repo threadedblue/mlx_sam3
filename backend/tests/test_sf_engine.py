@@ -446,6 +446,154 @@ class TestSingleInstanceGeometricSelection:
         np.testing.assert_array_equal(recs[0].geometry, _geom(FAR_AWAY[1]))
 
 
+# ---------------------------------------------------------------------------
+# Point selection: no top-score fallback, no focus hijack
+# (sf-display-and-workflow-v3-spec.md §3 Fix 2)
+# ---------------------------------------------------------------------------
+
+class TestPointSelectionNoFallbackHijack:
+    """Reproduces the investigation's own P1/P2/P3/P5 control study with
+    the fake segmentor: _pick_for_point used to fall back to the
+    highest-confidence returned instance ANYWHERE when none contained the
+    click, and if that instance's geometry happened to IoU-match an
+    existing record (as a leaked/mismatched concept's results often do —
+    confirmed live, up to 1,500px from the actual click), `_select_single`
+    silently reassigned focus to it. `_pick_for_box` is untouched — it
+    keeps its own top-score fallback (test_box_over_empty_background_
+    falls_back_to_top_score above, unmodified) because a drawn BOX region
+    is a much weaker "nothing else to go on" case than a point.
+    """
+
+    def test_point_on_the_object_it_was_drawn_for_still_works(self):
+        """P1 equivalent: baseline, must stay passing. (Already covered by
+        test_point_picks_the_instance_containing_the_click above — this
+        just pins the same shape under this class's own name for the
+        P1/P2/P3/P5 grouping.)"""
+        seg = FakeSam3()
+        seg.geo_rects = [FAR_AWAY[0], DRAWN]
+        seg.geo_scores = [0.99, 0.30]
+        session = _session(seg)
+
+        recs = session.add_point_selection(_norm_point(4, 4), True)
+
+        assert len(recs) == 1
+        np.testing.assert_array_equal(recs[0].geometry, _geom(DRAWN))
+        assert session.last_touched_mask_id == recs[0].mask_id
+
+    def test_point_with_no_containing_instance_does_not_hijack_an_existing_selection(self):
+        """P2/P5 equivalent: a click that hits nothing must not silently
+        focus an unrelated EXISTING record just because the (former)
+        top-score fallback would have picked an instance that happens to
+        geometrically reconcile onto it — exactly the mechanism confirmed
+        live with a leaked text prompt, reproduced here without needing
+        any text/concept simulation at all."""
+        seg = FakeSam3()
+        session = _session(seg)
+        existing = _select_one(session, seg, "prior-search", FAR_AWAY[0])
+        assert session.last_touched_mask_id is None  # text selection never sets focus
+
+        # Neither returned instance contains the click (DRAWN's region) —
+        # but the highest-scoring one (index 0) is geometrically the SAME
+        # object as `existing`, exactly like a leaked-concept point call
+        # returning largely the same candidate set as an earlier search.
+        seg.geo_rects = [FAR_AWAY[0], FAR_AWAY[1]]
+        seg.geo_scores = [0.95, 0.10]
+
+        recs = session.add_point_selection(_norm_point(4, 4), True)
+
+        assert recs == []
+        assert len(session.masks) == 1, "the existing record must not be duplicated or altered"
+        assert session.last_touched_mask_id is None, (
+            "must not silently focus the pre-existing record just because "
+            "the old fallback would have picked an instance that "
+            "happens to reconcile onto it"
+        )
+
+    def test_point_with_no_containing_instance_records_nothing_on_a_blank_session(self):
+        """The simplest case of the same fix: nothing selected yet, click
+        hits nothing -- no record, no crash, focus stays None."""
+        seg = FakeSam3()
+        seg.geo_rects = FAR_AWAY
+        seg.geo_scores = [0.99, 0.5, 0.3]
+        session = _session(seg)
+
+        recs = session.add_point_selection(_norm_point(4, 4), True)
+
+        assert recs == []
+        assert session.masks == []
+        assert session.last_touched_mask_id is None
+
+    def test_a_completely_empty_grounding_result_does_not_echo_a_stale_focus_either(self):
+        """The second, narrower hijack path the investigation flagged
+        explicitly: `_select_single` used to `return []` the instant the
+        raw grounding result had ZERO instances at all, before `pick`
+        (and therefore before the `idx is None` handling above) ever ran
+        — leaving `last_touched_mask_id` exactly as an EARLIER, unrelated
+        call left it. A click that finds literally nothing must clear
+        focus the same way a click that finds candidates-but-no-match
+        does, not echo whatever was focused before."""
+        seg = FakeSam3()
+        session = _session(seg)
+        _select_one(session, seg, "earlier", DRAWN)
+        seg.geo_rects = [FAR_AWAY[0]]
+        another = session.add_box_selection(_norm_box(FAR_AWAY[0]), True)[0]
+        assert session.last_touched_mask_id == another.mask_id  # sanity: focus IS set going in
+
+        seg.geo_rects = []  # SAM3/fake returns NOTHING at all for this click
+
+        recs = session.add_point_selection(_norm_point(1, 1), True)
+
+        assert recs == []
+        assert len(session.masks) == 2, "neither existing record touched"
+        assert session.last_touched_mask_id is None, (
+            "must not keep echoing an EARLIER call's focus as if this "
+            "click (which found nothing) had touched it"
+        )
+
+    def test_point_on_an_already_selected_object_still_reconciles_via_genuine_containment(self):
+        """P3 equivalent: a point clicked ON an object that's already
+        selected must still correctly re-focus the existing record via
+        genuine containment -- Fix 2 only removes the FALLBACK, not the
+        real containment path reconciliation already depends on. The
+        unrelated candidate scores HIGHER here, deliberately, to prove
+        this is containment-driven, not a score-driven coincidence."""
+        seg = FakeSam3()
+        session = _session(seg)
+        existing = _select_one(session, seg, "already-selected", DRAWN)
+
+        seg.geo_rects = [DRAWN, FAR_AWAY[0]]
+        seg.geo_scores = [0.5, 0.99]
+
+        recs = session.add_point_selection(_norm_point(4, 4), True)  # inside DRAWN
+
+        assert recs == [], "no NEW record -- it's the same object"
+        assert len(session.masks) == 1
+        assert session.last_touched_mask_id == existing.mask_id
+
+    def test_an_avoid_click_that_finds_nothing_still_leaves_focus_untouched(self):
+        """Removing the standalone `if not geometries: return []` guard
+        must not disturb Avoid's own, separately-documented "focus is
+        left wherever it was" behavior (see `_select_single`'s own
+        comment) — a negative label with a completely empty grounding
+        result still returns via the `if not label` branch, before ever
+        reaching the idx/pick logic this fix touches."""
+        seg = FakeSam3()
+        seg.geo_rects = [DRAWN]
+        session = _session(seg)
+        existing = session.add_box_selection(_norm_box(DRAWN), True)[0]
+        assert session.last_touched_mask_id == existing.mask_id
+
+        seg.geo_rects = []  # Avoid click that finds nothing at all
+
+        recs = session.add_point_selection(_norm_point(1, 1), False)
+
+        assert recs == []
+        assert session.last_touched_mask_id == existing.mask_id, (
+            "an Avoid call must leave focus exactly where it was, "
+            "empty grounding result or not"
+        )
+
+
 class TestAvoidRefinesRecordedGeometry:
     """Fix regression: the live investigation's case D. `_select_single`
     used to return before reconciling on a negative (Avoid) label, so a
@@ -572,6 +720,68 @@ class TestSelectHoldCaptionIndependence:
         with pytest.raises(ValueError, match="only pass 1"):
             session.set_held(old.mask_id, True)
         assert session.set_held(old.mask_id, False).held is False
+
+
+# ---------------------------------------------------------------------------
+# Reset: discarding SAM3's ungrounded selections without losing committed work
+# ---------------------------------------------------------------------------
+
+class TestDiscardUngroundedSelections:
+    """/reset (main.py) clears SAM3's own grounding/prompt state and calls
+    this to keep sf_session.masks in sync -- an ungrounded selection has
+    nothing else backing it and must go, but a captioned/held selection is
+    committed user work that resetting the live grounding must not erase."""
+
+    def test_an_uncaptioned_unheld_selection_is_discarded(self):
+        seg = FakeSam3()
+        session = _session(seg)
+        rec = _select_one(session, seg, "egg", DRAWN)
+
+        session.discard_ungrounded_selections()
+
+        assert session.masks == []
+        with pytest.raises(sfe.UnknownMaskError):
+            session.get_mask(rec.mask_id)
+
+    def test_a_captioned_selection_survives_geometry_and_status_intact(self):
+        seg = FakeSam3()
+        session = _session(seg)
+        rec = _select_one(session, seg, "egg", DRAWN)
+        session.attach_caption(rec.mask_id, "a red egg")
+
+        session.discard_ungrounded_selections()
+
+        survivor = session.get_mask(rec.mask_id)
+        assert survivor.dataset_status == KEEP
+        assert survivor.caption == "a red egg"
+        np.testing.assert_array_equal(survivor.geometry, rec.geometry)
+
+    def test_a_held_but_uncaptioned_selection_also_survives(self):
+        seg = FakeSam3()
+        session = _session(seg)
+        rec = _select_one(session, seg, "egg", DRAWN)
+        session.set_held(rec.mask_id, True)
+
+        session.discard_ungrounded_selections()
+
+        assert session.get_mask(rec.mask_id).held is True
+
+    def test_only_the_current_pass_is_affected(self):
+        seg = FakeSam3()
+        session = _session(seg)
+        earlier = _select_one(session, seg, "old", DRAWN)  # uncaptioned, unheld
+        session.run_lama_pass(NoOpInpainter())
+        current = _select_one(session, seg, "new", DRAWN)  # also uncaptioned, unheld
+
+        session.discard_ungrounded_selections()
+
+        # The earlier pass's record survives even though it carries no user
+        # state -- discard_ungrounded_selections only scopes to self._pass,
+        # matching _select's own eviction scope. The current pass's
+        # equally-ungrounded record is still discarded as normal.
+        assert session.get_mask(earlier.mask_id).pass_ == 0
+        with pytest.raises(sfe.UnknownMaskError):
+            session.get_mask(current.mask_id)
 
 
 # ---------------------------------------------------------------------------

@@ -65,6 +65,7 @@ class ApiService {
     Uint8List bytes, {
     required String filename,
     String? sessionId,
+    String? imageUrl,
   }) async {
     final uri = Uri.parse("$baseUrl/upload");
 
@@ -79,6 +80,15 @@ class ApiService {
     );
     if (sessionId != null) {
       request.fields['session_id'] = sessionId;
+    }
+    // Unlike `filename` (carried by the multipart file field itself),
+    // image_url has no other way to reach the backend — this is the only
+    // call that supplies it, so a session saved after this survives with
+    // its Image URL field intact on reload (sessionImageUrlFrom on the
+    // read side). Omitted when absent/empty so an unrelated /upload call
+    // never overwrites a URL /initSession already set for this session.
+    if (imageUrl != null && imageUrl.isNotEmpty) {
+      request.fields['image_url'] = imageUrl;
     }
 
     final streamed = await request.send();

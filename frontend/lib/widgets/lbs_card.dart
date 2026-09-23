@@ -6,16 +6,33 @@ import 'package:flutter/material.dart';
 /// transition.
 ///
 /// Stateless by design, like [ResultCell]/`IncludeExcludeToggle` — the
-/// caller (main.dart's state) owns [pendingCount]/[lastScrubLabel]/
-/// [isScrubbing] and the actual API call, the same split already used for
-/// every other per-card widget in this app. `SegmentLayersCard` is the one
-/// exception (a `Provider`-backed `ChangeNotifier`) because layer
-/// visibility is also read by the canvas elsewhere; nothing else needs to
-/// read this card's state, so that heavier pattern isn't warranted here.
+/// caller (main.dart's state) owns [pendingCount]/[hasSelection]/
+/// [lastScrubLabel]/[isScrubbing] and the actual API call, the same split
+/// already used for every other per-card widget in this app.
+/// `SegmentLayersCard` is the one exception (a `Provider`-backed
+/// `ChangeNotifier`) because layer visibility is also read by the canvas
+/// elsewhere; nothing else needs to read this card's state, so that
+/// heavier pattern isn't warranted here.
 class LBSCard extends StatelessWidget {
   /// Regions currently held for the next scrub batch (`held == true` in
   /// the current pass) — a true "awaiting scrub" count, not a proxy.
+  ///
+  /// sf-display-and-workflow-v3-spec.md §5: no longer what gates the
+  /// button (see [hasSelection] for that) — held now means "still checked
+  /// in the opt-out list below," so this is what will ACTUALLY be sent to
+  /// LaMa if Scrub is pressed right now, shown so unchecking a row is
+  /// visibly reflected here before the click.
   final int pendingCount;
+
+  /// Whether one or more objects are currently selected in the current
+  /// pass — via Prompt, Box, or Point, regardless of each one's held
+  /// (checked/unchecked) flag. Drives the button's enabled state (§5):
+  /// Scrub no longer requires a separate Hold step, only a selection to
+  /// review:  it must stay enabled even if the user has unchecked every
+  /// row, since pressing it then is a legitimate (if pointless) empty
+  /// scrub — [pendingCount] is what actually gates what gets sent, not
+  /// this.
+  final bool hasSelection;
 
   /// Null before the first successful scrub this session.
   final String? lastScrubLabel;
@@ -26,6 +43,7 @@ class LBSCard extends StatelessWidget {
   const LBSCard({
     super.key,
     required this.pendingCount,
+    required this.hasSelection,
     required this.lastScrubLabel,
     required this.isScrubbing,
     required this.onScrub,
@@ -70,13 +88,17 @@ class LBSCard extends StatelessWidget {
                 // height is theme-default (no explicit height set), which
                 // is why this doesn't set one either.
                 child: ElevatedButton(
-                  // Disabled with nothing held, not just while a scrub is
-                  // in flight — /lama/scrub still succeeds and advances the
-                  // pass counter on an empty batch (sf-model-v2-design.md
-                  // §3/§4: no "already scrubbed" state to reject), so
-                  // without this a stray click on an empty pending count
-                  // silently walks the pass forward for no visible effect.
-                  onPressed: (isScrubbing || pendingCount == 0) ? null : onScrub,
+                  // §5: gated on SELECTION, not on anything being held —
+                  // Hold is retired as a scrub-eligibility gate. Still
+                  // disabled with nothing selected at all, not just while a
+                  // scrub is in flight — /lama/scrub still succeeds and
+                  // advances the pass counter on an empty batch
+                  // (sf-model-v2-design.md §3/§4: no "already scrubbed"
+                  // state to reject), so without this a stray click with no
+                  // selection on screen silently walks the pass forward for
+                  // no visible effect. Falls out naturally once
+                  // _scrubLamaBackground clears `_segments` post-scrub.
+                  onPressed: (isScrubbing || !hasSelection) ? null : onScrub,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF007F00),
                     foregroundColor: Colors.white,

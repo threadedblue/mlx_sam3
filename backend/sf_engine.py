@@ -363,7 +363,19 @@ def _pick_for_box(
 def _pick_for_point(
     point: Sequence[float], geometries: Sequence[np.ndarray], scores, width: int, height: int,
 ) -> Optional[int]:
-    """Index of the returned instance the user actually clicked inside."""
+    """Index of the returned instance the user actually clicked inside.
+
+    No top-score fallback (v3 spec §3 Fix 2): unlike `_pick_for_box`, a
+    point has no drawn REGION to fall back on when nothing contains it —
+    "no returned instance was under this click" and "no returned instance
+    was under this NxN box" are not the same confidence of "the user
+    probably meant one of these anyway". Confirmed live that falling back
+    to the highest-confidence instance ANYWHERE on the page turned a
+    missed click into a silent selection of an unrelated object, up to
+    1,500px away — worse than doing nothing. A click that hits nothing
+    records nothing; the caller (`_select_single`) leaves focus untouched
+    rather than silently reassigning it.
+    """
     if not geometries:
         return None
     x, y = point
@@ -371,7 +383,7 @@ def _pick_for_point(
     py = min(max(int(round(y * height)), 0), height - 1)
     hits = [i for i, g in enumerate(geometries) if g.shape[0] > py and g.shape[1] > px and g[py, px]]
     if not hits:
-        return _argmax_score(scores)
+        return None
     if len(hits) == 1:
         return hits[0]
     scores_np = np.array(scores) if len(scores) else None
@@ -417,6 +429,14 @@ class SFSession:
         # needed to route the Prompt card's caption-mode call at the right
         # mask_id after a box/point selection.
         self.last_touched_mask_id: Optional[str] = None
+        # mask_ids whose GEOMETRY was refreshed in place by the most recent
+        # `_select`/`_select_single` call (reground reconciliation or an
+        # Avoid refinement) — set fresh on every call, empty if none were.
+        # A crop cache keyed by mask_id (services.py) drains this after each
+        # mutation to know which cached crops are now stale; nothing else
+        # (caption/hold/dataset_status) touches geometry, so nothing else
+        # needs to appear here.
+        self.last_refreshed_mask_ids: set[str] = set()
 
     @property
     def pass_(self) -> int:
@@ -503,6 +523,7 @@ class SFSession:
         """
         prior = [m for m in self.masks if m.pass_ == self._pass]
         self.state = apply(self.state)
+        self.last_refreshed_mask_ids = set()
         # `is None`, not `or []` — state["masks"]/["scores"] are MLX arrays
         # for the real Sam3Processor, and `X or []` forces a bool() on X
         # first; mx.array's __bool__ raises "[convert] Only length-1 arrays
@@ -523,6 +544,7 @@ class SFSession:
             if match is not None:
                 taken.add(match.mask_id)
                 reconciled.append(replace(match, geometry=geometry))
+                self.last_refreshed_mask_ids.add(match.mask_id)
             else:
                 record = MaskRecord(
                     mask_id=f"{self._pass}:{uuid.uuid4()}",
@@ -568,6 +590,7 @@ class SFSession:
         untouched even though they're absent from this call's single pick.
         """
         self.state = apply(self.state)
+        self.last_refreshed_mask_ids = set()
 
         raw_masks = self.state.get("masks")
         raw_masks = [] if raw_masks is None else raw_masks
@@ -577,8 +600,20 @@ class SFSession:
         raw_scores = [] if raw_scores is None else raw_scores
 
         geometries = [_binary_mask(m) for m in raw_masks]
-        if not geometries:
-            return []
+
+        # No standalone "geometries is empty -> return early" guard here
+        # (v3 spec §3 Fix 2, second hijack path): that used to short-circuit
+        # before `pick` ever ran, on a POSITIVE label leaving
+        # last_touched_mask_id at whatever an EARLIER, unrelated call set
+        # it to — the same stale-echo hijack Fix 2 closes for the
+        # non-empty-but-no-match case, just reachable from a genuinely
+        # empty grounding result instead. `pick` (both `_pick_for_box` and
+        # `_pick_for_point`) already returns None for empty input, so
+        # letting execution reach the `idx is None` branch below handles
+        # it correctly and uniformly. The reconciliation loop and the
+        # `label` check immediately below are both no-ops/pass-through on
+        # an empty `geometries` list, so nothing meaningful was actually
+        # being skipped by returning early here.
 
         # Reconcile EVERY raw instance against this pass's existing records
         # by geometry (IoU) — regardless of `label`. `add_geometric_prompt`
@@ -607,6 +642,7 @@ class SFSession:
             if match is not None:
                 taken.add(match.mask_id)
                 refreshed[match.mask_id] = replace(match, geometry=geometry)
+                self.last_refreshed_mask_ids.add(match.mask_id)
                 matched_mask_id_by_index[i] = match.mask_id
         if refreshed:
             self.masks = [refreshed.get(m.mask_id, m) for m in self.masks]
@@ -624,6 +660,16 @@ class SFSession:
         height = self.state.get("original_height") or self.original.size[1]
         idx = pick(geometries, raw_boxes, raw_scores, width, height)
         if idx is None:
+            # `pick` found nothing genuinely corresponding to the drawn
+            # prompt (v3 spec §3 Fix 2 — reachable for point via
+            # `_pick_for_point`'s empty-`hits` case now that it no longer
+            # falls back to a top-score guess). Explicitly clear focus
+            # rather than leaving `last_touched_mask_id` pointing at
+            # whatever an EARLIER, unrelated call last touched: left
+            # alone, the endpoint would echo that stale id as this call's
+            # own `selected_mask_id`, making a failed click indistinguishable
+            # from a successful one that re-touched the same object.
+            self.last_touched_mask_id = None
             return []
 
         # The drawn box/point's own instance was already reconciled above
@@ -721,6 +767,27 @@ class SFSession:
                 f"and only pass {self._pass} is eligible for the next scrub"
             )
         return self._update(mask_id, held=held)
+
+    def discard_ungrounded_selections(self) -> None:
+        """Reset-time cleanup for the CURRENT pass: discard selections that
+        exist only because SAM3's now-cleared prompt state was backing
+        them, while preserving anything carrying user state (kept or
+        held) — the same rule `_select`'s own reconciliation uses to
+        decide what a re-ground is allowed to evict (`_carries_user_state`).
+
+        `/reset` clears SAM3's grounding, which invalidates any
+        UNCOMMITTED selection — nothing else backs it. It must not also
+        discard already-captioned/held work just because the live
+        grounding state moved on: those two are different things, and
+        conflating them made kept/held masks vanish from the canvas (and
+        from `serialize_sf_masks`'s response) the moment a user reset
+        prompts, even though the work itself was never touched. Other
+        passes are untouched, matching `_select`'s own eviction scope.
+        """
+        self.masks = [
+            m for m in self.masks
+            if m.pass_ != self._pass or _carries_user_state(m)
+        ]
 
     # -- scrubbing ------------------------------------------------------------
 

@@ -32,11 +32,11 @@ dependencies:
     sdk: flutter
 
   # Paginated preview table for AA-shaped data, shared with DoubleNaught —
-  # see shared_widgets/aa_preview_table. SF has no domain AA payload type of
+  # see DoubleForgeCommons/aa_preview_table. SF has no domain AA payload type of
   # its own; sf_aa_preview_adapter.dart converts SFSession's mask records
   # into the package's generic AaPayload at the one call site that uses it.
   aa_preview_table:
-    path: ../../shared_widgets/aa_preview_table
+    path: ../../DoubleForgeCommons/aa_preview_table
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.

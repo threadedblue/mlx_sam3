@@ -106,12 +106,23 @@ class Sam3Processor:
         if "backbone_out" not in state:
             raise ValueError("You must call set_image before set_text_prompt")
 
-        if "language_features" not in state["backbone_out"]:
-            # Looks like we don't have a text prompt yet. This is allowed, but we need to set the text prompt to "visual" for the model to rely only on the geometric prompt
-            dummy_text_outputs = self.model.backbone.call_text(
-                ["visual"]
-            )
-            state["backbone_out"].update(dummy_text_outputs)
+        # ALWAYS ground on the dummy "visual" concept, unconditionally —
+        # never on whatever text happens to already be in backbone_out.
+        # A geometric prompt is spatial by nature; nothing about this call
+        # says the user wants it conditioned on an earlier, unrelated text
+        # prompt still sitting in state from a prior, abandoned search.
+        # Reconciliation against existing records is purely geometric
+        # (IoU, see sf_engine.py's _best_match), so there is no legitimate
+        # case where inheriting that leftover text helps — confirmed live
+        # (sf-display-and-workflow-v3-spec.md §3): a stale prompt left a
+        # later point click grounded on the wrong concept, which returned
+        # zero masks containing the actual click and — combined with
+        # _pick_for_point's old top-score fallback — silently reassigned
+        # focus to an unrelated object up to 1,500px away.
+        dummy_text_outputs = self.model.backbone.call_text(
+            ["visual"]
+        )
+        state["backbone_out"].update(dummy_text_outputs)
 
         if "geometric_prompt" not in state:
             state["geometric_prompt"] = self.model._get_dummy_prompt()
@@ -138,12 +149,13 @@ class Sam3Processor:
         if "backbone_out" not in state:
             raise ValueError("You must call set_image before set_text_prompt")
 
-        if "language_features" not in state["backbone_out"]:
-            # Looks like we don't have a text prompt yet. This is allowed, but we need to set the text prompt to "visual" for the model to rely only on the geometric prompt
-            dummy_text_outputs = self.model.backbone.call_text(
-                ["visual"]
-            )
-            state["backbone_out"].update(dummy_text_outputs)
+        # ALWAYS ground on the dummy "visual" concept, unconditionally —
+        # see add_geometric_prompt's identical comment for the full
+        # reasoning (sf-display-and-workflow-v3-spec.md §3 Fix 1).
+        dummy_text_outputs = self.model.backbone.call_text(
+            ["visual"]
+        )
+        state["backbone_out"].update(dummy_text_outputs)
 
         if "geometric_prompt" not in state:
             state["geometric_prompt"] = self.model._get_dummy_prompt()

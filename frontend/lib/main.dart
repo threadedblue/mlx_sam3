@@ -44,6 +44,75 @@ void main() {
 /// the canvas ignores taps and drags.
 enum SelectionMode { prompt, box, point }
 
+/// Whether the Prompt card's submit button should be enabled — shared by
+/// both of its faces: "Select" (a standalone text-prompt search) and "Save
+/// Caption" (committing a caption to the already-focused mask).
+///
+/// sf-display-and-workflow-v3-spec.md §4: **Select** is disabled while Box
+/// or Point mode is active — mode-exclusive, not a permanent disable, since
+/// Select is specifically the trigger for a standalone text-prompt search
+/// and isn't meant to run alongside box/point. **Save Caption is
+/// unaffected by this**: it commits a caption to whatever mask box/point
+/// selection just focused, which is a normal step immediately after a
+/// box/point selection, not a competing search — disabling it on the same
+/// condition would break that workflow rather than fix anything §4 asks
+/// for.
+bool promptCardCanSubmit({
+  required bool hasSession,
+  required bool promptEmpty,
+  required bool isLoading,
+  required bool captionMode,
+  required SelectionMode? selectedMode,
+}) {
+  if (!hasSession || promptEmpty || isLoading) return false;
+  if (captionMode) return true;
+  return selectedMode != SelectionMode.box && selectedMode != SelectionMode.point;
+}
+
+/// A Target/Avoid prompt with nothing recorded (`mask_ids` empty) draws its
+/// marker exactly like one that found something — a small dot, accumulating
+/// with every click — which is easy to mistake for "a mask should have
+/// appeared here" (the investigation's Case F/G: three Avoid clicks with no
+/// Target, landing on unintended objects, giving no feedback that nothing
+/// was ever selected). This distinguishes the two in the same status line
+/// the "Done" label already occupies, rather than adding a new UI element.
+String promptStatusLabel(Map<String, dynamic>? result) {
+  final maskIds = result?['mask_ids'] as List?;
+  return (maskIds == null || maskIds.isEmpty) ? '0 objects found' : 'Done';
+}
+
+/// Box/point status, aware of what THIS call itself found — not just
+/// whether the current pass has ever selected anything ([promptStatusLabel]
+/// alone).
+///
+/// sf-display-and-workflow-v3-spec.md §3 Fix 2: a positive click that finds
+/// no containing instance no longer silently falls back to an unrelated
+/// object — the backend clears `selected_mask_id` to null specifically for
+/// that case (see sf_engine.py's `_select_single`). So on a POSITIVE click,
+/// a null `selected_mask_id` means this click itself found nothing, even
+/// though other selections may already exist from earlier in the pass. On
+/// a NEGATIVE (Avoid) click `selected_mask_id` is left untouched by design
+/// (an Avoid call doesn't set focus — see `_select_single`'s own comment),
+/// so it carries no such meaning there and [promptStatusLabel]'s original
+/// whole-pass check is what applies.
+String positiveClickStatusLabel(Map<String, dynamic> response, bool isPositive) {
+  if (isPositive && response['selected_mask_id'] == null) {
+    return '0 objects found';
+  }
+  return promptStatusLabel(response['results'] as Map<String, dynamic>?);
+}
+
+/// The Image URL field's display value from a `/loadSession` response —
+/// `session['image_url']`, sourced from registry.parquet's `image_url`
+/// column (services.py's `load_session_from_disk`), trimmed, with an
+/// absent/empty/whitespace-only value normalized to null (the field's own
+/// "(no image URL)" placeholder condition) rather than shown as an empty
+/// string.
+String? sessionImageUrlFrom(Map<String, dynamic> session) {
+  final url = (session['image_url'] as String?)?.trim();
+  return (url != null && url.isNotEmpty) ? url : null;
+}
+
 class SamApp extends StatelessWidget {
   const SamApp({super.key});
 
@@ -361,9 +430,22 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _sessionName;
   String? _sessionDescription;
 
-  Uint8List? _imageBytes; // Web-safe image data
-  ui.Image? _uiImage; // Decoded image for canvas
-  Size? _imageSize; // Original size
+  Uint8List? _imageBytes; // Web-safe image data (current pass's working image)
+  ui.Image? _uiImage; // Decoded image for canvas (current pass's working image)
+  Size? _imageSize; // Current pass's image size
+
+  /// Pass 0 — the true original image, retained separately from
+  /// [_imageBytes]/[_uiImage]/[_imageSize] above so it survives a scrub.
+  /// Set ONCE, at the same two points those fields are first set (launch
+  /// session load, upload completion) — see [_loadLaunchSession] and
+  /// [_loadImageFromUrl] — and never touched anywhere else, specifically
+  /// not in [_scrubLamaBackground]. Confirmed live: before this slot
+  /// existed, `_imageBytes`/`_uiImage` was a single slot unconditionally
+  /// overwritten on every scrub, so "Original" silently became whatever
+  /// the current pass was for any session with a scrub behind it.
+  Uint8List? _originalBytes;
+  ui.Image? _originalUiImage;
+  Size? _originalImageSize;
 
   Map<String, dynamic>? _result;
   // Session-wide mask ledger (every pass, not just the current one) for
@@ -388,7 +470,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // Per-card result state
   bool _imageSourceRunning = false;
-  List<ResultDatum> _imageSourceResult = [];
   bool _textPromptRunning = false;
   List<ResultDatum> _textPromptResult = [];
   bool _boxRunning = false;
@@ -398,10 +479,11 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isScrubbing = false;
   String? _lastScrubLabel;
 
-  /// The mask a box/point selection (or a Hold toggle) most recently
-  /// touched — what the Prompt card's caption mode and the Hold control
-  /// act on. Cleared on scrub (the pass changes; whatever was focused no
-  /// longer has a live geometry in the new pass's result set).
+  /// The mask a box/point selection (or the scrub-batch checkbox list)
+  /// most recently touched — what the Prompt card's caption mode and
+  /// [_setMaskHeld] act on. Cleared on scrub (the pass changes; whatever
+  /// was focused no longer has a live geometry in the new pass's result
+  /// set).
   String? _focusedMaskId;
 
   Segment? get _focusedSegment {
@@ -502,11 +584,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Puts a launch-supplied session on screen: its name, its description and
   /// its image, straight from the backend.
   ///
-  /// Deliberately independent of the model: `/loadSession` reads state.json and
-  /// the stored PNG, so none of this waits on SAM. The upload in
-  /// [_maybeAutoLoadImage] still has to happen — only `/upload` builds the
-  /// in-memory image state that `/segment/*` works from — but the user should
-  /// not be looking at an empty window until then.
+  /// Deliberately independent of the model: `/loadSession` reads the
+  /// persisted AAs directly, so none of this waits on SAM — but it ALSO now
+  /// fully restores the backend's in-memory session and SFSession as a side
+  /// effect (services.py's `load_session_from_disk`), so by the time this
+  /// returns, `/segment/*` already has everything it needs for this
+  /// session. [_maybeAutoLoadImage] still fires afterward, but for a
+  /// resumed session (bytes already in hand here) it no longer re-uploads —
+  /// see `_loadImageFromUrl`'s early return — since doing so used to rebuild
+  /// the session from scratch and silently discard what this just restored.
   Future<void> _loadLaunchSession() async {
     final sessionId = _sessionId;
     if (sessionId == null || sessionId.isEmpty) return;
@@ -538,9 +624,20 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     if (!mounted) return;
 
+    // Wiring gap (v3): /loadSession's response has carried `image_url` from
+    // registry.parquet all along (services.py's load_session_from_disk),
+    // but nothing here ever read it — the Image URL field showed its
+    // "(no image URL)" placeholder even for a session that genuinely has
+    // one on disk, same shape as the earlier scrub/image_b64 and
+    // caption-color wiring gaps.
+    final sessionImageUrl = sessionImageUrlFrom(session);
+
     setState(() {
       _sessionName = (session['name'] as String?)?.trim();
       _sessionDescription = (session['description'] as String?)?.trim();
+      if (sessionImageUrl != null) {
+        _imageUrl = sessionImageUrl;
+      }
       if (bytes != null && decoded != null) {
         _imageBytes = bytes;
         _uiImage = decoded;
@@ -548,19 +645,20 @@ class _HomeScreenState extends State<HomeScreen> {
           (session['width'] as num?)?.toDouble() ?? decoded.width.toDouble(),
           (session['height'] as num?)?.toDouble() ?? decoded.height.toDouble(),
         );
-        _imageSourceResult = [
-          ResultDatum(label: 'Session', value: _sessionName ?? sessionId),
-        ];
+        _originalBytes = bytes;
+        _originalUiImage = decoded;
+        _originalImageSize = _imageSize;
       }
     });
   }
 
-  /// Registers the launch image with the backend once the model is ready.
+  /// Gets a genuinely new launch image registered with the backend once the
+  /// model is ready — a resumed session (bytes already in hand from
+  /// [_loadLaunchSession]) needs no registration here at all; see
+  /// `_loadImageFromUrl`'s early return.
   ///
   /// /upload answers 503 until the model finishes loading, so this waits for
-  /// the first "online" health check rather than firing from initState. Bytes
-  /// already in hand from [_loadLaunchSession] are reused — the image only
-  /// needs fetching when the session had none stored.
+  /// the first "online" health check rather than firing from initState.
   void _maybeAutoLoadImage() {
     if (_autoLoadStarted) return;
     if (_backendStatus != "online") return;
@@ -720,49 +818,67 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
-      Uint8List imageBytes;
-      ui.Image decodedImage;
       if (preloaded != null) {
-        imageBytes = preloaded;
-        decodedImage = _uiImage ?? await _decodeImage(preloaded);
-      } else {
-        // Handle file:// URIs (from standalone file picker) by reading directly
-        // from the filesystem. HTTP URLs use http.get as before.
-        if (url!.startsWith('file://')) {
-          // Convert file:// URI to filesystem path and read bytes directly.
-          // Use toFilePath() instead of .path to properly decode percent-encoding
-          // (e.g. %20 → space) and handle platform-specific path conversion.
-          final filePath = Uri.parse(url).toFilePath();
-          debugPrint('Loading image from file:// URI: $url -> path: $filePath');
-          try {
-            imageBytes = await File(filePath).readAsBytes();
-            debugPrint('Successfully read ${imageBytes.length} bytes from file');
-            decodedImage = await _decodeImage(imageBytes);
-          } catch (e) {
-            debugPrint('Error reading file from file:// URI: $e');
-            rethrow;
-          }
-        } else {
-          final response = await http.get(Uri.parse(url));
-          if (response.statusCode != 200) {
-            throw Exception("Failed to download image: ${response.statusCode}");
-          }
-          imageBytes = response.bodyBytes;
-          decodedImage = await _decodeImage(imageBytes);
-        }
+        // Resuming an existing session: these bytes came from /loadSession
+        // (_loadLaunchSession), which already fully restored the backend's
+        // in-memory session AND reconstructed its SFSession with every
+        // persisted mask (services.py's load_session_from_disk now warms
+        // that cache as a side effect). There is nothing left for /upload
+        // to legitimately do here — it exists to (re-)initialize SAM3's
+        // state for a genuinely NEW image, which this isn't. Calling it
+        // anyway used to rebuild the session from scratch and silently
+        // discard everything /loadSession just restored (confirmed live:
+        // name, description, prompts and masks all gone the instant the
+        // app finished launching, before the user touched anything).
+        // Every field the old upload-response handler set here
+        // (_imageBytes/_uiImage/_imageSize/_originalBytes/etc.) is already
+        // in place too — _loadLaunchSession set all of it from the same
+        // /loadSession response these bytes came from.
+        return;
       }
 
-      final filename = url == null || url.split('/').last.isEmpty
-          ? "image.png"
-          : url.split('/').last;
+      // preloaded == null here (the resume case returned above), so §807's
+      // guard guarantees url is non-null and non-empty — a genuinely new
+      // image, from a URL: standalone file-pick (file://) or DN launching
+      // straight into a fresh, never-saved session (http(s)://).
+      Uint8List imageBytes;
+      ui.Image decodedImage;
+      // Handle file:// URIs (from standalone file picker) by reading directly
+      // from the filesystem. HTTP URLs use http.get as before.
+      if (url!.startsWith('file://')) {
+        // Convert file:// URI to filesystem path and read bytes directly.
+        // Use toFilePath() instead of .path to properly decode percent-encoding
+        // (e.g. %20 → space) and handle platform-specific path conversion.
+        final filePath = Uri.parse(url).toFilePath();
+        debugPrint('Loading image from file:// URI: $url -> path: $filePath');
+        try {
+          imageBytes = await File(filePath).readAsBytes();
+          debugPrint('Successfully read ${imageBytes.length} bytes from file');
+          decodedImage = await _decodeImage(imageBytes);
+        } catch (e) {
+          debugPrint('Error reading file from file:// URI: $e');
+          rethrow;
+        }
+      } else {
+        final response = await http.get(Uri.parse(url));
+        if (response.statusCode != 200) {
+          throw Exception("Failed to download image: ${response.statusCode}");
+        }
+        imageBytes = response.bodyBytes;
+        decodedImage = await _decodeImage(imageBytes);
+      }
+
+      final filename = url.split('/').last.isEmpty ? "image.png" : url.split('/').last;
 
       // Upload to backend. This is what gives /segment/* something to work
-      // from: only /upload builds the in-memory image state.
+      // from for a genuinely new image — a resumed session's in-memory
+      // state comes from /loadSession instead (see the early return above).
       debugPrint('Uploading ${imageBytes.length} bytes with filename=$filename, sessionId=$_sessionId');
       final uploadResponse = await _api.uploadImageBytes(
         imageBytes,
         filename: filename,
         sessionId: _sessionId,
+        imageUrl: url,
       );
       debugPrint('Upload response: $uploadResponse');
 
@@ -775,13 +891,12 @@ class _HomeScreenState extends State<HomeScreen> {
             (uploadResponse['width'] as num).toDouble(),
             (uploadResponse['height'] as num).toDouble(),
           );
+          _originalBytes = imageBytes;
+          _originalUiImage = decodedImage;
+          _originalImageSize = _imageSize;
           _result = null;
           _segments = [];
           _aaPreviewData = null; // fresh upload — new session/pass 0, nothing selected yet
-          _imageSourceResult = [
-            ResultDatum(label: url != null ? 'URL' : 'Session',
-                value: url ?? _sessionId ?? ''),
-          ];
         });
         debugPrint('Upload complete. sessionId=$_sessionId, imageSize=$_imageSize');
       }
@@ -866,7 +981,6 @@ class _HomeScreenState extends State<HomeScreen> {
           if (s.maskId == maskId)
             Segment(
               path: s.path,
-              retouchedImage: s.retouchedImage,
               maskId: s.maskId,
               datasetStatus: datasetStatus ?? s.datasetStatus,
               held: held ?? s.held,
@@ -897,6 +1011,13 @@ class _HomeScreenState extends State<HomeScreen> {
   /// `_buildResultsCard` now renders one checkbox per selected mask, all
   /// routed through here, instead of one checkbox for whichever mask
   /// happened to be focused.
+  ///
+  /// sf-display-and-workflow-v3-spec.md §5: the backend now auto-holds a
+  /// mask the instant it's selected (every `/segment/*` call holds its own
+  /// new records), so in practice this is called with `held: false` far
+  /// more often now — unchecking a row to opt it OUT of the next scrub
+  /// batch — rather than `held: true` to opt one in. The call itself is
+  /// unchanged either way; only which direction gets used more changed.
   Future<void> _setMaskHeld(String maskId, bool held) async {
     if (_sessionId == null) return;
     try {
@@ -917,19 +1038,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// A Target/Avoid prompt with nothing recorded (`mask_ids` empty) draws
-  /// its marker exactly like one that found something -- a small dot,
-  /// accumulating with every click -- which is easy to mistake for "a mask
-  /// should have appeared here" (the investigation's Case F/G: three Avoid
-  /// clicks with no Target, landing on unintended objects, giving no
-  /// feedback that nothing was ever selected). This distinguishes the two
-  /// in the same status line the "Done" label already occupies, rather
-  /// than adding a new UI element.
-  String _promptStatusLabel(Map<String, dynamic>? result) {
-    final maskIds = result?['mask_ids'] as List?;
-    return (maskIds == null || maskIds.isEmpty) ? '0 objects found' : 'Done';
-  }
-
   Future<void> _sendBoxPrompt(List<double> box) async {
     if (_sessionId == null) return;
     setState(() { _isLoading = true; _boxRunning = true; _boxResult = []; });
@@ -942,7 +1050,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
-          _boxResult = [ResultDatum(label: 'Status', value: _promptStatusLabel(_result))];
+          _boxResult = [ResultDatum(label: 'Status', value: positiveClickStatusLabel(response, _boxMode == "positive"))];
         });
       }
     } catch (e) {
@@ -965,7 +1073,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
-          _pointResult = [ResultDatum(label: 'Status', value: _promptStatusLabel(_result))];
+          _pointResult = [ResultDatum(label: 'Status', value: positiveClickStatusLabel(response, _pointMode == "positive"))];
         });
       }
     } catch (e) {
@@ -1038,6 +1146,9 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _lastScrubLabel = "Pass ${response['from_pass']} → Pass ${response['to_pass']}";
           if (bytes != null && decoded != null) {
+            // Deliberately NOT touching _originalBytes/_originalUiImage/
+            // _originalImageSize here — those are pass 0 and must survive
+            // every scrub unchanged; only the current-pass slot moves.
             _imageBytes = bytes;
             _uiImage = decoded;
             _imageSize = Size(
@@ -1105,7 +1216,7 @@ class _HomeScreenState extends State<HomeScreen> {
           'original': _layerState!.showOriginal,
           'masks': _layerState!.showMasks,
           'raw': _layerState!.showRaw,
-          'final': _layerState!.showFinal,
+          'current': _layerState!.showCurrent,
         }
       });
     } catch (e) {
@@ -1193,7 +1304,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   _buildCardRow(_buildSessionCard(),       const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildUploadCard(),        ResultCell(isRunning: _imageSourceRunning, data: _imageSourceResult)),
+                  _buildCardRow(_buildUploadCard(),        ResultCell(isRunning: _imageSourceRunning, data: const [])),
                   const SizedBox(height: 16),
                   _buildCardRow(_buildTextPromptCard(),    ResultCell(isRunning: _textPromptRunning, data: _textPromptResult)),
                   const SizedBox(height: 16),
@@ -1245,6 +1356,7 @@ class _HomeScreenState extends State<HomeScreen> {
               child: DisplayAreaTabs(
                 imageBytes: _imageBytes,
                 uiImage: _uiImage,
+                originalUiImage: _originalUiImage,
                 segments: _segments,
                 result: _result,
                 aaPreviewData: _aaPreviewData,
@@ -1565,7 +1677,13 @@ class _HomeScreenState extends State<HomeScreen> {
             SizedBox(
               width: double.infinity,
               child: OutlinedButton(
-                onPressed: (_sessionId == null || _textController.text.isEmpty || _isLoading) ? null : _sendTextPrompt,
+                onPressed: promptCardCanSubmit(
+                  hasSession: _sessionId != null,
+                  promptEmpty: _textController.text.isEmpty,
+                  isLoading: _isLoading,
+                  captionMode: captionMode,
+                  selectedMode: _selectedMode,
+                ) ? _sendTextPrompt : null,
                 style: OutlinedButton.styleFrom(
                   foregroundColor: captionMode ? const Color(0xFF007F00) : Colors.white,
                   side: BorderSide(color: captionMode ? const Color(0xFF007F00) : Colors.white),
@@ -1665,8 +1783,15 @@ class _HomeScreenState extends State<HomeScreen> {
     // before that data existed.
     final heldFlags = _result?['held_flags'] as List?;
     final pendingCount = heldFlags?.where((h) => h == true).length ?? 0;
+    // v3 spec §5: Scrub's own enabled state is gated on SELECTION existing
+    // at all, not on held count — same holdable filter ObjectsSelectedCard
+    // uses for its checkbox list (a bbox-fallback segment with no maskId
+    // can't be tracked as held/scrubbed, so it doesn't count as a
+    // selection either).
+    final hasSelection = _segments.any((s) => s.maskId != null);
     return LBSCard(
       pendingCount: pendingCount,
+      hasSelection: hasSelection,
       lastScrubLabel: _lastScrubLabel,
       isScrubbing: _isScrubbing,
       onScrub: _scrubLamaBackground,
@@ -1725,6 +1850,10 @@ class _HomeScreenState extends State<HomeScreen> {
 class DisplayAreaTabs extends StatefulWidget {
   final Uint8List? imageBytes;
   final ui.Image? uiImage;
+  /// Pass 0 — the true original image, separate from [uiImage] (the
+  /// current-pass working image). See main.dart's `_originalUiImage` field
+  /// doc comment.
+  final ui.Image? originalUiImage;
   final List<Segment> segments;
   final Map<String, dynamic>? result;
   // Session-wide mask ledger (every pass), separate from `result` (current
@@ -1742,6 +1871,7 @@ class DisplayAreaTabs extends StatefulWidget {
     super.key,
     required this.imageBytes,
     required this.uiImage,
+    required this.originalUiImage,
     required this.segments,
     required this.result,
     required this.aaPreviewData,
@@ -1804,7 +1934,10 @@ class _DisplayAreaTabsState extends State<DisplayAreaTabs> with SingleTickerProv
               // counts that's negligible, and simpler than gating it on
               // `_tabController.index`, which would need its own listener
               // for no real benefit.
-              AaPreviewTableWidget(aa: sfResultToAaPayload(widget.aaPreviewData)),
+              AaPreviewTableWidget(
+                aa: sfResultToAaPayload(widget.aaPreviewData),
+                imageColumn: 'crop_png_bytes',
+              ),
             ],
           ),
         ),
@@ -1830,6 +1963,11 @@ class _DisplayAreaTabsState extends State<DisplayAreaTabs> with SingleTickerProv
     }
     return SegmentationCanvas(
       uiImage: widget.uiImage!,
+      // Falls back to the current-pass image only if the original slot
+      // somehow hasn't been populated yet — in practice both are always
+      // set together (see main.dart's `_originalUiImage` field doc
+      // comment), so this is defensive, not the normal path.
+      originalImage: widget.originalUiImage ?? widget.uiImage!,
       segments: widget.segments,
       result: widget.result,
       isLoading: widget.isLoading,
@@ -1842,6 +1980,10 @@ class _DisplayAreaTabsState extends State<DisplayAreaTabs> with SingleTickerProv
 
 class SegmentationCanvas extends StatefulWidget {
   final ui.Image uiImage;
+  /// Pass 0 — the true original image, distinct from [uiImage] (the
+  /// current-pass working image). Fed straight through to
+  /// [LayeredSegmentationCanvas]'s Original layer.
+  final ui.Image originalImage;
   final List<Segment> segments;
   final Map<String, dynamic>? result;
   final bool isLoading;
@@ -1856,6 +1998,7 @@ class SegmentationCanvas extends StatefulWidget {
   const SegmentationCanvas({
     super.key,
     required this.uiImage,
+    required this.originalImage,
     required this.segments,
     this.result,
     required this.isLoading,
@@ -1892,7 +2035,8 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
       children: [
         // The core display layers
         LayeredSegmentationCanvas(
-          originalImage: widget.uiImage,
+          originalImage: widget.originalImage,
+          currentImage: widget.uiImage,
           segments: widget.segments,
         ),
 

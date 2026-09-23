@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 
 import '../layered_segmentation_canvas.dart';
 
-/// "Objects Selected" card: object count, one Hold checkbox per currently
-/// selected mask, and a Clear Prompts button.
+/// "Objects Selected" card: object count, one scrub-batch checkbox per
+/// currently selected mask, and a Clear Prompts button.
 ///
 /// Stateless by design, like [LBSCard]/`ResultCell` — the caller
 /// (main.dart's state) owns [segments] and the actual `/mask/hold` call.
@@ -13,10 +13,20 @@ import '../layered_segmentation_canvas.dart';
 /// none of them focused — only box/point selection sets a focused mask id,
 /// since text has no single "the" instance to point at. Gating the
 /// checkbox on a focused mask left a multi-object text selection with no
-/// way to hold ANY of its results without individually re-clicking each
+/// way to act on ANY of its results without individually re-clicking each
 /// one via box/point first, which is what actually happened: the checkbox
 /// disappeared entirely after a 4-result text search, not just for one of
 /// the four.
+///
+/// sf-display-and-workflow-v3-spec.md §5: this list no longer GATES scrub
+/// eligibility (Scrub Selected Regions is enabled the moment anything is
+/// selected — see [LBSCard]) — it's an opt-OUT batch-membership selector
+/// now. Every checkbox starts CHECKED (the backend auto-holds a mask the
+/// instant it's selected, matching that default), and unchecking one
+/// excludes that specific object from the next scrub without touching
+/// whether Scrub itself is clickable. Same `held` field and `/mask/hold`
+/// call as before — only the default and the row's meaning changed, not
+/// the wire contract.
 class ObjectsSelectedCard extends StatelessWidget {
   final int maskCount;
   final List<Segment> segments;
@@ -81,9 +91,11 @@ class ObjectsSelectedCard extends StatelessWidget {
                     controlAffinity: ListTileControlAffinity.leading,
                     contentPadding: EdgeInsets.zero,
                     dense: true,
+                    // Checked by default (§5) — this is an opt-OUT of the
+                    // next scrub batch, not an opt-in Hold anymore.
                     title: Text(holdable.length == 1
-                        ? "Hold for next scrub"
-                        : "Hold ${_shortMaskId(seg.maskId!)} for next scrub"),
+                        ? "Include in next scrub"
+                        : "Include ${_shortMaskId(seg.maskId!)} in next scrub"),
                   ),
               ],
               const SizedBox(height: 12),

@@ -71,10 +71,11 @@ void main() {
     // even with an empty held set (no "already scrubbed" state to reject
     // per sf-model-v2-design.md §3/§4) -- the button itself has to be the
     // guard against a stray click doing that silently.
-    testWidgets('scrub button disabled with 0 pending regions, even when not scrubbing', (tester) async {
+    testWidgets('scrub button disabled with nothing selected, even when not scrubbing', (tester) async {
       var scrubCalls = 0;
       await tester.pumpWidget(_wrap(LBSCard(
         pendingCount: 0,
+        hasSelection: false,
         lastScrubLabel: null,
         isScrubbing: false,
         onScrub: () => scrubCalls++,
@@ -82,13 +83,19 @@ void main() {
 
       await tester.tap(find.text('Scrub Selected Regions'));
       await tester.pump();
-      expect(scrubCalls, 0, reason: 'a click with nothing held must not invoke onScrub');
+      expect(scrubCalls, 0, reason: 'a click with no selection must not invoke onScrub');
     });
 
-    testWidgets('scrub button enabled once something is held', (tester) async {
+    // v3 spec §5: Hold is retired as a scrub-eligibility gate -- SELECTION
+    // alone enables the button now, across all three selection modes
+    // (Prompt/Box/Point all populate main.dart's `_segments` the same way,
+    // which is what `hasSelection` is computed from — see _buildLBSCard).
+    testWidgets('scrub button enabled the moment something is selected, with nothing held/checked yet',
+        (tester) async {
       var scrubCalls = 0;
       await tester.pumpWidget(_wrap(LBSCard(
-        pendingCount: 1,
+        pendingCount: 0, // nothing checked — proves this does NOT gate the button anymore
+        hasSelection: true,
         lastScrubLabel: null,
         isScrubbing: false,
         onScrub: () => scrubCalls++,
@@ -99,10 +106,11 @@ void main() {
       expect(scrubCalls, 1);
     });
 
-    testWidgets('scrub button stays disabled while scrubbing even with pending regions', (tester) async {
+    testWidgets('scrub button stays disabled while scrubbing even with a selection', (tester) async {
       var scrubCalls = 0;
       await tester.pumpWidget(_wrap(LBSCard(
         pendingCount: 3,
+        hasSelection: true,
         lastScrubLabel: null,
         isScrubbing: true,
         onScrub: () => scrubCalls++,
@@ -110,6 +118,34 @@ void main() {
 
       expect(find.text('Scrub Selected Regions'), findsNothing); // spinner replaces the label
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    });
+
+    testWidgets('scrub button disables again once the post-scrub rebuild clears the selection', (tester) async {
+      // Models _scrubLamaBackground's own setState: `_segments = []` after
+      // a completed scrub, which is what main.dart derives `hasSelection`
+      // from (_buildLBSCard) — this is the rebuild that follows, not a new
+      // mechanism of LBSCard's own.
+      var scrubCalls = 0;
+      await tester.pumpWidget(_wrap(LBSCard(
+        pendingCount: 2,
+        hasSelection: true,
+        lastScrubLabel: null,
+        isScrubbing: false,
+        onScrub: () => scrubCalls++,
+      )));
+      expect(find.byType(ElevatedButton).evaluate().single.widget, isA<ElevatedButton>()
+          .having((b) => b.onPressed, 'onPressed', isNotNull));
+
+      await tester.pumpWidget(_wrap(LBSCard(
+        pendingCount: 0,
+        hasSelection: false,
+        lastScrubLabel: 'Pass 0 → Pass 1',
+        isScrubbing: false,
+        onScrub: () => scrubCalls++,
+      )));
+
+      expect(find.byType(ElevatedButton).evaluate().single.widget, isA<ElevatedButton>()
+          .having((b) => b.onPressed, 'onPressed', isNull));
     });
   });
 
@@ -172,8 +208,8 @@ void main() {
       )));
 
       expect(tester.takeException(), isNull);
-      expect(find.textContaining('Hold a for next scrub'), findsOneWidget);
-      expect(find.textContaining('Hold bb for next scrub'), findsOneWidget);
+      expect(find.textContaining('Include a in next scrub'), findsOneWidget);
+      expect(find.textContaining('Include bb in next scrub'), findsOneWidget);
     });
 
     testWidgets('a single-object selection still works (no regression for the common case)', (tester) async {
@@ -271,7 +307,7 @@ void main() {
         // Opaque backdrop so alpha-blended fill/stroke colors read back
         // deterministically instead of blending against a transparent pixel.
         canvas.drawRect(Offset.zero & size, Paint()..color = Colors.black);
-        MasksPainter(segments: [segment], showOriginal: false).paint(canvas, size);
+        MasksPainter(segments: [segment], backgroundVisible: false).paint(canvas, size);
         final image = await recorder.endRecording().toImage(size.width.toInt(), size.height.toInt());
         final bytes = (await image.toByteData(format: ui.ImageByteFormat.rawRgba))!.buffer.asUint8List();
         final offset = (point.dy.toInt() * size.width.toInt() + point.dx.toInt()) * 4;
@@ -351,6 +387,68 @@ void main() {
     });
   });
 
+  group('LayeredSegmentationCanvas: Original survives a scrub', () {
+    // Regression test for the bug this fix exists for: `originalImage`
+    // (Original layer) and `currentImage` (Raw/Current layers) used to be
+    // ONE slot in main.dart (`_imageBytes`/`_uiImage`), unconditionally
+    // overwritten by every scrub — so Original silently showed the current
+    // pass, not pass 0, for any session with a scrub behind it. Reference
+    // identity is the right thing to assert here, not pixel content:
+    // main.dart never re-decodes pass 0's bytes on a scrub, it keeps the
+    // same ui.Image object pinned in `_originalUiImage` (see its field doc
+    // comment) — the bug this guards against is exactly that pinning being
+    // silently dropped, which reference identity catches directly.
+    late ui.Image pass0;
+    late ui.Image pass1;
+
+    setUpAll(() async {
+      pass0 = await _solidImage(64, 64);
+      pass1 = await _solidImage(64, 64);
+    });
+
+    T painterOf<T extends CustomPainter>(WidgetTester tester) => tester
+        .widgetList<CustomPaint>(find.descendant(
+          of: find.byType(LayeredSegmentationCanvas),
+          matching: find.byType(CustomPaint),
+        ))
+        .map((w) => w.painter)
+        .whereType<T>()
+        .single;
+
+    testWidgets(
+        'Original stays pinned to pass 0 across a simulated scrub; Raw and Current follow the current pass',
+        (tester) async {
+      // "Load": pass 0 and the current pass start out identical, matching
+      // main.dart setting _originalUiImage/_uiImage from the same decoded
+      // bytes at the same upload-completion point.
+      await tester.pumpWidget(_wrap(LayeredSegmentationCanvas(
+        originalImage: pass0,
+        currentImage: pass0,
+        segments: const <Segment>[],
+      )));
+
+      expect(painterOf<OriginalImagePainter>(tester).image, same(pass0));
+      expect(painterOf<CurrentImagePainter>(tester).image, same(pass0));
+      expect(painterOf<RawCutoutsPainter>(tester).image, same(pass0));
+
+      // "Scrub": only the current-pass slot moves, exactly like
+      // _scrubLamaBackground's setState block in main.dart — originalImage
+      // is never touched.
+      await tester.pumpWidget(_wrap(LayeredSegmentationCanvas(
+        originalImage: pass0,
+        currentImage: pass1,
+        segments: const <Segment>[],
+      )));
+
+      expect(painterOf<OriginalImagePainter>(tester).image, same(pass0),
+          reason: 'Original must still show pass 0, unchanged, after a scrub');
+      expect(painterOf<CurrentImagePainter>(tester).image, same(pass1),
+          reason: 'Current must reflect the post-scrub image');
+      expect(painterOf<RawCutoutsPainter>(tester).image, same(pass1),
+          reason: 'Raw cuts from the current pass, not pass 0 — SETTLED in the v3 spec');
+    });
+  });
+
   group('SegmentationCanvas selection mode', () {
     late ui.Image image;
 
@@ -366,6 +464,7 @@ void main() {
     }) async {
       await tester.pumpWidget(_wrap(SegmentationCanvas(
         uiImage: image,
+        originalImage: image,
         segments: const <Segment>[],
         isLoading: false,
         mode: mode,
@@ -422,6 +521,212 @@ void main() {
     });
   });
 
+  group('Prompt card Select button mode-exclusivity (v3 spec §4)', () {
+    // Drives the actual `promptCardCanSubmit` function main.dart's Select
+    // button calls, through real radio taps and text entry — not a
+    // re-implementation of the button's condition. The surrounding
+    // RadioGroup/Radio/TextField shell here mirrors _buildTextPromptCard's
+    // real wiring (one RadioGroup<SelectionMode> spanning Prompt/Box/Point,
+    // same as main.dart ~1232) closely enough to exercise it without
+    // dragging in HomeScreen's network/timer setup — same reasoning
+    // DisplayAreaTabs was split out for; see its own doc comment.
+    Future<void> pumpPromptCard(
+      WidgetTester tester, {
+      required SelectionMode? initialMode,
+    }) async {
+      final controller = TextEditingController();
+      SelectionMode? mode = initialMode;
+      await tester.pumpWidget(_wrap(StatefulBuilder(
+        builder: (context, setState) => RadioGroup<SelectionMode>(
+          groupValue: mode,
+          onChanged: (m) => setState(() => mode = m),
+          child: Column(
+            children: [
+              const Radio<SelectionMode>(value: SelectionMode.prompt),
+              const Radio<SelectionMode>(value: SelectionMode.box),
+              const Radio<SelectionMode>(value: SelectionMode.point),
+              TextField(controller: controller),
+              ValueListenableBuilder<TextEditingValue>(
+                valueListenable: controller,
+                builder: (context, value, _) => OutlinedButton(
+                  onPressed: promptCardCanSubmit(
+                        hasSession: true,
+                        promptEmpty: value.text.isEmpty,
+                        isLoading: false,
+                        captionMode: false,
+                        selectedMode: mode,
+                      )
+                      ? () {}
+                      : null,
+                  child: const Text('Select'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      )));
+    }
+
+    Finder radioFor(SelectionMode value) => find.byWidgetPredicate(
+        (w) => w is Radio<SelectionMode> && w.value == value);
+
+    bool selectEnabled(WidgetTester tester) =>
+        tester.widget<OutlinedButton>(find.byType(OutlinedButton)).onPressed != null;
+
+    testWidgets('enabled in Prompt mode with non-empty text — matches the pre-existing condition',
+        (tester) async {
+      await pumpPromptCard(tester, initialMode: SelectionMode.prompt);
+      await tester.enterText(find.byType(TextField), 'cat');
+      await tester.pump();
+
+      expect(selectEnabled(tester), isTrue);
+    });
+
+    testWidgets('disabled in Prompt mode with empty text — pre-existing condition, unaffected by §4',
+        (tester) async {
+      await pumpPromptCard(tester, initialMode: SelectionMode.prompt);
+
+      expect(selectEnabled(tester), isFalse);
+    });
+
+    testWidgets('disabled while Box mode is active, regardless of prompt text', (tester) async {
+      await pumpPromptCard(tester, initialMode: SelectionMode.box);
+      await tester.enterText(find.byType(TextField), 'cat');
+      await tester.pump();
+
+      expect(selectEnabled(tester), isFalse);
+    });
+
+    testWidgets('disabled while Point mode is active, regardless of prompt text', (tester) async {
+      await pumpPromptCard(tester, initialMode: SelectionMode.point);
+      await tester.enterText(find.byType(TextField), 'cat');
+      await tester.pump();
+
+      expect(selectEnabled(tester), isFalse);
+    });
+
+    testWidgets('re-enables on switching back to Prompt mode — mode-exclusivity, not a permanent disable',
+        (tester) async {
+      await pumpPromptCard(tester, initialMode: SelectionMode.box);
+      await tester.enterText(find.byType(TextField), 'cat');
+      await tester.pump();
+      expect(selectEnabled(tester), isFalse, reason: 'sanity check: starts disabled in Box mode');
+
+      await tester.tap(radioFor(SelectionMode.prompt));
+      await tester.pump();
+
+      expect(selectEnabled(tester), isTrue);
+    });
+  });
+
+  group('Box/point status label (v3 spec §3 Fix 2 surfacing)', () {
+    // Pure-function logic (no widget tree needed) -- same rationale as
+    // promptCardCanSubmit's own tests: exercises the REAL
+    // positiveClickStatusLabel/promptStatusLabel production code calls,
+    // not a re-implementation.
+    Map<String, dynamic> response({String? selectedMaskId, required List maskIds}) => {
+          'selected_mask_id': selectedMaskId,
+          'results': {'mask_ids': maskIds},
+        };
+
+    test('a positive click with no selected_mask_id reports "0 objects found"', () {
+      // The actual bug this closes: previously a failed click could echo
+      // a stale id from an EARLIER call, or `results.mask_ids` would
+      // still be non-empty from prior selections, both of which made
+      // promptStatusLabel alone report "Done" for a click that found
+      // nothing.
+      final r = response(selectedMaskId: null, maskIds: ['0:earlier-selection']);
+
+      expect(positiveClickStatusLabel(r, true), '0 objects found');
+    });
+
+    test('a positive click that finds something reports "Done"', () {
+      final r = response(selectedMaskId: '0:abc', maskIds: ['0:abc']);
+
+      expect(positiveClickStatusLabel(r, true), 'Done');
+    });
+
+    test('a negative (Avoid) click with a null selected_mask_id still reports "Done" '
+        'when the pass already has selections', () {
+      // selected_mask_id carries no success/failure meaning for Avoid --
+      // it's left untouched by _select_single by design, so a null value
+      // here (e.g. the very first action in a session) must NOT be read
+      // as "this Avoid click failed". promptStatusLabel's own whole-pass
+      // check is what applies instead.
+      final r = response(selectedMaskId: null, maskIds: ['0:already-selected']);
+
+      expect(positiveClickStatusLabel(r, false), 'Done');
+    });
+
+    test('a negative (Avoid) click reports "0 objects found" only via the whole-pass check, '
+        'not selected_mask_id', () {
+      final r = response(selectedMaskId: null, maskIds: []);
+
+      expect(positiveClickStatusLabel(r, false), '0 objects found');
+    });
+
+    test('promptStatusLabel alone: empty mask_ids reports "0 objects found"', () {
+      expect(promptStatusLabel({'mask_ids': []}), '0 objects found');
+      expect(promptStatusLabel({'mask_ids': null}), '0 objects found');
+      expect(promptStatusLabel(null), '0 objects found');
+    });
+
+    test('promptStatusLabel alone: non-empty mask_ids reports "Done"', () {
+      expect(promptStatusLabel({'mask_ids': ['0:abc']}), 'Done');
+    });
+  });
+
+  group('sessionImageUrlFrom (/loadSession Image URL field wiring)', () {
+    // Regression test for a real bug: /loadSession's response has carried
+    // `image_url` from registry.parquet all along (services.py's
+    // load_session_from_disk), but _loadLaunchSession never read it -- the
+    // Image URL field showed its "(no image URL)" placeholder even for a
+    // session that genuinely has one on disk. Confirmed via
+    // DoubleNaught's seg_forge_node_widget.dart: a session's `image_url` is
+    // set once at its original creation (New Session from a URL or
+    // uploaded-bytes image port) and persists across every later resume
+    // (DN deliberately passes an empty SEGFORGE_IMAGE_URL when resuming,
+    // trusting SF to read the session's own stored value) -- so a
+    // resumed session with a real, previously-set image_url is exactly
+    // the case this fixes.
+    test('a session with a real image_url displays it', () {
+      final session = {
+        'name': 'My Session',
+        'image_url': 'https://example.com/cat.png',
+      };
+
+      expect(sessionImageUrlFrom(session), 'https://example.com/cat.png');
+    });
+
+    test('a session with a real image_url with surrounding whitespace is trimmed', () {
+      final session = {'image_url': '  https://example.com/cat.png  '};
+
+      expect(sessionImageUrlFrom(session), 'https://example.com/cat.png');
+    });
+
+    test('a session with no image_url at all returns null, not an empty string', () {
+      // The other, legitimate half of this fix: a session that has
+      // genuinely never had a URL (e.g. resumed, or uploaded via SF's own
+      // standalone file picker) must still fall through to the
+      // "(no image URL)" placeholder, not show a blank/broken value.
+      final session = {'name': 'My Session'};
+
+      expect(sessionImageUrlFrom(session), isNull);
+    });
+
+    test('a session with an empty-string image_url returns null', () {
+      final session = {'image_url': ''};
+
+      expect(sessionImageUrlFrom(session), isNull);
+    });
+
+    test('a session with a whitespace-only image_url returns null', () {
+      final session = {'image_url': '   '};
+
+      expect(sessionImageUrlFrom(session), isNull);
+    });
+  });
+
   group('DisplayAreaTabs', () {
     // Tests the tab wiring + live-reactivity mechanism this widget adds,
     // NOT the shared aa_preview_table package's own rendering/pagination
@@ -438,11 +743,14 @@ void main() {
       Map<String, dynamic>? result,
       Map<String, dynamic>? aaPreviewData,
       Uint8List? imageBytes,
+      ui.Image? currentImage,
+      List<Segment> segments = const <Segment>[],
     }) =>
         _wrap(DisplayAreaTabs(
           imageBytes: imageBytes,
-          uiImage: image,
-          segments: const <Segment>[],
+          uiImage: currentImage ?? image,
+          originalUiImage: image,
+          segments: segments,
           result: result,
           aaPreviewData: aaPreviewData,
           isLoading: false,
@@ -643,6 +951,36 @@ void main() {
 
       expect(find.textContaining('Empty associative array'), findsNothing);
       expect(find.textContaining('1 rows'), findsOneWidget);
+    });
+
+    testWidgets('AA Preview tab renders a mask\'s cached crop inline, not as base64 text',
+        (tester) async {
+      // A valid, minimal (1×1 transparent) PNG, base64-encoded — matches
+      // the shape services.py's crop cache actually returns.
+      const tinyPngBase64 =
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8A'
+          'AQUBAScY42YAAAAASUVORK5CYII=';
+
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), aaPreviewData: null));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('AA Preview'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Empty associative array'), findsOneWidget);
+
+      await tester.pumpWidget(pumpTabs(
+        imageBytes: Uint8List(0),
+        aaPreviewData: {
+          'mask_ids': ['0:abc'],
+          'dataset_statuses': ['keep'],
+          'held_flags': [false],
+          'passes': [0],
+          'crop_png_bytes': [tinyPngBase64],
+        },
+      ));
+      await settleAfterAaLoad(tester);
+
+      expect(find.byType(Image), findsOneWidget);
+      expect(find.textContaining(tinyPngBase64), findsNothing);
     });
   });
 }

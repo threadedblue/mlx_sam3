@@ -6,10 +6,11 @@ import 'package:flutter/material.dart';
 ///
 /// Labelled Target/Avoid rather than Include/Exclude because it is NOT
 /// what decides whether an object gets scrubbed or captioned — those are
-/// `held`/`dataset_status` (see main.dart's "Hold for next scrub" control
-/// and the Prompt card's caption mode), a separate axis entirely. The old
-/// Include/Exclude wording read as a duplicate of that axis and was the
-/// likeliest reason users expected this control to drive scrubbing.
+/// `held`/`dataset_status` (see ObjectsSelectedCard's "Include ... in next
+/// scrub" checkbox list and the Prompt card's caption mode), a separate
+/// axis entirely. The old Include/Exclude wording read as a duplicate of
+/// that axis and was the likeliest reason users expected this control to
+/// drive scrubbing.
 class IncludeExcludeToggle extends StatelessWidget {
   final bool value; // true = Target (positive), false = Avoid (negative)
   final ValueChanged<bool> onChanged;

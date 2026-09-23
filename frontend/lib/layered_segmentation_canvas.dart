@@ -9,10 +9,8 @@ import 'layer_state.dart';
 /// A data class to hold information about a single segmented area.
 /// [path] defines the shape of the segment.
 /// [color] is used for the mask layer.
-/// [retouchedImage] is an optional image for the 'finals' layer.
 class Segment {
   final Path path;
-  final ui.Image? retouchedImage;
 
   /// Backend `sf_engine.MaskRecord.mask_id` — what the hold/caption
   /// endpoints (`/mask/hold`, `/mask/caption`) need to name which record a
@@ -29,7 +27,6 @@ class Segment {
 
   Segment({
     required this.path,
-    this.retouchedImage,
     this.maskId,
     this.datasetStatus,
     this.held = false,
@@ -38,17 +35,25 @@ class Segment {
 
 /// A widget that displays an image and its segmentations in four distinct,
 /// toggleable layers:
-/// 1. [Original]: The base image.
+/// 1. [Original]: Pass 0 — the true original image, never overwritten by a
+///    scrub.
 /// 2. [Masks]: Colored overlays representing the segmentation masks.
-/// 3. [Raw]: The parts of the original image "cut out" by the masks.
-/// 4. [Finals]: Retouched images displayed within their segment boundaries.
+/// 3. [Raw]: The parts of the CURRENT-pass image "cut out" by the masks —
+///    a live preview against what's actually on screen right now, not a
+///    long-since-scrubbed original.
+/// 4. [Current]: The current-pass working image, drawn directly (the same
+///    source [Raw] cuts from). Replaces the old "Final" layer, whose
+///    per-segment `retouchedImage` compositing mechanism was never
+///    populated by anything in this codebase and has been retired.
 class LayeredSegmentationCanvas extends StatelessWidget {
   final ui.Image originalImage;
+  final ui.Image currentImage;
   final List<Segment> segments;
 
   const LayeredSegmentationCanvas({
     super.key,
     required this.originalImage,
+    required this.currentImage,
     required this.segments,
   });
 
@@ -64,7 +69,7 @@ class LayeredSegmentationCanvas extends StatelessWidget {
         child: Consumer<LayerState>(builder: (context, layerState, _) {
           return Stack(
             children: [
-              // Layer 1: Original Image
+              // Layer 1: Original Image (pass 0, always)
               Visibility(
                 visible: layerState.showOriginal,
                 child: CustomPaint(
@@ -78,27 +83,35 @@ class LayeredSegmentationCanvas extends StatelessWidget {
                 child: CustomPaint(
                   painter: MasksPainter(
                     segments: segments,
-                    showOriginal: layerState.showOriginal,
+                    // Original and Current are two independent toggles now,
+                    // not one shared background slot — subtle-over-background
+                    // vs. bright-standalone fill should key off whether
+                    // EITHER is currently showing something underneath the
+                    // masks, not arbitrarily pick one to the exclusion of
+                    // the other.
+                    backgroundVisible: layerState.showOriginal || layerState.showCurrent,
                   ),
                   size: Size.infinite,
                 ),
               ),
-              // Layer 3: Raw Cutouts from Original
+              // Layer 3: Raw Cutouts from the CURRENT-pass image, not pass 0
+              // — a live cutout preview should check a selection against
+              // what's actually on screen right now.
               Visibility(
                 visible: layerState.showRaw,
                 child: CustomPaint(
                   painter: RawCutoutsPainter(
-                    originalImage: originalImage,
+                    image: currentImage,
                     segments: segments,
                   ),
                   size: Size.infinite,
                 ),
               ),
-              // Layer 4: Final Retouched Images
+              // Layer 4: Current — the current-pass working image itself.
               Visibility(
-                visible: layerState.showFinal,
+                visible: layerState.showCurrent,
                 child: CustomPaint(
-                  painter: FinalsPainter(segments: segments),
+                  painter: CurrentImagePainter(image: currentImage),
                   size: Size.infinite,
                 ),
               ),
@@ -112,10 +125,10 @@ class LayeredSegmentationCanvas extends StatelessWidget {
 
 //--- Custom Painters for Each Layer ---
 
-/// Layer 1: Draws the original image.
+/// Layer 1: Draws the original (pass 0) image.
 class OriginalImagePainter extends CustomPainter {
   final ui.Image image;
-  
+
   OriginalImagePainter({required this.image});
 
   @override
@@ -132,9 +145,15 @@ class OriginalImagePainter extends CustomPainter {
 /// Layer 2: Draws semi-transparent colored masks for each segment.
 class MasksPainter extends CustomPainter {
   final List<Segment> segments;
-  final bool showOriginal;
 
-  MasksPainter({required this.segments, required this.showOriginal});
+  /// Whether any background layer (Original or Current) is currently
+  /// showing underneath the masks — drives subtle-fill-over-background vs.
+  /// bright-standalone-fill, same intent as the pre-split single
+  /// `showOriginal` bool, just keyed off either of the two now-independent
+  /// background toggles instead of one shared slot.
+  final bool backgroundVisible;
+
+  MasksPainter({required this.segments, required this.backgroundVisible});
 
   /// Green for a captioned keeper, red for a record queued in the pending
   /// scrub batch is a SEPARATE, independent cue (the border stroke below) —
@@ -151,18 +170,18 @@ class MasksPainter extends CustomPainter {
   /// fill is nearly invisible over artwork, and this needs to be read at a
   /// glance to be useful. That alpha is my choice, not sourced from a
   /// mockup. Neutral (unassigned, not held) is UNCHANGED from the original
-  /// pre-v2 painter: dark grey with Original shown, bright cyan without.
+  /// pre-v2 painter: dark grey with a background shown, bright cyan without.
   ({ui.Color color, double fill, double stripe, double border}) _paletteFor(Segment segment) {
     const green = ui.Color(0xFF007F00);
     if (segment.datasetStatus == 'keep') {
-      return (color: green, fill: showOriginal ? 0.28 : 0.6,
-              stripe: showOriginal ? 0.7 : 0.9, border: showOriginal ? 0.9 : 1.0);
+      return (color: green, fill: backgroundVisible ? 0.28 : 0.6,
+              stripe: backgroundVisible ? 0.7 : 0.9, border: backgroundVisible ? 0.9 : 1.0);
     }
-    final neutral = showOriginal
+    final neutral = backgroundVisible
         ? const ui.Color.fromARGB(255, 48, 42, 42)     // Dark grey for subtle overlay
         : const ui.Color.fromARGB(255, 100, 200, 255); // Bright cyan standalone
-    return (color: neutral, fill: showOriginal ? 0.2 : 0.6,
-            stripe: showOriginal ? 0.5 : 0.8, border: showOriginal ? 0.3 : 1.0);
+    return (color: neutral, fill: backgroundVisible ? 0.2 : 0.6,
+            stripe: backgroundVisible ? 0.5 : 0.8, border: backgroundVisible ? 0.3 : 1.0);
   }
 
   // Amber, not red or green — held is its own axis from dataset_status, and
@@ -234,7 +253,7 @@ class MasksPainter extends CustomPainter {
         canvas.drawRect(
           segment.path.getBounds(),
           Paint()
-            ..color = _heldBorderColor.withValues(alpha: showOriginal ? 0.9 : 1.0)
+            ..color = _heldBorderColor.withValues(alpha: backgroundVisible ? 0.9 : 1.0)
             ..strokeWidth = 2.0
             ..style = PaintingStyle.stroke,
         );
@@ -246,17 +265,17 @@ class MasksPainter extends CustomPainter {
   bool shouldRepaint(covariant MasksPainter oldDelegate) {
     // For better performance, consider a deep list comparison or versioning.
     return !listEquals(segments, oldDelegate.segments) ||
-        showOriginal != oldDelegate.showOriginal;
+        backgroundVisible != oldDelegate.backgroundVisible;
   }
 }
 
 
-/// Layer 3: Draws the parts of the original image that correspond to the masks.
+/// Layer 3: Draws the parts of [image] that correspond to the masks.
 class RawCutoutsPainter extends CustomPainter {
-  final ui.Image originalImage;
+  final ui.Image image;
   final List<Segment> segments;
 
-  RawCutoutsPainter({required this.originalImage, required this.segments});
+  RawCutoutsPainter({required this.image, required this.segments});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -266,8 +285,8 @@ class RawCutoutsPainter extends CustomPainter {
       // Create a temporary drawing layer.
       canvas.saveLayer(imageRect, Paint());
 
-      // Draw the original image into the temporary layer.
-      canvas.drawImage(originalImage, Offset.zero, Paint());
+      // Draw the source image into the temporary layer.
+      canvas.drawImage(image, Offset.zero, Paint());
 
       // Use BlendMode.dstIn to keep the destination (image) pixels only where
       // the source (mask path) is drawn, effectively creating a cutout.
@@ -281,36 +300,28 @@ class RawCutoutsPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant RawCutoutsPainter oldDelegate) {
-    return originalImage != oldDelegate.originalImage ||
+    return image != oldDelegate.image ||
         !listEquals(segments, oldDelegate.segments);
   }
 }
 
-/// Layer 4: Draws the final, retouched images, clipped to their segment path.
-class FinalsPainter extends CustomPainter {
-  final List<Segment> segments;
+/// Layer 4: Draws the current-pass working image directly. Replaces the old
+/// "Final" concept: nothing in this codebase ever populated a per-segment
+/// retouched composite, and what "Final" was actually trying to preview
+/// ("the whole page as it currently stands") is exactly what the current
+/// pass's image already is.
+class CurrentImagePainter extends CustomPainter {
+  final ui.Image image;
 
-  FinalsPainter({required this.segments});
+  CurrentImagePainter({required this.image});
 
   @override
   void paint(Canvas canvas, Size size) {
-    for (final segment in segments) {
-      if (segment.retouchedImage != null) {
-        // Save the current canvas state and clip the drawing area to the path.
-        canvas.save();
-        canvas.clipPath(segment.path);
-
-        // Draw the retouched image. It will only be visible inside the clipped path.
-        canvas.drawImage(segment.retouchedImage!, Offset.zero, Paint());
-
-        // Restore the canvas to its original state (removes the clip).
-        canvas.restore();
-      }
-    }
+    canvas.drawImage(image, Offset.zero, Paint());
   }
 
   @override
-  bool shouldRepaint(covariant FinalsPainter oldDelegate) {
-    return !listEquals(segments, oldDelegate.segments);
+  bool shouldRepaint(covariant CurrentImagePainter oldDelegate) {
+    return image != oldDelegate.image;
   }
 }

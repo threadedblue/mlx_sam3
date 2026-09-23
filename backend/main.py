@@ -219,8 +219,24 @@ async def root():
     return {"message": "SAM3 Segmentation API", "status": "running"}
     
 @app.post("/upload")
-async def upload_image(file: UploadFile = File(...), session_id: Optional[str] = Form(None)):
-    """Upload an image into an existing session or create a new one."""
+async def upload_image(
+    file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+    image_url: Optional[str] = Form(None),
+):
+    """Upload an image into an existing session or create a new one.
+
+    `image_url` is optional and, unlike `original_filename` (which rides
+    along on the multipart file's own `filename`), has no other way to
+    reach the backend — the frontend's standalone upload/file-dialog flow
+    is the only caller that supplies it (main.dart's `_loadImageFromUrl`,
+    whatever `_imageUrl`/the Image URL field currently shows, file:// or
+    http(s)://); DoubleNaught's `/initSession` sets it independently for
+    its own "+ New Session" flow. Only written when actually supplied —
+    an absent value must not clobber whatever `/initSession` already set
+    for this session_id (register_session_data merges, not replaces, but
+    a key present with value None here would still overwrite on merge).
+    """
     if processor is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
 
@@ -241,14 +257,17 @@ async def upload_image(file: UploadFile = File(...), session_id: Optional[str] =
         state = processor.set_image(image)
         processing_time_ms = (time.perf_counter() - start_time) * 1000
 
-        service.register_session_data(session_id, {
+        session_data = {
             "state": state,
             "original_image_bytes": contents,
             "original_filename": file.filename,
             "image_size": image.size,
             "created_at": datetime.utcnow().isoformat(),
-        })
-        
+        }
+        if image_url:
+            session_data["image_url"] = image_url
+        service.register_session_data(session_id, session_data)
+
         return {
             "session_id": session_id,
             "width": image.size[0],
@@ -304,7 +323,16 @@ async def segment_with_text(request: TextPromptRequest):
         # double-invoke SAM3 and, worse, double-register this prompt in its
         # accumulated grounding history).
         start_time = time.perf_counter()
-        sf_session.add_text_selection(request.prompt)
+        # v3 spec §5: Scrub is now gated on selection alone, not a separate
+        # Hold step, so a newly selected mask must start held — the frontend's
+        # per-object checkbox list defaults to checked and an explicit
+        # /mask/hold(held=False) opts a specific one out. Only genuinely NEW
+        # records (not ones add_text_selection merely re-grounded/refined) are
+        # touched, so an object a user already opted out stays opted out
+        # across a re-search that happens to re-match its geometry.
+        new_records = sf_session.add_text_selection(request.prompt)
+        for record in new_records:
+            sf_session.set_held(record.mask_id, True)
         state = sf_session.state
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session.setdefault("prompts", []).append(request.prompt)
@@ -380,7 +408,10 @@ async def add_box_prompt(request: BoxPromptRequest):
         # processor.add_geometric_prompt (single source of truth for
         # `state`, same reasoning as /segment/text).
         start_time = time.perf_counter()
-        sf_session.add_box_selection(request.box, request.label, request.text_substitute)
+        # v3 spec §5 — see /segment/text's identical comment for why.
+        new_records = sf_session.add_box_selection(request.box, request.label, request.text_substitute)
+        for record in new_records:
+            sf_session.set_held(record.mask_id, True)
         state = sf_session.state
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
@@ -454,7 +485,10 @@ async def add_point_prompt(request: PointPromptRequest):
         # sf_session.add_point_selection makes the one real call to
         # processor.add_point_prompt.
         start_time = time.perf_counter()
-        sf_session.add_point_selection(request.point, request.label, request.text_substitute)
+        # v3 spec §5 — see /segment/text's identical comment for why.
+        new_records = sf_session.add_point_selection(request.point, request.label, request.text_substitute)
+        for record in new_records:
+            sf_session.set_held(record.mask_id, True)
         state = sf_session.state
         processing_time_ms = (time.perf_counter() - start_time) * 1000
         session["state"] = state
@@ -616,15 +650,21 @@ async def reset_prompts(request: SessionRequest):
         if "prompts" in session:
             session["prompts"] = []
 
-        # Clearing SAM3's prompts invalidates this pass's recorded
-        # selections too — nothing in live state backs them anymore. Without
-        # this they'd keep coming back in every /segment/* response (which
-        # is now built from the records, not raw state) as phantom masks.
-        # Other passes are left alone: a Pass 2 reset must not discard the
-        # Pass 1 selections the scrub already consumed.
+        # Clearing SAM3's prompts invalidates this pass's UNCOMMITTED
+        # selections — nothing in live state backs them anymore, and
+        # without discarding them they'd keep coming back in every
+        # /segment/* response (which is now built from the records, not
+        # raw state) as phantom masks. Already-captioned/held selections
+        # are a different thing: SAM3's grounding resetting doesn't erase
+        # committed user work, so those must survive — confirmed live,
+        # they were vanishing from the canvas (and from serialize_sf_masks'
+        # response) on every Clear Prompts even though nothing about them
+        # had actually changed. Other passes are left alone regardless:
+        # a Pass 2 reset must not discard the Pass 1 selections the scrub
+        # already consumed.
         sf_session = service.get_or_create_sf_session(request.session_id)
         if sf_session is not None:
-            sf_session.masks = [m for m in sf_session.masks if m.pass_ != sf_session.pass_]
+            sf_session.discard_ungrounded_selections()
             # The mask `last_touched_mask_id` names may no longer exist
             # after the line above discards this pass's recorded
             # selections — confirmed live: it kept echoing a deleted mask's
@@ -667,9 +707,11 @@ async def save_session_settings(request: SessionSettingsRequest):
 @app.post("/saveSession")
 async def save_session(request: SessionRequest):
     """Manually save the current session state to disk."""
+    # TEMP DEBUG (1/4) — confirms this handler is actually invoked at all.
+    print(f"[SAVE-DEBUG 1] /saveSession HANDLER INVOKED — session_id={request.session_id!r}")
     if service is None:
         raise HTTPException(status_code=503, detail="Service not available")
-    
+
     try:
         service.save_session_to_disk(request.session_id)
         return {"message": "Session saved", "session_id": request.session_id}
