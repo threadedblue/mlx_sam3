@@ -707,8 +707,6 @@ async def save_session_settings(request: SessionSettingsRequest):
 @app.post("/saveSession")
 async def save_session(request: SessionRequest):
     """Manually save the current session state to disk."""
-    # TEMP DEBUG (1/4) — confirms this handler is actually invoked at all.
-    print(f"[SAVE-DEBUG 1] /saveSession HANDLER INVOKED — session_id={request.session_id!r}")
     if service is None:
         raise HTTPException(status_code=503, detail="Service not available")
 

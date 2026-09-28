@@ -248,7 +248,26 @@ def serialize_sf_masks_all_passes(sf_session) -> dict:
     `SFSession.masks`, which keeps every record as a permanent audit
     trail. This ledger is meant to show that trail, not just what will
     eventually be exported.
+
+    `crop_png_bytes` reuses `_cached_crop_png_b64` — same cache
+    `serialize_sf_masks` fills, keyed by mask_id — rather than a second
+    cache. Crucially, each record's crop still comes from ITS OWN pass's
+    image (`_cached_crop_png_b64` sources `sf_session.image_for_pass(
+    mask.pass_)` per mask, not the session's *current* pass): this
+    function spans every pass, so a pass-0 mask and a pass-1 mask in the
+    same response must not collapse onto one image. This is the same
+    multi-pass crop-correctness class of bug already found and fixed once
+    for `build_sf_payload` — a keeper from a later pass was being cropped
+    from pass 0's image before that fix.
+
+    Stale crops are invalidated here too, not just in `serialize_sf_masks`:
+    three callers (`/mask/hold`, `/mask/caption`, the scrub response) read
+    `all_masks` without calling `serialize_sf_masks` first in the same
+    request, so this can't assume that call already drained
+    `last_refreshed_mask_ids`. Idempotent when it does run right after —
+    the set is already empty by then.
     """
+    _invalidate_stale_crops(sf_session)
     records = sf_session.masks
     return {
         "mask_ids": [m.mask_id for m in records],
@@ -258,6 +277,7 @@ def serialize_sf_masks_all_passes(sf_session) -> dict:
         "text_tags": [m.text_tag for m in records],
         "scores": [float(m.score) if m.score is not None else 0.0 for m in records],
         "boxes": [_bbox_from_geometry(m.geometry) for m in records],
+        "crop_png_bytes": [_cached_crop_png_b64(sf_session, m) for m in records],
         "passes": [m.pass_ for m in records],
     }
 
@@ -536,22 +556,7 @@ class SegmentationService:
             print(f"Warning: Cannot save state for non-existent in-memory session {session_id}")
             return
 
-        # TEMP DEBUG (2/4) — the single most important log point: is there
-        # an SFSession for this session_id at all, and does it actually
-        # have masks? _build_segments_from_masks reads sf_session.masks
-        # directly with no filter, so this tells us whether the bug is
-        # upstream of this call (masks missing/SFSession absent here) or
-        # downstream (masks present here but still nothing gets written).
         sf_session = self.sf_sessions.get(session_id)
-        if sf_session is None:
-            print(f"[SAVE-DEBUG 2] save_session_to_disk: session_id={session_id!r} — "
-                  f"no SFSession found for this session_id (self.sf_sessions.get returned None)")
-        else:
-            print(f"[SAVE-DEBUG 2] save_session_to_disk: session_id={session_id!r} — "
-                  f"SFSession found: len(sf_session.masks)={len(sf_session.masks)}, "
-                  f"pass_={sf_session.pass_}, "
-                  f"mask_ids={[m.mask_id for m in sf_session.masks]}")
-
         aa_persistence.save_session(session_id, session, sf_session)
 
     def save_session_settings(self, session_id: str, settings: Dict[str, Any]):
@@ -586,6 +591,38 @@ class SegmentationService:
         raw = aa_persistence.read_session_raw(session_id)
         if raw is None:
             raise FileNotFoundError(f"State file not found for session {session_id}")
+
+        # `self.get_session` above (via `_load_session_into_memory` ->
+        # `_reconstruct_sf_session`) already warmed `self.sf_sessions` with
+        # every persisted mask when an image exists — reused here for
+        # crop_png_bytes rather than a third crop cache. Looked up by
+        # mask_id rather than zipped by list position: a live in-memory
+        # session (already cached before this call, e.g. via /updateState
+        # on a session with unsaved edits) can have masks this fresh
+        # `raw["segments"]` read doesn't know about yet, or vice versa: a
+        # missing entry becomes None, not a misaligned crop for some other
+        # mask.
+        sf_session = self.sf_sessions.get(session_id)
+        crop_by_mask_id = (
+            {m.mask_id: m for m in sf_session.masks} if sf_session is not None else {}
+        )
+
+        def _resolved_mask_id(seg: Dict[str, Any]) -> str:
+            # Mirrors _reconstruct_sf_session's own v1/v2 normalization: a v2
+            # segment_id already carries its pass prefix (f"{pass}:{uuid4()}"),
+            # unchanged; a v1 row's segment_id is a bare uuid and needs one
+            # prepended to match the mask_id sf_session.masks actually uses.
+            seg_id = seg["segment_id"]
+            return seg_id if ":" in seg_id else f"{int(seg['pass'])}:{seg_id}"
+
+        def _crop_for(seg: Dict[str, Any]) -> Optional[str]:
+            # Each mask's crop still comes from ITS OWN pass's image
+            # (_cached_crop_png_b64 sources sf_session.image_for_pass(
+            # mask.pass_) per mask) — a resumed session can span multiple
+            # passes same as the live all_masks endpoints, so this must not
+            # collapse onto pass 0 or any one "current" pass.
+            mask = crop_by_mask_id.get(_resolved_mask_id(seg))
+            return _cached_crop_png_b64(sf_session, mask) if mask is not None else None
 
         # A session registered by /initSession but never uploaded to has
         # metadata and no image. That is a session the caller can still use --
@@ -622,17 +659,37 @@ class SegmentationService:
             # Same shape/purpose as serialize_sf_masks_all_passes' field of
             # the same name on the live endpoints — a reloaded session's AA
             # Preview tab needs this too, not just a live in-progress one.
-            # `segment["segment_id"]` is already the bare mask_id (the
-            # session_id prefix is stripped by read_session_raw).
+            # Two fields need normalizing before they match that live
+            # contract, not just `segment["segment_id"]` as read_session_raw
+            # hands it back:
+            #   - `mask_ids` must be _resolved_mask_id(seg), not the raw
+            #     segment_id — a v1 row's segment_id is a bare uuid with no
+            #     pass prefix, while serialize_sf_masks_all_passes always
+            #     emits sf_session.masks' already-normalized (pass-prefixed)
+            #     mask_id for the same record. Left un-normalized, the same
+            #     v1 mask would be addressable under two different ids
+            #     depending on which endpoint answered, and /mask/hold and
+            #     /mask/caption route by whatever id they're given.
+            #   - `passes` must be int(seg["pass"]), not the numeric-string
+            #     form aa_persistence._migrate_pass_value produces — every
+            #     live /segment/*, /mask/*, and /lama/scrub response's
+            #     `all_masks.passes` is already int (sf_engine.MaskRecord.
+            #     pass_ is a plain int), and the frontend adapter casts this
+            #     field `as int?` accordingly. Confirmed live: sending the
+            #     string form here made sfResultToAaPayload throw a
+            #     TypeError on every resumed session, which made the AA
+            #     Preview tab render nothing at all — not just missing
+            #     images, the whole tab silently empty.
             "all_masks": {
-                "mask_ids": [seg["segment_id"] for seg in raw["segments"]],
+                "mask_ids": [_resolved_mask_id(seg) for seg in raw["segments"]],
                 "dataset_statuses": [seg["dataset_status"] for seg in raw["segments"]],
                 "held_flags": [seg["held"] for seg in raw["segments"]],
                 "captions": [seg["caption"] for seg in raw["segments"]],
                 "text_tags": [seg["text_tag"] or None for seg in raw["segments"]],
                 "scores": [seg["score"] or 0.0 for seg in raw["segments"]],
                 "boxes": [seg["bbox"] for seg in raw["segments"]],
-                "passes": [seg["pass"] for seg in raw["segments"]],
+                "crop_png_bytes": [_crop_for(seg) for seg in raw["segments"]],
+                "passes": [int(seg["pass"]) for seg in raw["segments"]],
             },
             "prompts": raw["prompts"],
             "created_at": raw["created_at"],

@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -981,6 +982,50 @@ void main() {
 
       expect(find.byType(Image), findsOneWidget);
       expect(find.textContaining(tinyPngBase64), findsNothing);
+    });
+
+    testWidgets(
+        'AA Preview tab paints a REAL, full-size backend crop, not just a tiny synthetic PNG',
+        (tester) async {
+      // test/fixtures/real_crop_png_base64.txt is genuine crop_png_bytes
+      // captured live from the running SF backend (services.py's
+      // _cached_crop_png_b64) against real session data — a real
+      // 1791×2298 RGBA PNG, ~92KB decoded, ~123KB as base64. The HTTP-
+      // level check earlier in this investigation proved the backend
+      // emits this value; the tiny 1×1 PNG used elsewhere in this file
+      // proves the widget CAN decode base64 at all but can't rule out a
+      // size-specific decode/paint failure on production-scale data. This
+      // is the one check that actually exercises the paint path itself —
+      // find.byType(Image) only passes if Image.memory successfully
+      // decoded and Flutter built an Image render object from it, not
+      // merely that no exception was thrown.
+      final realCropBase64 =
+          File('test/fixtures/real_crop_png_base64.txt').readAsStringSync();
+
+      // AA Preview isn't the default tab (Canvas is) — must switch to it
+      // before the table is the one actually on screen. Empty aaPreviewData
+      // first, matching the other crop test's own pattern, so the tab
+      // selection (State persists across pumpWidget) is already on AA
+      // Preview by the time the real payload is pumped in.
+      await tester.pumpWidget(pumpTabs(imageBytes: Uint8List(0), aaPreviewData: null));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('AA Preview'));
+      await tester.pumpAndSettle();
+
+      await tester.pumpWidget(pumpTabs(
+        imageBytes: Uint8List(0),
+        aaPreviewData: {
+          'mask_ids': ['2:cb74a2eb-9d12-4363-9391-52e9fca2c5ac'],
+          'dataset_statuses': ['keep'],
+          'held_flags': [false],
+          'passes': [2],
+          'crop_png_bytes': [realCropBase64],
+        },
+      ));
+      await settleAfterAaLoad(tester);
+
+      expect(find.byType(Image), findsOneWidget);
+      expect(find.byIcon(Icons.image_not_supported_outlined), findsNothing);
     });
   });
 }

@@ -458,6 +458,19 @@ class _HomeScreenState extends State<HomeScreen> {
   // exact case reported ("I did the scrub. AA preview shows nothing.").
   Map<String, dynamic>? _aaPreviewData;
   List<Segment> _segments = [];
+  // Dirty tracking for the "Unsaved Changes" prompt (_hasUnsavedWork
+  // below). _mutationCount increments once per successful call to every
+  // handler that changes session state /saveSession would persist —
+  // text/box/point selection, hold/include toggle, caption commit, scrub,
+  // Clear Prompts. _savedAtMutationCount is _mutationCount's value as of
+  // the last successful save; work is unsaved iff they differ. NOT a plain
+  // bool: a failed save must leave existing dirt in place, and a second
+  // mutation after a save must not be silently absorbed by a bool that's
+  // already true. View-layer toggles (_saveLayerState) deliberately don't
+  // touch this — they persist themselves immediately on every change, so
+  // there's nothing pending to lose.
+  int _mutationCount = 0;
+  int _savedAtMutationCount = 0;
   bool _isLoading = false;
   String? _error;
   String _backendStatus = "checking";
@@ -649,6 +662,19 @@ class _HomeScreenState extends State<HomeScreen> {
         _originalUiImage = decoded;
         _originalImageSize = _imageSize;
       }
+      // Same field, same shape/purpose as every live /segment/*, /mask/*
+      // and /lama/scrub response's `all_masks` — a resumed session's AA
+      // Preview tab needs this too, not just a live in-progress one (see
+      // load_session_from_disk's own docstring). Confirmed live: this was
+      // present in the response all along but never read here, leaving
+      // the tab in its "Empty associative array" state on every resume
+      // regardless of how many masks the session actually has.
+      _aaPreviewData = session['all_masks'] as Map<String, dynamic>?;
+      // A resumed session starts clean: everything it carries just came
+      // FROM the last save, not from unsaved work in this run. Explicit
+      // rather than relying on both counters defaulting to 0 on a fresh
+      // State — this is the specific moment "clean" has to hold.
+      _savedAtMutationCount = _mutationCount;
     });
   }
 
@@ -930,6 +956,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _textPromptResult = [const ResultDatum(label: 'Status', value: 'Done')];
+          _mutationCount++;
         });
       }
     } catch (e) {
@@ -958,6 +985,7 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _textPromptResult = [const ResultDatum(label: 'Status', value: 'Captioned')];
+          _mutationCount++;
         });
       }
     } catch (e) {
@@ -1031,6 +1059,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _focusedMaskId = maskId;
         _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+        _mutationCount++;
       });
     } catch (e) {
       if (!mounted) return;
@@ -1051,6 +1080,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
           _boxResult = [ResultDatum(label: 'Status', value: positiveClickStatusLabel(response, _boxMode == "positive"))];
+          _mutationCount++;
         });
       }
     } catch (e) {
@@ -1074,6 +1104,7 @@ class _HomeScreenState extends State<HomeScreen> {
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
           _pointResult = [ResultDatum(label: 'Status', value: positiveClickStatusLabel(response, _pointMode == "positive"))];
+          _mutationCount++;
         });
       }
     } catch (e) {
@@ -1107,6 +1138,7 @@ class _HomeScreenState extends State<HomeScreen> {
           // otherwise keep pointing at a mask reset just deleted.
           _focusedMaskId = null;
           _resultsResult = [const ResultDatum(label: 'Status', value: 'Done')];
+          _mutationCount++;
         });
       }
     } catch (e) {
@@ -1171,6 +1203,7 @@ class _HomeScreenState extends State<HomeScreen> {
           // captioned, defeating its purpose (previewing exportable data)
           // precisely when the data became exportable.
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+          _mutationCount++;
         });
       } else {
         // scrubLamaBackground doesn't rethrow (see ApiService) — a null
@@ -1194,6 +1227,12 @@ class _HomeScreenState extends State<HomeScreen> {
       final response = await _api.saveSession(_sessionId!);
       if (!mounted) return;
       if (response != null) {
+        // Only a genuine 200 reaches here (saveSession throws otherwise —
+        // see ApiService), so this is exactly "the save succeeded": record
+        // the mutation count as of right now. A failed save falls into the
+        // catch block below and never touches this, so unsaved work stays
+        // unsaved until a save actually goes through.
+        setState(() => _savedAtMutationCount = _mutationCount);
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Session saved successfully")),
         );
@@ -1225,9 +1264,13 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// Check if there are unsaved changes in the current session.
-  /// Returns true if there are segmentation results that haven't been saved.
-  bool get _hasUnsavedWork => _result != null;
+  /// Whether any mutation since the last successful save is still
+  /// unsaved. Was `_result != null`, which is true the instant anything is
+  /// selected and stays true forever after — including right after a
+  /// successful Save, since Save never touched `_result`. Confirmed live:
+  /// that fired the "Unsaved Changes" dialog on every session switch after
+  /// the first selection, saved or not.
+  bool get _hasUnsavedWork => _mutationCount != _savedAtMutationCount;
 
   /// Switch to a different session (standalone mode only).
   /// Warns if there are unsaved changes before discarding them.

@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:aa_preview_table/aa_preview_table.dart';
 import 'package:frontend/services/sf_aa_preview_adapter.dart';
@@ -220,6 +223,39 @@ void main() {
       expect(row.cells['held'], 'true');
       expect(row.cells['caption'], 'a red egg');
       expect(row.cells['pass'], '0');
+    });
+  });
+
+  group('sfResultToAaPayload — passes type contract (root cause of the AA '
+      'Preview tab rendering nothing at all on resume)', () {
+    Map<String, dynamic> realAllMasksWithPasses(List<dynamic> passes) {
+      final raw = jsonDecode(
+        File('test/fixtures/real_all_masks.json').readAsStringSync(),
+      ) as Map<String, dynamic>;
+      return Map<String, dynamic>.from(raw)..['passes'] = passes;
+    }
+
+    test(
+        'string passes (load_session_from_disk\'s pre-fix numeric-string '
+        'form) throws — must fail if this string form is ever reintroduced',
+        () {
+      final result = realAllMasksWithPasses(
+        List<dynamic>.generate(8, (i) => '${[0, 0, 0, 0, 1, 2, 2, 2][i]}'),
+      );
+
+      expect(() => sfResultToAaPayload(result), throwsA(isA<TypeError>()));
+    });
+
+    test(
+        'int passes (every live /segment/*, /mask/*, /lama/scrub response, '
+        'and now load_session_from_disk too) does not throw', () {
+      final result = realAllMasksWithPasses([0, 0, 0, 0, 1, 2, 2, 2]);
+
+      final aa = sfResultToAaPayload(result);
+
+      expect(aa.rows, isNotEmpty);
+      expect(aa.cols, contains('pass'));
+      expect(aa.cols, contains('crop_png_bytes'));
     });
   });
 }

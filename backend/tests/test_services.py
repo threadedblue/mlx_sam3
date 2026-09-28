@@ -153,3 +153,59 @@ class TestCropCacheIsPassAware:
             # Pins that this is really pass 1's content, not pass 0's flat
             # original: pass 0 was black here, pass 1 is the scrub's red.
             assert crop.getpixel((x, y))[:3] == (255, 0, 0)
+
+
+class TestAllPassesCropIsPassAware:
+    def test_masks_from_different_passes_each_get_their_own_passs_crop(self):
+        """Root-cause regression test for the AA Preview tab: the tab is fed
+        by serialize_sf_masks_all_passes (`response['all_masks']`), which
+        spans every pass in one response — unlike serialize_sf_masks, it
+        can't rely on a single `session.pass_` filter to keep crops
+        correct. `keeper0` (pass 0, kept before any scrub) and `keeper1`
+        (pass 1, kept after the scrub repaints the image red) must each be
+        cropped from their OWN pass's image in the SAME response — a naive
+        port of serialize_sf_masks's crop line, or any accidental reuse of
+        the session's *current* pass instead of each record's own `pass_`,
+        would collapse both onto one image and silently pass a
+        single-pass test while failing here.
+        """
+        seg = FakeSam3()
+        session = _session(seg)
+        keeper0 = _select_one(session, seg, "keeper0", (0, 5, 0, 5))
+        session.set_held(keeper0.mask_id, True)
+        session.attach_caption(keeper0.mask_id, "kept in pass 0")
+
+        session.run_lama_pass(PaintingInpainter(color=(255, 0, 0, 255)))
+
+        keeper1 = _select_one(session, seg, "keeper1", (1, 4, 1, 4))
+        assert keeper1.pass_ == 1
+        session.attach_caption(keeper1.mask_id, "kept in pass 1")
+
+        result = services.serialize_sf_masks_all_passes(session)
+        assert "crop_png_bytes" in result
+
+        def crop_for(mask_id):
+            idx = result["mask_ids"].index(mask_id)
+            return Image.open(io.BytesIO(base64.b64decode(result["crop_png_bytes"][idx])))
+
+        crop0 = crop_for(keeper0.mask_id)
+        crop1 = crop_for(keeper1.mask_id)
+
+        pass0_image = session.image_for_pass(0)
+        pass1_image = session.image_for_pass(1)
+
+        ys0, xs0 = np.nonzero(keeper0.geometry)
+        assert len(xs0) > 0
+        for y, x in zip(ys0, xs0):
+            y, x = int(y), int(x)
+            assert crop0.getpixel((x, y)) == pass0_image.getpixel((x, y))
+            # pass 0 was never scrubbed — still the flat black original.
+            assert crop0.getpixel((x, y))[:3] == (0, 0, 0)
+
+        ys1, xs1 = np.nonzero(keeper1.geometry)
+        assert len(xs1) > 0
+        for y, x in zip(ys1, xs1):
+            y, x = int(y), int(x)
+            assert crop1.getpixel((x, y)) == pass1_image.getpixel((x, y))
+            # pass 1 is the scrub's repaint — must not match pass 0's crop.
+            assert crop1.getpixel((x, y))[:3] == (255, 0, 0)

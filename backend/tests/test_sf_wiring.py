@@ -29,6 +29,7 @@ import aa_persistence
 import compile_training_set
 import d4m_juliacall_bridge as bridge
 import main
+from tests.test_sf_engine import PaintingInpainter
 import sf_engine
 from services import SegmentationService
 
@@ -707,6 +708,136 @@ class TestSaveReloadRoundTrip:
         assert main.service.sf_sessions[session_id].get_mask(mask_id).held is True
 
 
+class TestReloadedSessionAaPreviewCropIsPassAware:
+    """Root-cause regression test for the third of three independently-
+    diverged all_masks serializers found this session:
+    load_session_from_disk (the /loadSession and /updateState resume path)
+    built its own hand-rolled all_masks dict straight from raw["segments"]
+    and never carried crop_png_bytes at all -- unlike serialize_sf_masks and
+    serialize_sf_masks_all_passes, already fixed. Same multi-pass hazard as
+    both of those: a resumed session can span several passes, so a crop
+    sourced uniformly from pass 0 (or naively zipped by list position
+    instead of looked up by mask_id) would silently show the wrong pass's
+    content for at least one mask while still "having" the field.
+
+    Evicts the in-memory cache entirely before reloading (mirrors
+    TestSaveReloadRoundTrip's own pattern) -- an already-warm sf_session
+    would already carry correct crops via the process-lifetime cache
+    regardless of whether load_session_from_disk's own wiring were fixed,
+    which would let this pass for the wrong reason.
+    """
+
+    def test_reload_returns_pass_correct_crops_for_masks_in_different_passes(self, client, monkeypatch):
+        session_id = _upload(client)
+
+        # keeper0: selected and captioned in pass 0, before any scrub.
+        keeper0_id = _box_select(client, session_id, [0.3, 0.3, 0.2, 0.2])
+        _hold(client, session_id, keeper0_id, True)
+        _caption(client, session_id, keeper0_id, "kept in pass 0")
+
+        # Scrub paints red exactly where keeper0's held mask was -- the
+        # recursive-peel case (same location, new pass): the box reselected
+        # below lands on that freshly-painted content, not pass 0's original.
+        painter = PaintingInpainter(color=(255, 0, 0, 255))
+        monkeypatch.setattr(main, "_lama_inpainter", painter)
+        r = client.post("/lama/scrub", json={"session_id": session_id})
+        assert r.status_code == 200, r.text
+
+        keeper1_id = _box_select(client, session_id, [0.3, 0.3, 0.2, 0.2])
+        _caption(client, session_id, keeper1_id, "kept in pass 1")
+
+        r = client.post("/saveSession", json={"session_id": session_id})
+        assert r.status_code == 200
+
+        # Force a genuine disk reconstruction -- simulate a process restart,
+        # so this actually exercises load_session_from_disk rather than an
+        # already-warm sf_session's cache.
+        del main.service.sessions[session_id]
+        del main.service.sf_sessions[session_id]
+
+        r = client.get(f"/loadSession/{session_id}")
+        assert r.status_code == 200, r.text
+        all_masks = r.json()["all_masks"]
+        assert "crop_png_bytes" in all_masks
+
+        def crop_for(mask_id):
+            idx = all_masks["mask_ids"].index(mask_id)
+            b64 = all_masks["crop_png_bytes"][idx]
+            assert b64, f"no crop returned for {mask_id}"
+            return Image.open(io.BytesIO(base64.b64decode(b64)))
+
+        crop0 = crop_for(keeper0_id)
+        crop1 = crop_for(keeper1_id)
+
+        reloaded = main.service.sf_sessions[session_id]
+        pass0_image = reloaded.image_for_pass(0)
+        pass1_image = reloaded.image_for_pass(1)
+
+        keeper0_geometry = reloaded.get_mask(keeper0_id).geometry
+        ys0, xs0 = np.nonzero(keeper0_geometry)
+        assert len(xs0) > 0
+        for y, x in zip(ys0, xs0):
+            y, x = int(y), int(x)
+            assert crop0.getpixel((x, y)) == pass0_image.getpixel((x, y))
+            # pass 0 was never scrubbed -- must not show the scrub's red.
+            assert crop0.getpixel((x, y))[:3] != (255, 0, 0)
+
+        keeper1_geometry = reloaded.get_mask(keeper1_id).geometry
+        ys1, xs1 = np.nonzero(keeper1_geometry)
+        assert len(xs1) > 0
+        for y, x in zip(ys1, xs1):
+            y, x = int(y), int(x)
+            assert crop1.getpixel((x, y)) == pass1_image.getpixel((x, y))
+            # pass 1 is the scrub's repaint at this exact location.
+            assert crop1.getpixel((x, y))[:3] == (255, 0, 0)
+
+    def test_reload_passes_are_int_matching_the_live_endpoints_contract(self, client, monkeypatch):
+        """Fix 2 regression: load_session_from_disk used to emit `passes`
+        as the numeric-STRING form aa_persistence._migrate_pass_value
+        produces, while every live /segment/*, /mask/*, and /lama/scrub
+        response's all_masks.passes is a plain int (sf_engine.MaskRecord.
+        pass_ is int, never str) — and the frontend adapter casts this
+        field `as int?`. Confirmed live: sending strings here made
+        sfResultToAaPayload throw on every resumed session, silently
+        rendering the whole AA Preview tab empty, not just missing one
+        column. Must fail if load_session_from_disk's `int(seg["pass"])`
+        is reverted back to the bare seg["pass"] string.
+        """
+        session_id = _upload(client)
+        keeper0_id = _box_select(client, session_id, [0.3, 0.3, 0.2, 0.2])
+        _hold(client, session_id, keeper0_id, True)
+        _caption(client, session_id, keeper0_id, "kept in pass 0")
+
+        monkeypatch.setattr(main, "_lama_inpainter", PaintingInpainter())
+        r = client.post("/lama/scrub", json={"session_id": session_id})
+        assert r.status_code == 200, r.text
+
+        keeper1_id = _box_select(client, session_id, [0.3, 0.3, 0.2, 0.2])
+        _caption(client, session_id, keeper1_id, "kept in pass 1")
+
+        r = client.post("/saveSession", json={"session_id": session_id})
+        assert r.status_code == 200
+
+        del main.service.sessions[session_id]
+        del main.service.sf_sessions[session_id]
+
+        r = client.get(f"/loadSession/{session_id}")
+        assert r.status_code == 200, r.text
+        all_masks = r.json()["all_masks"]
+
+        assert all_masks["passes"], "expected at least one mask"
+        assert all(isinstance(p, int) for p in all_masks["passes"]), (
+            f"passes must be int, got {[type(p).__name__ for p in all_masks['passes']]}"
+        )
+        assert set(all_masks["passes"]) == {0, 1}
+
+        # And mask_ids must match sf_session.masks' own ids exactly — the
+        # same identifiers /mask/hold and /mask/caption route by.
+        reloaded = main.service.sf_sessions[session_id]
+        live_ids = {m.mask_id for m in reloaded.masks}
+        assert set(all_masks["mask_ids"]) == live_ids
+
+
 class TestRealResumeSequenceDoesNotDestroyData:
     """The actual product sequence on every app relaunch, reproduced
     precisely — NOT `TestSaveReloadRoundTrip`'s `get_session()` shortcut,
@@ -1212,6 +1343,50 @@ class TestOldSessionMigration:
         assert migrated.pass_ == 0
         assert migrated.dataset_status == sf_engine.DatasetStatus.UNASSIGNED
         assert sf_session.pass_ == 0
+
+    def test_load_session_from_disk_normalizes_mask_id_to_match_sf_session(self, tmp_path, monkeypatch):
+        """Fix 3 regression: load_session_from_disk's own all_masks dict
+        used to emit the raw, un-normalized segment_id — a bare uuid with
+        no pass prefix for a v1 row — while serialize_sf_masks_all_passes
+        emits sf_session.masks' already-normalized (pass-prefixed)
+        mask_id for the SAME record (see
+        test_reconstructed_session_resumes_at_pass_zero above: the same
+        bare uuid migrates to f"0:{old_mask_id}" there). Left
+        un-normalized, a v1 session's mask would be addressable under two
+        different ids depending on which endpoint answered, and
+        /mask/hold and /mask/caption route by whatever id they're given.
+        Must fail if load_session_from_disk's mask_ids reverts to the raw
+        seg["segment_id"].
+        """
+        monkeypatch.setattr(aa_persistence, "STORAGE_ROOT", tmp_path / "sf_storage")
+        fake_processor = FakeProcessor()
+        fake_service = SegmentationService(tmp_path / "sessions", fake_processor)
+
+        session_id = "legacy-session-3"
+        d = aa_persistence.session_dir(session_id)
+        bridge.save_parquet(str(d / "registry.parquet"), [session_id], ["name"], ["Legacy"])
+        old_mask_id = "bare-uuid-no-pass-prefix-2"
+        row = f"{session_id}:{old_mask_id}"
+        tiny_png = _upload_png_bytes()
+        bridge.save_parquet(
+            str(d / "segment.parquet"),
+            [f"{session_id}:_source", row, row],
+            ["image_bytes", "crop_bytes", "mask_bytes"],
+            [aa_persistence._b64(tiny_png)] * 3,
+        )
+
+        response = fake_service.load_session_from_disk(session_id)
+
+        sf_session = fake_service.sf_sessions[session_id]
+        expected_mask_id = sf_session.masks[0].mask_id
+        assert expected_mask_id == f"0:{old_mask_id}"  # sanity: matches the migration test above
+
+        all_masks = response["all_masks"]
+        assert all_masks["mask_ids"] == [expected_mask_id], (
+            f"expected the normalized id {expected_mask_id!r}, got {all_masks['mask_ids']!r}"
+        )
+        # Fix 2 holds for a v1-migrated record too, not just v2 sessions.
+        assert all(isinstance(p, int) for p in all_masks["passes"])
 
 
 class TestCompileTrainingSet:
