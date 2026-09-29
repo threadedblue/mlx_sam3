@@ -29,6 +29,7 @@ import 'layer_state.dart';
 import 'models/result_datum.dart';
 import 'widgets/result_cell.dart';
 import 'widgets/include_exclude_toggle.dart';
+import 'widgets/balloon_scrub_card.dart';
 import 'widgets/lbs_card.dart';
 import 'widgets/objects_selected_card.dart';
 import 'launch_config.dart';
@@ -490,6 +491,9 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _pointRunning = false;
   List<ResultDatum> _pointResult = [];
   bool _isScrubbing = false;
+  bool _isDetectingBalloons = false;
+  /// Null until the first detection run this session — distinct from 0.
+  int? _lastDetectedCount;
   String? _lastScrubLabel;
 
   /// The mask a box/point selection (or the scrub-batch checkbox list)
@@ -1220,6 +1224,35 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _detectBalloons() async {
+    if (_sessionId == null) return;
+    setState(() { _isDetectingBalloons = true; });
+    try {
+      final response = await _api.detectBalloons(_sessionId!);
+      if (!mounted) return;
+      if (response != null) {
+        setState(() {
+          // Deliberately the same result handling as _sendBoxPrompt: this is
+          // an ordinary selection response, so it renders through the existing
+          // Objects Selected / checkbox list / Masks layer path.
+          _result = response['results'] as Map<String, dynamic>?;
+          _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+          _updateSegmentsFromResult();
+          _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
+          _lastDetectedCount = (response['detection_count'] as num?)?.toInt() ?? 0;
+          _mutationCount++;
+        });
+      } else {
+        setState(() => _error = "Balloon detection failed.");
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() { _isDetectingBalloons = false; });
+    }
+  }
+
   Future<void> _saveSession() async {
     if (_sessionId == null) return;
     setState(() { _isLoading = true; });
@@ -1356,6 +1389,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   _buildCardRow(_buildPointPromptCard(),   ResultCell(isRunning: _pointRunning, data: _pointResult)),
                   const SizedBox(height: 16),
                   _buildCardRow(_buildResultsCard(),       ResultCell(isRunning: _resultsRunning, data: _resultsResult)),
+                  const SizedBox(height: 16),
+                  _buildCardRow(_buildBalloonScrubCard(), ResultCell(isRunning: _isDetectingBalloons, data: const [])),
                   const SizedBox(height: 16),
                   _buildCardRow(_buildLBSCard(),           const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
@@ -1838,6 +1873,15 @@ class _HomeScreenState extends State<HomeScreen> {
       lastScrubLabel: _lastScrubLabel,
       isScrubbing: _isScrubbing,
       onScrub: _scrubLamaBackground,
+    );
+  }
+
+  Widget _buildBalloonScrubCard() {
+    return BalloonScrubCard(
+      hasImage: _sessionId != null && _uiImage != null,
+      lastDetectedCount: _lastDetectedCount,
+      isDetecting: _isDetectingBalloons,
+      onDetect: _detectBalloons,
     );
   }
 

@@ -38,12 +38,20 @@ from dotenv import load_dotenv
 
 from services import (
     SegmentationService,
+    SessionLoadError,
     serialize_state,
     serialize_sf_masks,
     serialize_sf_masks_all_passes,
 )
 import aa_persistence
 import sf_engine
+import balloon_detector
+
+# Set from Part 1's zero-shot validation on Little Nemo 0026/0042/0122: 91%
+# recall of text regions with zero false positives on artwork, chosen over a
+# lower floor because a false positive here silently inpaints real artwork with
+# no human reviewing any individual detection.
+BALLOON_SCRUB_CONFIDENCE = 0.25
 import compile_training_set
 from lora_inferencer import (
     validate_inference_inputs,
@@ -63,6 +71,20 @@ model = None
 processor = None
 service = None
 _lama_inpainter: Optional[sf_engine.LamaInpainter] = None
+
+
+def _detector_box_to_norm_cxcywh(
+    box: List[float], width: int, height: int
+) -> list[float]:
+    """The detector reports pixel xyxy; add_box_selection takes normalized
+    cxcywh (the same shape BoxPromptRequest carries)."""
+    x1, y1, x2, y2 = box
+    return [
+        ((x1 + x2) / 2) / width,
+        ((y1 + y2) / 2) / height,
+        (x2 - x1) / width,
+        (y2 - y1) / height,
+    ]
 
 
 def _get_lama_inpainter() -> sf_engine.LamaInpainter:
@@ -514,6 +536,82 @@ class LamaScrubRequest(BaseModel):
     session_id: str
 
 
+@app.post("/segment/balloons")
+async def segment_balloons(request: SessionRequest):
+    """Detect every speech balloon on this session's CURRENT pass image and
+    hold each one, on the session that is already open.
+
+    Selection only. This never calls `run_lama_pass`: the user reviews the
+    held set in the existing per-object checkbox list and scrubs with the
+    existing LaMa Background Scrub card, so there is deliberately no second
+    scrub path. Zero detections is a clean no-op that still returns the
+    session's current masks unchanged.
+
+    Side effects mirror /segment/box exactly (`prompts` and the display-only
+    `prompted_boxes`), because each detection really is an ordinary box
+    selection — this endpoint only automates drawing them.
+    """
+    if processor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    session = service.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=400, detail="Session has no image uploaded yet")
+
+    # The current pass's image, not the original: a second run after a scrub
+    # must see what is on screen now.
+    image = sf_session.image_for_pass(sf_session.pass_).convert("RGB")
+
+    try:
+        detections = balloon_detector.detect(image, BALLOON_SCRUB_CONFIDENCE)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Balloon detection failed: {exc}")
+
+    start_time = time.perf_counter()
+    width, height = image.size
+    state = session["state"]
+    if "prompted_boxes" not in state:
+        state["prompted_boxes"] = []
+
+    held: List[str] = []
+    for det in detections:
+        box = _detector_box_to_norm_cxcywh(det["box"], width, height)
+        x1, y1, x2, y2 = det["box"]
+        state["prompted_boxes"].append({"box": [x1, y1, x2, y2], "label": True})
+        session.setdefault("prompts", []).append(
+            {"type": "box", "box": box, "label": "positive"}
+        )
+        records = sf_session.add_box_selection(box, True)
+        for record in records:
+            sf_session.set_held(record.mask_id, True)
+            held.append(record.mask_id)
+
+    processing_time_ms = (time.perf_counter() - start_time) * 1000
+    state = sf_session.state
+    session["state"] = state
+
+    results = serialize_sf_masks(sf_session, state)
+
+    # Persistence is explicit-Save-only — no autosave here, same as every
+    # other selection endpoint.
+    return {
+        "session_id": request.session_id,
+        "detection_count": len(detections),
+        "held_mask_ids": held,
+        "results": results,
+        "selected_mask_id": sf_session.last_touched_mask_id,
+        "all_masks": serialize_sf_masks_all_passes(sf_session),
+        "processing_time_ms": round(processing_time_ms, 2),
+        "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2),
+    }
+
+
 @app.post("/lama/scrub")
 async def lama_scrub(request: LamaScrubRequest):
     """Scrub the current pass's held masks via LaMa and advance to the next
@@ -557,6 +655,121 @@ async def lama_scrub(request: LamaScrubRequest):
         # "the current pass" — the AA Preview tab needs this response to
         # keep seeing it, not just the /segment/* responses.
         "all_masks": serialize_sf_masks_all_passes(sf_session),
+    }
+
+
+@app.post("/balloon-scrub")
+async def balloon_scrub(file: UploadFile = File(...)):
+    """Detect every text region on a comic page and LaMa-scrub them in one pass.
+
+    Fully automatic: there is no per-detection human review anywhere in this
+    flow, so `detections` in the response is the only record of what was
+    scrubbed and why. Nothing is captioned — held-and-scrubbed-without-a-caption
+    is this project's implicit-discard state, which is exactly right for a word
+    balloon.
+
+    The session created here is deliberately NOT persisted. `create_session()`
+    still makes the empty per-session directories, but `save_session_to_disk`
+    is never called, so no AA/session data is written; that is why the normal
+    `register_session_data` path is bypassed below rather than reused wholesale
+    — its last act is a disk save.
+    """
+    if processor is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    try:
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Error reading image: {exc}")
+
+    try:
+        detections = balloon_detector.detect(image, BALLOON_SCRUB_CONFIDENCE)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Balloon detection failed: {exc}")
+
+    session_id = service.create_session()
+    state = processor.set_image(image)
+
+    # In-memory registration only — see the docstring on why this does not go
+    # through register_session_data.
+    service.sessions[session_id] = {
+        "state": state,
+        "original_image_bytes": contents,
+        "original_filename": file.filename,
+        "image_size": image.size,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    sf_session = sf_engine.SFSession(
+        session_id=session_id,
+        original=sf_engine.ImmutableOriginal(contents),
+        segmentor=processor,
+        state=state,
+    )
+    service.sf_sessions[session_id] = sf_session
+
+    width, height = image.size
+    audit: List[Dict[str, Any]] = []
+
+    for det in detections:
+        box = _detector_box_to_norm_cxcywh(det["box"], width, height)
+        entry = {
+            "box": [round(v, 2) for v in det["box"]],
+            "confidence": det["confidence"],
+            "cls": det["cls"],
+            "mask_id": None,
+        }
+        try:
+            records = sf_session.add_box_selection(box, True)
+            for record in records:
+                sf_session.set_held(record.mask_id, True)
+            if records:
+                entry["mask_id"] = records[0].mask_id
+            else:
+                entry["note"] = "detector box produced no SAM3 mask"
+        except Exception as exc:
+            entry["note"] = f"selection failed: {exc}"
+        audit.append(entry)
+
+    held_ids = [m.mask_id for m in sf_session.masks if m.held]
+
+    if not held_ids:
+        # Zero usable detections is a clean no-op, not an error: hand back the
+        # original image untouched and never invoke LaMa.
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        return {
+            "session_id": session_id,
+            "image_b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
+            "width": width,
+            "height": height,
+            "confidence_threshold": BALLOON_SCRUB_CONFIDENCE,
+            "detections": audit,
+            "scrubbed_mask_ids": [],
+            "scrubbed": False,
+        }
+
+    try:
+        working_copy = sf_session.run_lama_pass(_get_lama_inpainter())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error running LaMa scrub: {exc}")
+
+    service.sessions[session_id]["state"] = sf_session.state
+
+    buf = io.BytesIO()
+    working_copy.image.save(buf, format="PNG")
+    scrub = sf_session.last_scrub
+    return {
+        "session_id": session_id,
+        "image_b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
+        "width": working_copy.image.width,
+        "height": working_copy.image.height,
+        "confidence_threshold": BALLOON_SCRUB_CONFIDENCE,
+        "detections": audit,
+        "scrubbed_mask_ids": list(scrub.mask_ids),
+        "scrubbed": True,
     }
 
 
@@ -701,6 +914,8 @@ async def save_session_settings(request: SessionSettingsRequest):
         return {"message": "Settings saved", "session_id": request.session_id}
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except SessionLoadError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -252,6 +252,28 @@ class ApiService {
     }
   }
 
+  /// Detect every speech balloon on the session's current pass and hold each
+  /// one for review. Selection only — this never scrubs; the returned shape is
+  /// an ordinary selection response, so it flows through the same result
+  /// handling as /segment/box.
+  Future<Map<String, dynamic>?> detectBalloons(String sessionId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/segment/balloons'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId}),
+      );
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      debugPrint('Balloon detection failed: ${response.statusCode} ${response.body}');
+      return null;
+    } catch (e) {
+      debugPrint('Error detecting balloons: $e');
+      return null;
+    }
+  }
+
   Future<Map<String, dynamic>?> resetPrompts(String sessionId) async {
     try {
       final response = await http.post(

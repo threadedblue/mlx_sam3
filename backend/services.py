@@ -23,6 +23,12 @@ import aa_persistence
 import sf_engine
 
 
+class SessionLoadError(Exception):
+    """Raised when an operation refuses to proceed because this session's
+    SAM3/prompt reconstruction is known to have failed — see
+    `SegmentationService._broken_sessions`."""
+
+
 def _img_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
     buf = io.BytesIO()
     img.save(buf, format=fmt)
@@ -290,6 +296,13 @@ class SegmentationService:
         self.processor = processor
         self.sessions: Dict[str, Dict[str, Any]] = {}
         self.sf_sessions: Dict[str, sf_engine.SFSession] = {}
+        # session_ids whose SAM3/prompt reconstruction threw on the most
+        # recent attempt — see `_load_session_into_memory`'s except clause
+        # and `save_session_settings` below. Deliberately NOT populated for
+        # a session that simply has no image yet (staged via /initSession):
+        # that is an expected, benign state (`load_session_from_disk`'s own
+        # docstring: "a session the caller can still use"), not a failure.
+        self._broken_sessions: set[str] = set()
         self.segment_prompt_dir = self.storage_dir.parent / "segment_prompt"
         schema_path = Path(__file__).parent.parent / "schemas" / "metadata-schema.json"
         with schema_path.open() as _f:
@@ -427,14 +440,41 @@ class SegmentationService:
 
             # 3. Re-apply prompts, in original order, to reconstruct the full state
             prompts = raw["prompts"]
-            for p in prompts:
-                if isinstance(p, str):  # Text prompt
-                    state = self.processor.set_text_prompt(p, state)
-                elif isinstance(p, dict) and p.get("type") in ["box", "point"]:
-                    prompt_geom = p.get("box") or p.get("point")
-                    is_positive = p.get("label") == "positive"
-                    if prompt_geom:
-                        state = self.processor.add_geometric_prompt(prompt_geom, is_positive, state)
+            for idx, p in enumerate(prompts):
+                try:
+                    if isinstance(p, str):  # Text prompt
+                        state = self.processor.set_text_prompt(p, state)
+                    elif isinstance(p, dict) and p.get("type") in ["box", "point"]:
+                        is_positive = p.get("label") == "positive"
+                        # Dispatch by TYPE, not by "whichever geometry key is
+                        # present". Replaying a point through
+                        # add_geometric_prompt sends a 2-element [x, y] into
+                        # the box path, which reshapes to (1, 1, 4) and throws
+                        # "Cannot reshape array of size 2 into shape (1,1,4)" —
+                        # failing the whole load, which the caller then reports
+                        # as a bare 404 "Session not found". Confirmed live on
+                        # 3 of 7 stored sessions. Points also have their own
+                        # trained pathway (see add_point_prompt's docstring);
+                        # the box path was never a valid input shape for them
+                        # even when the arity happened to line up.
+                        if p.get("type") == "point":
+                            point = p.get("point")
+                            if point:
+                                state = self.processor.add_point_prompt(point, is_positive, state)
+                        else:
+                            box = p.get("box")
+                            if box:
+                                state = self.processor.add_geometric_prompt(box, is_positive, state)
+                except Exception as e:
+                    # One unreplayable prompt must not cost the whole session.
+                    # Resuming with a partially reconstructed SAM3 state is
+                    # strictly better than a 404 that reads as "your work is
+                    # gone" — the masks themselves are restored from persisted
+                    # columns, not from replay (see this class's docstring).
+                    print(
+                        f"Warning: skipping unreplayable prompt {idx} "
+                        f"({p!r}) in session {session_id}: {e}"
+                    )
 
             # 4. Construct the session object and store it in memory
             session_data = {
@@ -476,10 +516,24 @@ class SegmentationService:
             session_data["state"] = self.sf_sessions[session_id].state
 
             print(f"Successfully loaded session {session_id} from disk into memory.")
+            # A retry (e.g. after a code fix, or a transient error) that now
+            # succeeds must clear any earlier broken mark — this is a
+            # liveness flag for "as of the last attempt", not a permanent
+            # blacklist.
+            self._broken_sessions.discard(session_id)
             return session_data
         except Exception as e:
             # Using print for visibility in logs, but proper logging is better
             print(f"Error loading session {session_id} into memory: {e}")
+            # Distinct from the early `image_bytes is None` return above:
+            # this session HAS a registry row and an image, but reconstructing
+            # its SAM3/prompt state threw partway through. Marked broken so
+            # save_session_settings (and any future write path that doesn't
+            # itself depend on a healthy in-memory session) can refuse to
+            # persist against it, rather than silently "succeeding" while the
+            # backend has no valid state for this session — see that
+            # function's docstring for the incident this closes.
+            self._broken_sessions.add(session_id)
             return None
 
     def create_session(self) -> str:
@@ -560,7 +614,32 @@ class SegmentationService:
         aa_persistence.save_session(session_id, session, sf_session)
 
     def save_session_settings(self, session_id: str, settings: Dict[str, Any]):
-        """Merges UI-specific settings into the session's persisted registry."""
+        """Merges UI-specific settings into the session's persisted registry.
+
+        Refuses when this session's SAM3/prompt reconstruction is known to
+        have failed (`_broken_sessions`) — `aa_persistence.save_session_settings`
+        itself only checks that registry.parquet exists, with no idea whether
+        the backend actually has a valid in-memory session for this id.
+        Confirmed live: a session whose replay threw (e.g. the point-prompt
+        reshape bug) could still have its view-layer toggles "saved"
+        successfully, silently implying the session was fine when it wasn't
+        — harmless in that specific case (this write never touches anything
+        but the ui_settings field, and preserves every other field's existing
+        value), but the wrong invariant to leave standing in general.
+
+        `self.get_session` first ensures a load has actually been attempted
+        in this process — so this works whether or not /loadSession already
+        ran — before consulting the flag it sets. A session that legitimately
+        has no image yet (staged via /initSession) is NOT broken and is
+        unaffected: `get_session` returns None for it too, but nothing marks
+        it broken (see `_load_session_into_memory`'s early return).
+        """
+        self.get_session(session_id)
+        if session_id in self._broken_sessions:
+            raise SessionLoadError(
+                f"Session {session_id} failed to load; refusing to persist "
+                "settings until it loads successfully."
+            )
         aa_persistence.save_session_settings(session_id, settings)
 
     def load_session_from_disk(self, session_id: str) -> Dict[str, Any]:
