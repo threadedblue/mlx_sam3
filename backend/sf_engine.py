@@ -43,6 +43,16 @@ import d4m_juliacall_bridge as bridge
 
 ORIGINAL_PASS = 0
 
+# `MaskRecord.source` values — how a selection was made. SOURCE_BALLOON is
+# mechanically identical to SOURCE_BOX (balloon detection goes through
+# `add_box_selection` unchanged); it exists only so a scrub can tell that its
+# batch came from balloon detection, which is what makes the resulting pass
+# identifiable as the WB-scrub result rather than an ordinary S&S round.
+SOURCE_TEXT_PROMPT = "text_prompt"
+SOURCE_BOX = "box"
+SOURCE_POINT = "point"
+SOURCE_BALLOON = "balloon"
+
 
 class DatasetStatus(str, Enum):
     UNASSIGNED = "unassigned"
@@ -421,6 +431,15 @@ class SFSession:
         # still exported.
         self._pass_images: dict[int, Image.Image] = {}
         self.last_scrub: Optional[ScrubRecord] = None
+        # Which pass a WB (word-balloon) scrub produced, or None if one has
+        # never run. v4 §2's layer table calls this layer "WB-scrub result"
+        # and expects it at pass 1 — but pass 1 only MEANS that if Balloon
+        # Scrub happened to run before any ordinary S&S scrub, which nothing
+        # enforces (an S&S scrub first takes pass 1, pushing WB-scrub to 2+).
+        # So the layer is identified by what produced it, recorded here, not
+        # by its pass number. Stays None for a page with no balloons, so no
+        # phantom WB layer appears for a scrub that never happened.
+        self.wb_scrub_pass: Optional[int] = None
         # The mask id a box/point call most recently matched-or-created —
         # set by `_select_single` only (text prompts are multi-instance, so
         # there's no single "the" mask to point at). `serialize_sf_masks`'s
@@ -460,9 +479,16 @@ class SFSession:
         pass_images: dict[int, Image.Image],
         masks: list[MaskRecord],
         last_scrub: Optional[ScrubRecord] = None,
+        wb_scrub_pass: Optional[int] = None,
     ) -> None:
         """Reconstruct state from persistence in one call, rather than the
         caller reaching into `_pass`/`_pass_images`/`masks` directly.
+
+        `wb_scrub_pass` must be supplied by the caller rather than re-derived
+        from `masks`: `MaskRecord.source` is deliberately not persisted (it
+        comes back as "loaded" — see aa_persistence's module docstring), so a
+        reloaded session cannot tell which of its masks were balloons. The
+        pass number itself is what survives.
 
         `state` (the live SAM3 processor dict) is deliberately NOT part of
         this: the caller must still `segmentor.set_image(...)` on whichever
@@ -475,6 +501,7 @@ class SFSession:
         self._pass_images = dict(pass_images)
         self.masks = list(masks)
         self.last_scrub = last_scrub
+        self.wb_scrub_pass = wb_scrub_pass
 
     @property
     def working_copy(self) -> Optional[WorkingCopy]:
@@ -701,9 +728,15 @@ class SFSession:
 
     def add_box_selection(
         self, box: list[float], label: bool, text_substitute: Optional[str] = None,
+        source: str = SOURCE_BOX,
     ) -> list[MaskRecord]:
+        """A box selection. `source` exists so balloon detection can mark its
+        own selections ([SOURCE_BALLOON]) while going through this exact same
+        path — a detected balloon IS an ordinary box selection mechanically,
+        and must stay one; only its provenance differs. See
+        `run_lama_pass`'s `wb_scrub_pass` for what that provenance buys."""
         return self._select_single(
-            text_substitute, "box", label,
+            text_substitute, source, label,
             lambda s: self.segmentor.add_geometric_prompt(box, label, s),
             lambda geoms, boxes, scores, w, h: _pick_for_box(box, boxes, scores, w, h),
         )
@@ -825,6 +858,13 @@ class SFSession:
         self.state = new_state
         self._pass = to_pass
         self.last_scrub = ScrubRecord(from_pass, to_pass, tuple(m.mask_id for m in batch))
+        # Derived from what was actually scrubbed, not from a caller's claim
+        # or from the pass number: a batch containing balloon-detected masks
+        # makes the resulting pass the WB-scrub result, wherever it lands in
+        # the chain. An empty batch (a zero-balloon page) contains no balloon
+        # masks, so this correctly stays as it was.
+        if any(m.source == SOURCE_BALLOON for m in batch):
+            self.wb_scrub_pass = to_pass
         return WorkingCopy(self.image_for_pass(to_pass))
 
 

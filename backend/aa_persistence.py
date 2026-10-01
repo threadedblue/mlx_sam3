@@ -127,9 +127,25 @@ STORAGE_ROOT = Path(__file__).resolve().parent.parent / "storage" / "sf" / "sess
 _SOURCE_TARGET = "_source"
 _BACKGROUND_TARGET = "_background"  # v1 sentinel, read-only migration path
 _PASS_IMAGE_PREFIX = "_pass_image"  # v2: one row per pass >= 1, "_pass_image:<pass>"
+# v4: which pass a word-balloon scrub produced, written only once one has.
+# The pass NUMBER is persisted rather than re-derived from the masks on load,
+# because `MaskRecord.source` deliberately isn't persisted (it reads back as
+# "loaded"), so a reloaded session has no way to tell which of its masks were
+# balloons. Absent row == no WB scrub has run, which is also what a
+# zero-balloon page correctly looks like.
+_WB_SCRUB_TARGET = "_wb_scrub"
 _GLOBAL_TARGET = "_global"
 
-_REGISTRY_FIELDS = ("name", "description", "created_at", "image_url", "original_filename")
+# "mode" (v4 §3): which SegForge toolset this session was created under.
+# Persisted alongside image_url so a resumed session knows its own mode
+# without DoubleNaught re-supplying it — DN sends it only on a fresh
+# launch and sends empty on resume, exactly as it does for image_url.
+# Absent/empty reads back as None, which means "legacy/unfiltered", NOT
+# "assume Comix" (see the frontend's SfMode.cardsFor).
+_REGISTRY_FIELDS = (
+    "name", "description", "created_at", "image_url", "original_filename",
+    "mode",
+)
 
 
 def session_dir(session_id: str) -> Path:
@@ -258,6 +274,11 @@ def _build_segments_from_masks(session_id: str, sf_session: "sf_engine.SFSession
         rows.append(f"{session_id}:{_PASS_IMAGE_PREFIX}:{p}")
         cols.append("image_bytes")
         vals.append(_b64(_png_bytes(image)))
+
+    if sf_session.wb_scrub_pass is not None:
+        rows.append(f"{session_id}:{_WB_SCRUB_TARGET}")
+        cols.append("pass")
+        vals.append(str(sf_session.wb_scrub_pass))
 
     for mask in sf_session.masks:
         base_image = pass_images.get(mask.pass_, pass_images[0])
@@ -411,6 +432,7 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
 
     image_bytes: Optional[bytes] = None
     pass_images: dict[int, bytes] = {}
+    wb_scrub_pass: Optional[int] = None
     segments: list[dict[str, Any]] = []
     seg_path = d / "segment.parquet"
     if seg_path.exists():
@@ -432,6 +454,9 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
             if target_id.startswith(f"{_PASS_IMAGE_PREFIX}:"):
                 pass_num = int(target_id.split(":", 1)[1])
                 pass_images[pass_num] = _unb64(attrs["image_bytes"])
+                continue
+            if target_id == _WB_SCRUB_TARGET:
+                wb_scrub_pass = int(attrs["pass"])
                 continue
             dataset_status = attrs.get("dataset_status", "unassigned")
             segments.append({
@@ -468,11 +493,13 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
         "description": fields.get("description") or None,
         "created_at": fields.get("created_at") or None,
         "image_url": fields.get("image_url") or None,
+        "mode": fields.get("mode") or None,
         "original_filename": fields.get("original_filename") or None,
         "width": width,
         "height": height,
         "image_bytes": image_bytes,
         "pass_images": pass_images,
+        "wb_scrub_pass": wb_scrub_pass,
         "segments": segments,
         "prompts": prompts,
         "ui_settings": json.loads(fields["ui_settings"]) if fields.get("ui_settings") else {},

@@ -418,3 +418,68 @@ def test_balloons_do_not_persist_the_session(client, monkeypatch):
     client.post("/segment/balloons", json={"session_id": session_id})
 
     assert saved == []
+
+
+# ── v4 §2: the pass a balloon scrub produces is identifiable ─────────────────
+
+
+def test_balloon_endpoint_marks_its_selections_as_balloon_sourced(
+    client, monkeypatch
+):
+    """The marking is what later lets the scrub recognise its own batch —
+    before this, a detected balloon was indistinguishable from a hand-drawn
+    box (both source 'box')."""
+    _detects(monkeypatch, [((10, 10, 30, 30), 0.91)])
+    session_id = _make_session(client, monkeypatch)
+
+    client.post("/segment/balloons", json={"session_id": session_id})
+
+    sf_session = main.service.sf_sessions[session_id]
+    assert sf_session.masks
+    assert all(
+        m.source == main.sf_engine.SOURCE_BALLOON for m in sf_session.masks
+    )
+
+
+def test_scrub_response_reports_the_wb_scrub_pass(client, monkeypatch):
+    _detects(monkeypatch, [((10, 10, 30, 30), 0.91)])
+    session_id = _make_session(client, monkeypatch)
+
+    client.post("/segment/balloons", json={"session_id": session_id})
+    body = client.post("/lama/scrub", json={"session_id": session_id}).json()
+
+    assert body["wb_scrub_pass"] == 1
+    assert main.service.sf_sessions[session_id].wb_scrub_pass == 1
+
+
+def test_an_ordinary_scrub_reports_no_wb_scrub_pass(client, monkeypatch):
+    """Display Layers must not grow a WB checkbox for an S&S-only session."""
+    _detects(monkeypatch, [])
+    session_id = _make_session(client, monkeypatch)
+
+    client.post("/segment/box", json={
+        "session_id": session_id, "box": [0.5, 0.5, 0.2, 0.2], "label": True,
+    })
+    body = client.post("/lama/scrub", json={"session_id": session_id}).json()
+
+    assert body["wb_scrub_pass"] is None
+
+
+def test_balloon_scrub_out_of_order_reports_the_pass_it_actually_made(
+    client, monkeypatch
+):
+    _detects(monkeypatch, [((10, 10, 30, 30), 0.91)])
+    session_id = _make_session(client, monkeypatch)
+
+    # An ordinary S&S round takes pass 1 first.
+    client.post("/segment/box", json={
+        "session_id": session_id, "box": [0.5, 0.5, 0.2, 0.2], "label": True,
+    })
+    first = client.post("/lama/scrub", json={"session_id": session_id}).json()
+    assert first["wb_scrub_pass"] is None
+
+    # Balloon scrub now lands at pass 2, and says so.
+    client.post("/segment/balloons", json={"session_id": session_id})
+    second = client.post("/lama/scrub", json={"session_id": session_id}).json()
+
+    assert second["wb_scrub_pass"] == 2

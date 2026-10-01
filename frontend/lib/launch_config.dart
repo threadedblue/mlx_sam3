@@ -29,6 +29,7 @@ class LaunchConfig {
 
   static const String _imageUrl = String.fromEnvironment('SEGFORGE_IMAGE_URL');
   static const String _sessionId = String.fromEnvironment('SEGFORGE_SESSION_ID');
+  static const String _mode = String.fromEnvironment('SEGFORGE_MODE');
   static const String _backendUrl = String.fromEnvironment(
     'SEGFORGE_BACKEND_URL',
     defaultValue: 'http://127.0.0.1:8401',
@@ -46,6 +47,16 @@ class LaunchConfig {
 
   /// Session to work in, or null to let the backend allocate one on upload.
   static String? get sessionId => _resolve('SEGFORGE_SESSION_ID', _sessionId);
+
+  /// Which toolset to show (v4 §3), or null when nothing supplied one.
+  ///
+  /// Null is NOT "assume Comix": absence means this app was launched
+  /// standalone, or by a DoubleNaught build predating modes, or is resuming
+  /// a session saved before modes existed. All of those are legacy cases
+  /// that must keep seeing the full, unfiltered card set — silently
+  /// narrowing them to one mode's toolset would hide cards that used to be
+  /// there. See [SfMode.cardsFor].
+  static String? get mode => _resolve('SEGFORGE_MODE', _mode);
 
   /// Where the SegForge backend lives.
   ///

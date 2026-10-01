@@ -28,11 +28,15 @@ import 'layered_segmentation_canvas.dart';
 import 'layer_state.dart';
 import 'models/result_datum.dart';
 import 'widgets/result_cell.dart';
-import 'widgets/include_exclude_toggle.dart';
 import 'widgets/balloon_scrub_card.dart';
+import 'widgets/box_select_card.dart';
 import 'widgets/lbs_card.dart';
 import 'widgets/objects_selected_card.dart';
+import 'widgets/point_select_card.dart';
+import 'widgets/prompt_card.dart';
+import 'widgets/save_card.dart';
 import 'launch_config.dart';
+import 'sf_mode.dart';
 
 void main() {
   runApp(const SamApp());
@@ -491,6 +495,15 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _pointRunning = false;
   List<ResultDatum> _pointResult = [];
   bool _isScrubbing = false;
+  /// Which pass a balloon scrub produced, from the backend's
+  /// `wb_scrub_pass`. Null until one has run — which is also exactly
+  /// what a zero-balloon page looks like, so the WB-scrub layer stays
+  /// absent rather than mislabeling an ordinary pass.
+  int? _wbScrubPass;
+  /// Which toolset to show. Seeded from SEGFORGE_MODE at launch and
+  /// replaced by the session's OWN stored mode on resume, since DN sends
+  /// nothing on a resume. Null means legacy/unfiltered — never Comix.
+  SfMode? _mode = SfMode.parse(LaunchConfig.mode);
   bool _isDetectingBalloons = false;
   /// Null until the first detection run this session — distinct from 0.
   int? _lastDetectedCount;
@@ -674,6 +687,12 @@ class _HomeScreenState extends State<HomeScreen> {
       // the tab in its "Empty associative array" state on every resume
       // regardless of how many masks the session actually has.
       _aaPreviewData = session['all_masks'] as Map<String, dynamic>?;
+      _wbScrubPass = (session['wb_scrub_pass'] as num?)?.toInt();
+      // A resumed session is authoritative about its own mode: DN only
+      // supplies one when launching a NEW session. A session saved before
+      // modes existed sends null here, which correctly leaves the sidebar
+      // unfiltered rather than narrowing it.
+      _mode = SfMode.parse(session['mode'] as String?);
       // A resumed session starts clean: everything it carries just came
       // FROM the last save, not from unsaved work in this run. Explicit
       // rather than relying on both counters defaulting to 0 on a fresh
@@ -1207,6 +1226,9 @@ class _HomeScreenState extends State<HomeScreen> {
           // captioned, defeating its purpose (previewing exportable data)
           // precisely when the data became exportable.
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+          // Only a balloon scrub sets this; an ordinary S&S scrub leaves
+          // whatever it already was (null, or an earlier WB pass).
+          _wbScrubPass = (response['wb_scrub_pass'] as num?)?.toInt() ?? _wbScrubPass;
           _mutationCount++;
         });
       } else {
@@ -1378,25 +1400,35 @@ class _HomeScreenState extends State<HomeScreen> {
             child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _buildCardRow(_buildSessionCard(),       const ResultCell(isRunning: false, data: [])),
+                  if (_showsCard(SfCard.session))
+                    _buildCardRow(_buildSessionCard(),       const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildUploadCard(),        ResultCell(isRunning: _imageSourceRunning, data: const [])),
+                  if (_showsCard(SfCard.upload))
+                    _buildCardRow(_buildUploadCard(),        ResultCell(isRunning: _imageSourceRunning, data: const [])),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildTextPromptCard(),    ResultCell(isRunning: _textPromptRunning, data: _textPromptResult)),
+                  if (_showsCard(SfCard.prompt))
+                    _buildCardRow(_buildTextPromptCard(),    ResultCell(isRunning: _textPromptRunning, data: _textPromptResult)),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildBoxPromptCard(),     ResultCell(isRunning: _boxRunning, data: _boxResult)),
+                  if (_showsCard(SfCard.boxSelect))
+                    _buildCardRow(_buildBoxPromptCard(),     ResultCell(isRunning: _boxRunning, data: _boxResult)),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildPointPromptCard(),   ResultCell(isRunning: _pointRunning, data: _pointResult)),
+                  if (_showsCard(SfCard.pointSelect))
+                    _buildCardRow(_buildPointPromptCard(),   ResultCell(isRunning: _pointRunning, data: _pointResult)),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildResultsCard(),       ResultCell(isRunning: _resultsRunning, data: _resultsResult)),
+                  if (_showsCard(SfCard.objectsSelected))
+                    _buildCardRow(_buildResultsCard(),       ResultCell(isRunning: _resultsRunning, data: _resultsResult)),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildBalloonScrubCard(), ResultCell(isRunning: _isDetectingBalloons, data: const [])),
+                  if (_showsCard(SfCard.balloonScrub))
+                    _buildCardRow(_buildBalloonScrubCard(), ResultCell(isRunning: _isDetectingBalloons, data: const [])),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildLBSCard(),           const ResultCell(isRunning: false, data: [])),
+                  if (_showsCard(SfCard.lamaBackgroundScrub))
+                    _buildCardRow(_buildLBSCard(),           const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildSegmentLayersCard(), const ResultCell(isRunning: false, data: [])),
+                  if (_showsCard(SfCard.displayLayers))
+                    _buildCardRow(_buildSegmentLayersCard(), const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
-                  _buildCardRow(_buildSaveCard(),          const ResultCell(isRunning: false, data: [])),
+                  if (_showsCard(SfCard.save))
+                    _buildCardRow(_buildSaveCard(),          const ResultCell(isRunning: false, data: [])),
                   if (_error != null) ...[
                     const SizedBox(height: 16),
                     SizedBox(
@@ -1499,6 +1531,9 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
+
+  /// Whether [card] belongs in this session's sidebar (v4 §3).
+  bool _showsCard(SfCard card) => cardsFor(_mode).contains(card);
 
   Widget _buildBorderedCard(Widget child) {
     return Container(
@@ -1698,143 +1733,31 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildTextPromptCard() {
-    // REQUIRED, not cosmetic: the mode must be visible on screen at all
-    // times, never something to infer from what happens after submit —
-    // see _sendTextPrompt's docstring for why.
-    final captionMode = _isCaptionMode;
-    final focusedIdTail = _focusedSegment?.maskId?.split(':').last;
-    // Not a bare .substring(0, 8): real ids are f"{pass}:{uuid4()}"
-    // (backend/sf_engine.py), always well over 8 chars here, but nothing
-    // guarantees that for every possible maskId — same clamp as
-    // ObjectsSelectedCard's identical truncation.
-    final headerLabel = captionMode
-        ? "Caption: ${focusedIdTail == null ? '' : (focusedIdTail.length <= 8 ? focusedIdTail : focusedIdTail.substring(0, 8))}"
-        : "Prompt";
-
-    return _buildBorderedCard(
-      Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(captionMode ? Icons.local_offer : Icons.text_fields, size: 16),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    headerLabel,
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      color: captionMode ? const Color(0xFF007F00) : null,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                if (!captionMode)
-                  const Radio<SelectionMode>(
-                    value: SelectionMode.prompt,
-                    toggleable: true,
-                  ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _textController,
-              maxLines: null,
-              decoration: InputDecoration(
-                hintText: captionMode ? 'Describe this object for training' : 'e.g. "cat", "wheel"',
-                isDense: true,
-                border: const OutlineInputBorder(),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-              ),
-              enabled: _sessionId != null && !_isLoading,
-              onSubmitted: (_) => _sendTextPrompt(),
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton(
-                onPressed: promptCardCanSubmit(
-                  hasSession: _sessionId != null,
-                  promptEmpty: _textController.text.isEmpty,
-                  isLoading: _isLoading,
-                  captionMode: captionMode,
-                  selectedMode: _selectedMode,
-                ) ? _sendTextPrompt : null,
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: captionMode ? const Color(0xFF007F00) : Colors.white,
-                  side: BorderSide(color: captionMode ? const Color(0xFF007F00) : Colors.white),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(24),
-                  ),
-                ),
-                child: Text(captionMode ? "Save Caption" : "Select"),
-              ),
-            ),
-          ],
-        ),
-      ),
+    return PromptCard(
+      // REQUIRED, not cosmetic: the mode must be visible on screen at all
+      // times, never something to infer from what happens after submit —
+      // see _sendTextPrompt's docstring for why.
+      captionMode: _isCaptionMode,
+      focusedMaskId: _focusedSegment?.maskId,
+      promptController: _textController,
+      hasSession: _sessionId != null,
+      isLoading: _isLoading,
+      selectedMode: _selectedMode,
+      onSubmit: _sendTextPrompt,
     );
   }
 
   Widget _buildBoxPromptCard() {
-    return _buildBorderedCard(
-      Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.crop_free, size: 16),
-                const SizedBox(width: 8),
-                const Text("Box Select", style: TextStyle(fontWeight: FontWeight.bold)),
-                const Spacer(),
-                const Radio<SelectionMode>(
-                  value: SelectionMode.box,
-                  toggleable: true,
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            IncludeExcludeToggle(
-              value: _boxMode == "positive",
-              onChanged: (isPositive) => setState(() => _boxMode = isPositive ? "positive" : "negative"),
-            ),
-          ],
-        ),
-      ),
+    return BoxSelectCard(
+      isPositive: _boxMode == "positive",
+      onModeChanged: (isPositive) => setState(() => _boxMode = isPositive ? "positive" : "negative"),
     );
   }
 
   Widget _buildPointPromptCard() {
-    return _buildBorderedCard(
-      Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.touch_app, size: 16),
-                const SizedBox(width: 8),
-                const Text("Point Select", style: TextStyle(fontWeight: FontWeight.bold)),
-                const Spacer(),
-                const Radio<SelectionMode>(
-                  value: SelectionMode.point,
-                  toggleable: true,
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            IncludeExcludeToggle(
-              value: _pointMode == "positive",
-              onChanged: (isPositive) => setState(() => _pointMode = isPositive ? "positive" : "negative"),
-            ),
-          ],
-        ),
-      ),
+    return PointSelectCard(
+      isPositive: _pointMode == "positive",
+      onModeChanged: (isPositive) => setState(() => _pointMode = isPositive ? "positive" : "negative"),
     );
   }
 
@@ -1850,8 +1773,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
 
   Widget _buildSegmentLayersCard() {
-    // This widget now manages its own state via a Consumer<LayerState>
-    return const SegmentLayersCard();
+    // Layer visibility is its own Consumer<LayerState>; whether the
+    // WB-scrub layer EXISTS is session state, so it comes from here.
+    return SegmentLayersCard(hasWbScrubLayer: _wbScrubPass != null);
   }
 
   Widget _buildLBSCard() {
@@ -1886,37 +1810,10 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildSaveCard() {
-    return _buildBorderedCard(
-      Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Row(
-              children: [
-                Icon(Icons.save, size: 16),
-                SizedBox(width: 8),
-                Text("Save", style: TextStyle(fontWeight: FontWeight.bold)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: (_sessionId == null || _isLoading) ? null : _saveSession,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF007F00),
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(24),
-                  ),
-                ),
-                child: const Text("Save"),
-              ),
-            ),
-          ],
-        ),
-      ),
+    return SaveCard(
+      hasSession: _sessionId != null,
+      isLoading: _isLoading,
+      onSave: _saveSession,
     );
   }
 

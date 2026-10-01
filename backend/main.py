@@ -214,6 +214,10 @@ class InitSessionRequest(BaseModel):
     name: str
     description: str
     image_url: str
+    # v4 §3. Optional, and empty on resume: DoubleNaught supplies a mode only
+    # when it is launching a NEW session. An empty value must never overwrite
+    # the mode already stored for this session — see the guard in init_session.
+    mode: str = ""
 
 
 class LoraAppendRequest(BaseModel):
@@ -587,7 +591,13 @@ async def segment_balloons(request: SessionRequest):
         session.setdefault("prompts", []).append(
             {"type": "box", "box": box, "label": "positive"}
         )
-        records = sf_session.add_box_selection(box, True)
+        # Same box-selection path as a hand-drawn box, marked as balloon-
+        # sourced so the scrub that follows can identify the pass it produces
+        # as the WB-scrub result (v4 §2's layer table) — see
+        # SFSession.wb_scrub_pass.
+        records = sf_session.add_box_selection(
+            box, True, source=sf_engine.SOURCE_BALLOON
+        )
         for record in records:
             sf_session.set_held(record.mask_id, True)
             held.append(record.mask_id)
@@ -655,6 +665,12 @@ async def lama_scrub(request: LamaScrubRequest):
         # "the current pass" — the AA Preview tab needs this response to
         # keep seeing it, not just the /segment/* responses.
         "all_masks": serialize_sf_masks_all_passes(sf_session),
+        # Which pass (if any) a balloon scrub produced — what lets Display
+        # Layers show "WB-scrub result" as its own layer, distinct from
+        # Current, wherever in the chain it landed. None until one runs, so a
+        # zero-balloon page never shows a phantom WB layer. A scrub is the
+        # only moment this can change.
+        "wb_scrub_pass": sf_session.wb_scrub_pass,
     }
 
 
@@ -1024,14 +1040,20 @@ async def init_session(request: InitSessionRequest):
         raise HTTPException(status_code=503, detail="Service not available")
 
     try:
-        service.register_session_data(
-            request.session_id,
-            {
-                "name": request.name,
-                "description": request.description,
-                "image_url": request.image_url,
-            }
-        )
+        init_data = {
+            "name": request.name,
+            "description": request.description,
+            "image_url": request.image_url,
+        }
+        # Only written when actually supplied — the same guard /upload needs
+        # for image_url, and for the same reason: register_session_data merges
+        # into whatever is already cached, so a key present with an empty value
+        # would clobber a real stored one. DoubleNaught sends mode="" on every
+        # resume, so without this a resumed session would lose its mode on the
+        # first /initSession call and silently fall back to unfiltered.
+        if request.mode:
+            init_data["mode"] = request.mode
+        service.register_session_data(request.session_id, init_data)
         return {
             "session_id": request.session_id,
             "name": request.name,

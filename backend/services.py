@@ -418,7 +418,10 @@ class SegmentationService:
                 caption=seg.get("caption"),
             ))
 
-        sf_session.restore(current_pass, pass_images, masks)
+        sf_session.restore(
+            current_pass, pass_images, masks,
+            wb_scrub_pass=raw.get("wb_scrub_pass"),
+        )
         return sf_session
 
     def _load_session_into_memory(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -487,6 +490,7 @@ class SegmentationService:
                 "name": raw["name"],
                 "description": raw["description"],
                 "image_url": raw["image_url"],
+                "mode": raw.get("mode"),
             }
             self.sessions[session_id] = session_data
             self.sf_sessions[session_id] = self._reconstruct_sf_session(session_id, raw, state)
@@ -776,6 +780,17 @@ class SegmentationService:
             "description": raw["description"],
             "image_url": raw["image_url"],
         }
+
+        # The mode this session was created under (v4 §3), read back from
+        # registry.parquet. This is what lets a resumed session pick its own
+        # card list without DoubleNaught re-supplying it — DN sends mode only
+        # on a fresh launch. None means legacy/unfiltered, never "Comix".
+        response["mode"] = raw.get("mode")
+
+        # Which pass a balloon scrub produced, so a resumed session still
+        # labels its WB-scrub layer — `MaskRecord.source` is not persisted,
+        # so this number is the only thing that survives to identify it.
+        response["wb_scrub_pass"] = raw.get("wb_scrub_pass")
 
         view_layers = raw["ui_settings"].get("view_layers")
         if view_layers is not None:

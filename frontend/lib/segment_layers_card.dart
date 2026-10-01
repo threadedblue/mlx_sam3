@@ -3,7 +3,14 @@ import 'layer_state.dart';
 import 'package:provider/provider.dart';
 
 class SegmentLayersCard extends StatelessWidget {
-  const SegmentLayersCard({super.key});
+  /// Whether this session has a WB-scrub result layer at all — true only
+  /// once a balloon scrub has actually produced a pass (backend's
+  /// `wb_scrub_pass`). A page with no balloons never grows the checkbox,
+  /// rather than showing one for a layer that is really just the pass
+  /// before it (v4 §2: no phantom WB layer).
+  final bool hasWbScrubLayer;
+
+  const SegmentLayersCard({super.key, this.hasWbScrubLayer = false});
 
   Widget _buildLayerCheckbox(
       String label, bool value, ValueChanged<bool> onChanged) {
@@ -40,6 +47,9 @@ class SegmentLayersCard extends StatelessWidget {
               _buildLayerCheckbox('Masks', layerState.showMasks, layerState.setMasks),
               _buildLayerCheckbox('Raw', layerState.showRaw, layerState.setRaw),
               _buildLayerCheckbox('Current', layerState.showCurrent, layerState.setCurrent),
+              if (hasWbScrubLayer)
+                _buildLayerCheckbox(
+                    'WB-scrub result', layerState.showWbScrub, layerState.setWbScrub),
             ],
           );
         }),
