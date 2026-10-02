@@ -687,6 +687,18 @@ class _HomeScreenState extends State<HomeScreen> {
       // the tab in its "Empty associative array" state on every resume
       // regardless of how many masks the session actually has.
       _aaPreviewData = session['all_masks'] as Map<String, dynamic>?;
+      // Same two lines every live /segment/*, /mask/* and /lama/scrub
+      // response already uses to populate the canvas. Confirmed live: on
+      // resume this was simply never called, so `_segments` stayed empty
+      // forever — ObjectsSelectedCard showed no checkboxes and LBSCard's
+      // `hasSelection` stayed false (Scrub permanently disabled) no matter
+      // how many masks the session actually had. `results` is filtered to
+      // the session's CURRENT pass (same as every live response) — a
+      // session whose masks sit at an earlier pass than its current one
+      // correctly gets nothing here rather than something misleading; that
+      // is a real, separate resume-reconciliation gap, not fixed by this.
+      _result = session['results'] as Map<String, dynamic>?;
+      _updateSegmentsFromResult();
       _wbScrubPass = (session['wb_scrub_pass'] as num?)?.toInt();
       // A resumed session is authoritative about its own mode: DN only
       // supplies one when launching a NEW session. A session saved before

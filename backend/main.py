@@ -46,6 +46,7 @@ from services import (
 import aa_persistence
 import sf_engine
 import balloon_detector
+import source_fingerprint
 
 # Set from Part 1's zero-shot validation on Little Nemo 0026/0042/0122: 91%
 # recall of text regions with zero false positives on artwork, chosen over a
@@ -237,6 +238,16 @@ async def health():
     vram = free_vram_mb()
     if vram is not None:
         info["vram_free_mb"] = vram
+    # Whether this process is still serving the source it imported. A launcher
+    # that reuses "anything healthy" would otherwise keep a days-old backend
+    # alive forever — see source_fingerprint's module docstring for the
+    # incident this exists to prevent.
+    info.update(source_fingerprint.status())
+    if info["stale"]:
+        print(
+            "WARNING: backend source has changed since this process started; "
+            "it is serving stale code and should be restarted."
+        )
     return info
 
 
@@ -302,7 +313,12 @@ async def upload_image(
             "processing_time_ms": round(processing_time_ms, 2),
             "peak_memory_mb": round(mx.get_peak_memory() / (1024 * 1024), 2)
         }
-    
+
+    except SessionLoadError as e:
+        # The session is real and on disk but could not be restored, so the
+        # upload was refused rather than allowed to blank it. 409, not the
+        # generic 400 below: nothing is wrong with the REQUEST.
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error processing image: {str(e)}")
 
@@ -1061,6 +1077,8 @@ async def init_session(request: InitSessionRequest):
             "image_url": request.image_url,
             "ready": True,
         }
+    except SessionLoadError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to initialize session: {str(e)}")
 

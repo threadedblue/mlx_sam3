@@ -147,6 +147,11 @@ _REGISTRY_FIELDS = (
     "mode",
 )
 
+# Public alias: services.register_session_data restores these fields when it
+# finds a session on disk that it could not warm into memory, so that a
+# merge onto it cannot blank them out.
+REGISTRY_FIELDS = _REGISTRY_FIELDS
+
 
 def session_dir(session_id: str) -> Path:
     d = STORAGE_ROOT / session_id

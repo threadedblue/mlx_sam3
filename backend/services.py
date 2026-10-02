@@ -583,7 +583,35 @@ class SegmentationService:
         if session_id not in self.sessions:
             self.get_session(session_id)
         if session_id not in self.sessions:
-            self.sessions[session_id] = {}
+            # The cache is STILL cold after trying to warm it. That is three
+            # very different situations, and blanking is only right for one:
+            #
+            #  (a) genuinely new session_id, nothing on disk — blank is
+            #      correct, and is the original intent of this branch;
+            #  (b) reconstruction THREW (marked in `_broken_sessions`) — the
+            #      session is real and on disk, so merging onto a blank dict
+            #      would write empty name/description/image_url/mode straight
+            #      over it. Fail loudly instead;
+            #  (c) a session staged via /initSession that has metadata but no
+            #      image yet. `_load_session_into_memory` returns None for it
+            #      (its early `image_bytes is None` return), which is correct
+            #      for "nothing to segment" but must NOT be read as "nothing
+            #      exists" — its metadata has to survive the merge.
+            #
+            # (c) is the one that bites in ordinary use: /initSession then
+            # /upload, with a process restart in between, is the documented
+            # DoubleNaught launch flow. Before this, it silently emptied every
+            # registry field. Confirmed by reproduction, not inferred.
+            if session_id in self._broken_sessions:
+                raise SessionLoadError(
+                    f"Session {session_id} exists on disk but could not be "
+                    f"restored; refusing to overwrite it with a blank session."
+                )
+            persisted = aa_persistence.read_session_raw(session_id)
+            self.sessions[session_id] = {} if persisted is None else {
+                field: persisted.get(field)
+                for field in aa_persistence.REGISTRY_FIELDS
+            }
         self.sessions[session_id].update(data)
         session = self.sessions[session_id]
         if (
@@ -711,34 +739,74 @@ class SegmentationService:
         # metadata and no image. That is a session the caller can still use --
         # the frontend shows its name while the image is on its way -- so the
         # image is optional here rather than a 404 for the whole session.
-        image_b64 = (
-            base64.b64encode(raw["image_bytes"]).decode("utf-8")
-            if raw["image_bytes"] else None
-        )
+        #
+        # raw["image_bytes"] is always the ORIGINAL unscrubbed upload (the
+        # `_source` row) -- correct for a session that has never been
+        # scrubbed, wrong for one that has. Confirmed live: reopening a
+        # WB-scrubbed session sent back bytes sha256-identical to `_source`,
+        # so every balloon reappeared regardless of how many passes had
+        # actually run. When sf_session reconstructed successfully and sits
+        # past pass 0, its CURRENT pass's image is what the canvas must show
+        # instead -- image_for_pass(sf_session.pass_) is the same
+        # pass-resolution build_sf_payload already uses
+        # (`session.image_for_pass(session.pass_)`), not reimplemented here.
+        # Only consulted past pass 0: at pass 0 this would just re-encode the
+        # same picture through PIL, producing different PNG bytes than the
+        # original upload for no reason, so the untouched common case keeps
+        # sending raw["image_bytes"] unchanged.
+        if sf_session is not None and sf_session.pass_ > 0:
+            image_b64 = _b64(
+                sf_engine._png_bytes(sf_session.image_for_pass(sf_session.pass_))
+            )
+        elif raw["image_bytes"]:
+            image_b64 = base64.b64encode(raw["image_bytes"]).decode("utf-8")
+        else:
+            image_b64 = None
 
-        masks_rle: list = []
-        boxes: list = []
-        scores: list = []
-        for seg in raw["segments"]:
-            if seg["mask_bytes"] is not None:
-                mask_img = Image.open(io.BytesIO(seg["mask_bytes"])).convert("L")
-                mask_np = (np.array(mask_img) > 127).astype(np.uint8)
-                masks_rle.append(mask_to_rle(mask_np))
-            if seg["bbox"] is not None:
-                boxes.append(seg["bbox"])
-            if seg["score"] is not None:
-                scores.append(seg["score"])
+        # `results` here used to be a hand-rolled hobbled subset built
+        # straight from raw["segments"] -- `masks`/`boxes`/`scores` only, no
+        # `mask_ids`/`dataset_statuses`/`held_flags`, and spanning every pass
+        # rather than just the current one. That made it look superficially
+        # like a live /segment/* response's `results` field while actually
+        # being incompatible with it: main.dart's `_updateSegmentsFromResult`
+        # needs `mask_ids` to populate `Segment.maskId`, which is what
+        # `hasSelection`/ObjectsSelectedCard's checkboxes key off, so a
+        # resumed session could never show anything selectable even where
+        # `/segment/box`'s identical-looking response always could. Confirmed
+        # live: _result was simply never populated by resume at all.
+        #
+        # serialize_sf_masks(sf_session, sf_session.state) is the EXACT
+        # function every live /segment/*, /mask/* and /lama/scrub response
+        # already builds `results` from -- reused here rather than
+        # duplicating its filtering/shape a second time. It filters to
+        # `sf_session.pass_` by design (an earlier pass's masks were traced
+        # against a different image), so a session whose masks sit at an
+        # earlier pass than its current one correctly gets an EMPTY results
+        # here, same as it would from any live endpoint in that state -- not
+        # papered over.
+        if sf_session is not None:
+            results = serialize_sf_masks(sf_session, sf_session.state)
+        else:
+            masks_rle: list = []
+            boxes: list = []
+            scores: list = []
+            for seg in raw["segments"]:
+                if seg["mask_bytes"] is not None:
+                    mask_img = Image.open(io.BytesIO(seg["mask_bytes"])).convert("L")
+                    mask_np = (np.array(mask_img) > 127).astype(np.uint8)
+                    masks_rle.append(mask_to_rle(mask_np))
+                if seg["bbox"] is not None:
+                    boxes.append(seg["bbox"])
+                if seg["score"] is not None:
+                    scores.append(seg["score"])
+            results = {"masks": masks_rle, "boxes": boxes, "scores": scores}
 
         response = {
             "session_id": session_id,
             "image_b64": image_b64,
             "width": raw["width"],
             "height": raw["height"],
-            "results": {
-                "masks": masks_rle,
-                "boxes": boxes,
-                "scores": scores,
-            },
+            "results": results,
             # Same shape/purpose as serialize_sf_masks_all_passes' field of
             # the same name on the live endpoints — a reloaded session's AA
             # Preview tab needs this too, not just a live in-progress one.
