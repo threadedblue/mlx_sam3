@@ -19,8 +19,24 @@ class BalloonScrubCard extends StatelessWidget {
   final bool hasImage;
 
   /// Null before the first detection run this session — distinct from `0`,
-  /// which means a run happened and genuinely found nothing.
+  /// which means a run happened and genuinely found nothing. Always wins
+  /// over [isResumedSession]/[resumedWbScrubPass] below when non-null: a
+  /// live detection this session is more specific than anything restored.
   final int? lastDetectedCount;
+
+  /// True iff this card's session came from a resumed /loadSession, not a
+  /// fresh upload (bug-3 audit finding #2/#3) — distinguishes "no scrub
+  /// history restored" from "no history exists at all", which
+  /// [lastDetectedCount] alone cannot, since both start as `null`.
+  final bool isResumedSession;
+
+  /// The resumed session's `wb_scrub_pass` (same value backing the WB-scrub
+  /// layer toggle) — non-null means a balloon scrub genuinely ran at some
+  /// point in this session's history, whichever pass it landed on.
+  /// `MaskRecord.source` is never persisted, so the ORIGINAL detection
+  /// count cannot be recovered — this says only THAT one ran, not how many
+  /// balloons it found.
+  final int? resumedWbScrubPass;
 
   final bool isDetecting;
   final VoidCallback onDetect;
@@ -29,6 +45,8 @@ class BalloonScrubCard extends StatelessWidget {
     super.key,
     required this.hasImage,
     required this.lastDetectedCount,
+    this.isResumedSession = false,
+    this.resumedWbScrubPass,
     required this.isDetecting,
     required this.onDetect,
   });
@@ -36,11 +54,24 @@ class BalloonScrubCard extends StatelessWidget {
   /// Neutral before the first run, and distinguishes "found none" from
   /// "haven't looked" — the same distinction [LBSCard] draws with its
   /// 'No scrub yet'.
+  ///
+  /// A fresh session (never resumed) keeps the original two-way text
+  /// unchanged. A resumed session with no live detection yet this run adds
+  /// a third: "ran previously" vs "nothing restored to report" — NOT the
+  /// fresh-session default, which would misread as "never looked" when it
+  /// might just be unrecoverable (see [resumedWbScrubPass]'s doc).
   String get _statusLine {
     final count = lastDetectedCount;
-    if (count == null) return 'No detection run yet';
-    if (count == 0) return 'No balloons detected';
-    return '$count balloon${count == 1 ? '' : 's'} detected';
+    if (count != null) {
+      if (count == 0) return 'No balloons detected';
+      return '$count balloon${count == 1 ? '' : 's'} detected';
+    }
+    if (isResumedSession) {
+      final pass = resumedWbScrubPass;
+      if (pass != null) return 'Balloons scrubbed at pass $pass';
+      return 'Not run in this session';
+    }
+    return 'No detection run yet';
   }
 
   @override

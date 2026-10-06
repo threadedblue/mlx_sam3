@@ -313,3 +313,78 @@ class TestBug3RemainsVisibleNotPaperedOver:
 
         response = service.load_session_from_disk(SID)  # must not raise
         assert response is not None
+
+
+# ── Bug 3 audit fix #1: the `pass` field /loadSession never sent ────────────
+
+
+class TestResumeReportsCurrentPass:
+    """/loadSession carried no current-pass number at all, so the frontend
+    had no way to distinguish a resumed post-scrub session from a fresh one
+    and show the same scrub label a live scrub already shows. One added
+    field — nothing else about the response changes."""
+
+    def test_a_scrubbed_session_reports_its_post_scrub_pass(self, service):
+        sf_session = _upload(service)
+        service.processor.geo_rects = [RECT_A]
+        rec = sf_session.add_box_selection(_norm_box_100(RECT_A), True)[0]
+        sf_session.set_held(rec.mask_id, True)
+        sf_session.run_lama_pass(PaintingInpainter(color=(255, 0, 0, 255)))
+        service.sessions[SID]["state"] = sf_session.state
+        assert sf_session.pass_ == 1
+
+        service.save_session_to_disk(SID)
+        _restart(service)
+
+        response = service.load_session_from_disk(SID)
+        assert response["pass"] == 1
+
+    def test_a_never_scrubbed_session_reports_pass_zero(self, service):
+        _upload(service)
+        service.save_session_to_disk(SID)
+        _restart(service)
+
+        response = service.load_session_from_disk(SID)
+        assert response["pass"] == 0
+
+    def test_a_session_scrubbed_twice_reports_the_latest_pass(self, service):
+        sf_session = _upload(service)
+        service.processor.geo_rects = [RECT_A]
+        rec_a = sf_session.add_box_selection(_norm_box_100(RECT_A), True)[0]
+        sf_session.set_held(rec_a.mask_id, True)
+        sf_session.run_lama_pass(PaintingInpainter(color=(255, 0, 0, 255)))
+        service.processor.geo_rects = [RECT_B]
+        rec_b = sf_session.add_box_selection(_norm_box_100(RECT_B), True)[0]
+        sf_session.set_held(rec_b.mask_id, True)
+        sf_session.run_lama_pass(PaintingInpainter(color=(0, 255, 0, 255)))
+        service.sessions[SID]["state"] = sf_session.state
+        assert sf_session.pass_ == 2
+
+        service.save_session_to_disk(SID)
+        _restart(service)
+
+        response = service.load_session_from_disk(SID)
+        assert response["pass"] == 2
+
+    def test_a_session_staged_but_never_uploaded_to_reports_pass_zero(
+        self, service, monkeypatch
+    ):
+        """No SFSession is ever reconstructed for this shape (no image —
+        see load_session_from_disk's own docstring) — `pass` must still be
+        present and 0, not missing or raising. Same raw shape
+        test_session_load_failure_no_write.py's own staged-session case
+        uses."""
+        monkeypatch.setattr(
+            aa_persistence,
+            "read_session_raw",
+            lambda sid: {
+                "name": "staged only", "description": "",
+                "created_at": "2026-01-01T00:00:00", "image_url": None,
+                "original_filename": "image.png", "width": 0, "height": 0,
+                "image_bytes": None, "pass_images": {}, "segments": [],
+                "prompts": [], "ui_settings": {},
+            },
+        )
+
+        response = service.load_session_from_disk(SID)
+        assert response["pass"] == 0

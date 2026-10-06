@@ -29,6 +29,7 @@ import 'layer_state.dart';
 import 'models/result_datum.dart';
 import 'widgets/result_cell.dart';
 import 'widgets/balloon_scrub_card.dart';
+import 'widgets/panels_card.dart';
 import 'widgets/box_select_card.dart';
 import 'widgets/lbs_card.dart';
 import 'widgets/objects_selected_card.dart';
@@ -42,19 +43,25 @@ void main() {
   runApp(const SamApp());
 }
 
-/// Which of the three prompt cards currently owns canvas interaction.
+/// Which card currently owns canvas interaction.
 ///
-/// The radio buttons on the Prompt, Box Select and Point Select cards form one
-/// mutually exclusive group over this enum; `null` means no mode is active and
-/// the canvas ignores taps and drags.
-enum SelectionMode { prompt, box, point }
+/// The radio buttons on the Prompt, Box Select, Point Select and Panels cards
+/// form one mutually exclusive group over this enum; `null` means no mode is
+/// active and the canvas ignores taps and drags.
+///
+/// [panel] is the odd one out on purpose: its drag authors a LAYOUT REGION
+/// (v4 §4) via /panel/add and never reaches SAM3, so it creates no mask and
+/// nothing in Objects Selected. It is in this enum only because canvas
+/// interaction is genuinely exclusive — a drag cannot mean both "box prompt"
+/// and "panel bounds".
+enum SelectionMode { prompt, box, point, panel }
 
 /// Whether the Prompt card's submit button should be enabled — shared by
 /// both of its faces: "Select" (a standalone text-prompt search) and "Save
 /// Caption" (committing a caption to the already-focused mask).
 ///
-/// sf-display-and-workflow-v3-spec.md §4: **Select** is disabled while Box
-/// or Point mode is active — mode-exclusive, not a permanent disable, since
+/// sf-display-and-workflow-v3-spec.md §4: **Select** is disabled while Box,
+/// Point or Panel mode is active — mode-exclusive, not a permanent disable, since
 /// Select is specifically the trigger for a standalone text-prompt search
 /// and isn't meant to run alongside box/point. **Save Caption is
 /// unaffected by this**: it commits a caption to whatever mask box/point
@@ -71,7 +78,9 @@ bool promptCardCanSubmit({
 }) {
   if (!hasSession || promptEmpty || isLoading) return false;
   if (captionMode) return true;
-  return selectedMode != SelectionMode.box && selectedMode != SelectionMode.point;
+  return selectedMode != SelectionMode.box &&
+      selectedMode != SelectionMode.point &&
+      selectedMode != SelectionMode.panel;
 }
 
 /// A Target/Avoid prompt with nothing recorded (`mask_ids` empty) draws its
@@ -500,6 +509,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// what a zero-balloon page looks like, so the WB-scrub layer stays
   /// absent rather than mislabeling an ordinary pass.
   int? _wbScrubPass;
+  /// Manually authored panel bounds (v4 §4), in authoring order — raw maps
+  /// straight from the backend (`panel_id`, `x0`, `y0`, `x1`, `y1`).
+  ///
+  /// Deliberately separate from `_result`/`_segments`: a panel is a layout
+  /// region, never a mask, so it must not appear in Objects Selected and
+  /// must not affect `hasSelection`/the Scrub button. Keeping it in its own
+  /// field is what makes that structural rather than a filter someone can
+  /// later forget to apply.
+  List<Map<String, dynamic>> _panels = const [];
   /// Which toolset to show. Seeded from SEGFORGE_MODE at launch and
   /// replaced by the session's OWN stored mode on resume, since DN sends
   /// nothing on a resume. Null means legacy/unfiltered — never Comix.
@@ -508,6 +526,16 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Null until the first detection run this session — distinct from 0.
   int? _lastDetectedCount;
   String? _lastScrubLabel;
+  /// True once [_loadLaunchSession] has successfully loaded a session from
+  /// the backend (not just attempted — a session with nothing stored yet
+  /// leaves this false, same as a brand-new upload). [BalloonScrubCard]
+  /// needs this: a resumed session with `_wbScrubPass == null` genuinely
+  /// cannot tell "balloon scrub never ran" from "ran and found nothing" (
+  /// `MaskRecord.source` isn't persisted — see load_session_from_disk's own
+  /// docstring), so it must show a distinct "Not run in this session" text
+  /// rather than the fresh-session "No detection run yet" default, which
+  /// would otherwise read as "never looked" when it might have.
+  bool _isResumedSession = false;
 
   /// The mask a box/point selection (or the scrub-batch checkbox list)
   /// most recently touched — what the Prompt card's caption mode and
@@ -515,6 +543,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// was focused no longer has a live geometry in the new pass's result
   /// set).
   String? _focusedMaskId;
+
+  /// Guards the caption-draft pre-fill (templating v1) against a response
+  /// that arrives after focus has already moved on. Bumped on every request;
+  /// a reply whose generation no longer matches is dropped.
+  int _draftGen = 0;
+  /// The mask a pre-fill has already been requested for, so re-rendering or
+  /// a second hold toggle on the SAME mask does not re-request or stomp on
+  /// text the user has since typed.
+  String? _draftRequestedFor;
 
   Segment? get _focusedSegment {
     final id = _focusedMaskId;
@@ -700,17 +737,45 @@ class _HomeScreenState extends State<HomeScreen> {
       _result = session['results'] as Map<String, dynamic>?;
       _updateSegmentsFromResult();
       _wbScrubPass = (session['wb_scrub_pass'] as num?)?.toInt();
+      // Panel bounds (v4 §4) restored from the same /loadSession response
+      // every other resumed field comes from. A session saved before panels
+      // existed sends no `panels` key, which correctly reads as none.
+      _panels = _panelsFrom(session);
       // A resumed session is authoritative about its own mode: DN only
       // supplies one when launching a NEW session. A session saved before
       // modes existed sends null here, which correctly leaves the sidebar
       // unfiltered rather than narrowing it.
       _mode = SfMode.parse(session['mode'] as String?);
+      // Reaching this point means the backend actually returned a session
+      // (the early-return catch above handles "nothing stored yet"), so
+      // this IS a resume, independent of what it carries — a resumed
+      // session with wb_scrub_pass == null still needs to be told apart
+      // from a brand-new one (see BalloonScrubCard's text, _buildBalloon-
+      // ScrubCard below).
+      _isResumedSession = true;
+      // /loadSession carries the session's current pass (services.py's
+      // load_session_from_disk, bug-3 audit finding #3) — LBSCard showed
+      // "No scrub yet" on every resumed session regardless of scrub
+      // history, because _lastScrubLabel is otherwise only ever set by a
+      // live scrub response. Same format as that live label
+      // (_formatScrubLabel), so the two can't read differently for the
+      // same transition. Only the LAST transition is ever shown, same as
+      // live: a session scrubbed twice shows "Pass 1 -> Pass 2", not its
+      // full history. At pass 0 there is no transition to show.
+      final pass = (session['pass'] as num?)?.toInt() ?? 0;
+      _lastScrubLabel = pass > 0 ? _formatScrubLabel(pass - 1, pass) : null;
       // A resumed session starts clean: everything it carries just came
       // FROM the last save, not from unsaved work in this run. Explicit
       // rather than relying on both counters defaulting to 0 on a fresh
       // State — this is the specific moment "clean" has to hold.
       _savedAtMutationCount = _mutationCount;
     });
+    // Outside setState: _applyViewLayers mutates LayerState (a separate
+    // ChangeNotifier), not this State's own fields, and already notifies
+    // its own listeners (Provider's dependents rebuild on that, same as a
+    // live checkbox toggle would). Detaches _onLayerStateChanged for its
+    // duration so this restoration can never itself trigger a save.
+    _applyViewLayers(session['view_layers'] as Map<String, dynamic>?);
   }
 
   /// Gets a genuinely new launch image registered with the backend once the
@@ -1007,6 +1072,54 @@ class _HomeScreenState extends State<HomeScreen> {
   /// SAM3 text-grounding call. Patches the one changed record locally
   /// rather than re-deriving segments — this endpoint returns just that
   /// record, not a full results payload like /segment/* does.
+  /// Pre-fills the caption box from this session's prompt template when the
+  /// focused mask enters caption mode (templating v1).
+  ///
+  /// Deliberately conservative — it only ever writes into an UNTOUCHED box:
+  ///
+  ///  * No template (`draft` empty) means the controller is not touched at
+  ///    all, so a session without one behaves exactly as it did before this
+  ///    existed. Note what that baseline actually is: typed text is NOT
+  ///    cleared when focus moves (only a successful Save Caption and Clear
+  ///    Prompts clear it), so "don't touch" genuinely means leave it.
+  ///  * A late reply is dropped (`gen != _draftGen`), as is one for a mask
+  ///    that is no longer focused.
+  ///  * If the text changed between request and reply, the user typed while
+  ///    it was in flight and their text wins.
+  ///
+  /// Does NOT bump `_mutationCount`: nothing persistent changed. The draft
+  /// becomes real work only when Save Caption sends it, which already counts.
+  /// Schedules a pre-fill once the current `setState` has been applied.
+  ///
+  /// The box/point/balloon handlers set `_focusedMaskId` INSIDE their
+  /// `setState` callback, where `_isCaptionMode` would still read the old
+  /// focus; deferring to after the frame lets the check see the new one.
+  void _prefillAfterFrame() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _maybePrefillCaptionDraft();
+    });
+  }
+
+  Future<void> _maybePrefillCaptionDraft() async {
+    final sessionId = _sessionId;
+    final maskId = _focusedMaskId;
+    if (sessionId == null || maskId == null) return;
+    if (!_isCaptionMode) return;
+    // Already handled this mask; re-requesting would fight the user's edits.
+    if (_draftRequestedFor == maskId) return;
+    _draftRequestedFor = maskId;
+
+    final gen = ++_draftGen;
+    final textAtRequest = _textController.text;
+    final draft = await _api.promptDraft(sessionId, maskId);
+    if (!mounted) return;
+    if (gen != _draftGen) return;                       // a newer request won
+    if (_focusedMaskId != maskId) return;               // focus moved on
+    if (draft == null || draft.isEmpty) return;         // no template: hands off
+    if (_textController.text != textAtRequest) return;  // user typed; theirs wins
+    _textController.text = draft;
+  }
+
   Future<void> _attachCaptionToFocusedMask() async {
     final maskId = _focusedMaskId;
     if (_sessionId == null || maskId == null) return;
@@ -1017,6 +1130,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (response != null) {
         _patchMaskLocally(maskId, datasetStatus: response['dataset_status'] as String?);
         _textController.clear();
+        _draftRequestedFor = null;
         setState(() {
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _textPromptResult = [const ResultDatum(label: 'Status', value: 'Captioned')];
@@ -1096,6 +1210,9 @@ class _HomeScreenState extends State<HomeScreen> {
         _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
         _mutationCount++;
       });
+      // Holding a mask is exactly the transition into caption mode
+      // (held && unassigned), so this is where a template pre-fills the box.
+      await _maybePrefillCaptionDraft();
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = e.toString());
@@ -1114,6 +1231,8 @@ class _HomeScreenState extends State<HomeScreen> {
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
+          // ignore: unawaited_futures
+          _prefillAfterFrame();
           _boxResult = [ResultDatum(label: 'Status', value: positiveClickStatusLabel(response, _boxMode == "positive"))];
           _mutationCount++;
         });
@@ -1138,6 +1257,8 @@ class _HomeScreenState extends State<HomeScreen> {
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
+          // ignore: unawaited_futures
+          _prefillAfterFrame();
           _pointResult = [ResultDatum(label: 'Status', value: positiveClickStatusLabel(response, _pointMode == "positive"))];
           _mutationCount++;
         });
@@ -1172,6 +1293,7 @@ class _HomeScreenState extends State<HomeScreen> {
           // read selected_mask_id at all before, so _focusedMaskId would
           // otherwise keep pointing at a mask reset just deleted.
           _focusedMaskId = null;
+          _draftRequestedFor = null;
           _resultsResult = [const ResultDatum(label: 'Status', value: 'Done')];
           _mutationCount++;
         });
@@ -1183,6 +1305,14 @@ class _HomeScreenState extends State<HomeScreen> {
       if (mounted) setState(() { _isLoading = false; _resultsRunning = false; });
     }
   }
+
+  /// Formats a scrub transition the one way it's shown anywhere: the live
+  /// post-scrub update below and a resumed session's restored label in
+  /// [_loadLaunchSession]. One function so the two strings can't drift
+  /// apart — resume only has a single current pass to work from, not a
+  /// from_pass/to_pass pair, so it calls this with (pass - 1, pass).
+  String _formatScrubLabel(Object? from, Object? to) =>
+      "Pass $from → Pass $to";
 
   Future<void> _scrubLamaBackground() async {
     if (_sessionId == null) return;
@@ -1211,7 +1341,8 @@ class _HomeScreenState extends State<HomeScreen> {
         }
         if (!mounted) return;
         setState(() {
-          _lastScrubLabel = "Pass ${response['from_pass']} → Pass ${response['to_pass']}";
+          _lastScrubLabel =
+              _formatScrubLabel(response['from_pass'], response['to_pass']);
           if (bytes != null && decoded != null) {
             // Deliberately NOT touching _originalBytes/_originalUiImage/
             // _originalImageSize here — those are pass 0 and must survive
@@ -1228,6 +1359,7 @@ class _HomeScreenState extends State<HomeScreen> {
           // one's result set (serialize_sf_masks only returns the current
           // pass — see its docstring).
           _focusedMaskId = null;
+          _draftRequestedFor = null;
           _result = null;
           _segments = [];
           // NOT nulled like _result — a scrub is exactly the moment a
@@ -1273,6 +1405,8 @@ class _HomeScreenState extends State<HomeScreen> {
           _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
           _updateSegmentsFromResult();
           _focusedMaskId = response['selected_mask_id'] as String? ?? _focusedMaskId;
+          // ignore: unawaited_futures
+          _prefillAfterFrame();
           _lastDetectedCount = (response['detection_count'] as num?)?.toInt() ?? 0;
           _mutationCount++;
         });
@@ -1285,6 +1419,58 @@ class _HomeScreenState extends State<HomeScreen> {
     } finally {
       if (mounted) setState(() { _isDetectingBalloons = false; });
     }
+  }
+
+  /// Authors a panel from a canvas drag (v4 §4).
+  ///
+  /// Never calls SAM3 and never creates a mask — see [SelectionMode.panel].
+  /// A rejected drag (too small; the backend's MIN_PANEL_SIDE floor) returns
+  /// null and is a silent no-op, matching how an undersized box prompt is
+  /// already dropped on the canvas side rather than raised to the user.
+  Future<void> _addPanel(int x0, int y0, int x1, int y1) async {
+    final sessionId = _sessionId;
+    if (sessionId == null) return;
+    try {
+      final response = await _api.addPanel(sessionId, x0, y0, x1, y1);
+      if (!mounted || response == null) return;
+      setState(() {
+        _panels = _panelsFrom(response);
+        // Panels are saved state, so authoring one is unsaved work until
+        // Save runs — same contract as every other mutation handler.
+        _mutationCount++;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    }
+  }
+
+  Future<void> _deletePanel(String panelId) async {
+    final sessionId = _sessionId;
+    if (sessionId == null) return;
+    try {
+      final response = await _api.deletePanel(sessionId, panelId);
+      if (!mounted || response == null) return;
+      setState(() {
+        _panels = _panelsFrom(response);
+        _mutationCount++;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.toString());
+    }
+  }
+
+  /// `panels` out of any response that carries it, normalised to the shape
+  /// [PanelsCard] and [PanelOutlinePainter] read. One place, so the add,
+  /// delete and resume paths cannot disagree about it.
+  static List<Map<String, dynamic>> _panelsFrom(Map<String, dynamic> response) {
+    final raw = response['panels'] as List?;
+    if (raw == null) return const [];
+    return raw
+        .whereType<Map>()
+        .map((p) => Map<String, dynamic>.from(p))
+        .toList(growable: false);
   }
 
   Future<void> _saveSession() async {
@@ -1312,6 +1498,39 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+
+  /// Applies a resumed session's persisted `view_layers` (the same four
+  /// keys [_saveLayerState] writes) to [LayerState] — wiring gap (bug-3
+  /// audit finding #5): the backend has sent this on every /loadSession
+  /// response all along, but nothing here ever read it, so a session saved
+  /// with e.g. Raw unchecked silently came back with Raw checked again on
+  /// every resume (LayerState's own field defaults).
+  ///
+  /// Missing keys keep whatever LayerState already has; unknown keys (a
+  /// session saved before the Final -> Current rename carries a "final"
+  /// row) are ignored by construction — only the four named keys are ever
+  /// read.
+  ///
+  /// [_onLayerStateChanged] is detached for the duration: loading a session
+  /// must not immediately re-save the very state it just loaded (an
+  /// ordinary user toggle still saves normally once this returns).
+  void _applyViewLayers(Map<String, dynamic>? viewLayers) {
+    final layerState = _layerState;
+    if (viewLayers == null || layerState == null) return;
+    layerState.removeListener(_onLayerStateChanged);
+    try {
+      final original = viewLayers['original'];
+      if (original is bool) layerState.setOriginal(original);
+      final masks = viewLayers['masks'];
+      if (masks is bool) layerState.setMasks(masks);
+      final raw = viewLayers['raw'];
+      if (raw is bool) layerState.setRaw(raw);
+      final current = viewLayers['current'];
+      if (current is bool) layerState.setCurrent(current);
+    } finally {
+      layerState.addListener(_onLayerStateChanged);
+    }
+  }
 
   Future<void> _saveLayerState() async {
     if (_sessionId == null || _layerState == null) return;
@@ -1427,6 +1646,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   if (_showsCard(SfCard.pointSelect))
                     _buildCardRow(_buildPointPromptCard(),   ResultCell(isRunning: _pointRunning, data: _pointResult)),
                   const SizedBox(height: 16),
+                  if (_showsCard(SfCard.panels))
+                    _buildCardRow(_buildPanelsCard(),        const ResultCell(isRunning: false, data: [])),
+                  const SizedBox(height: 16),
                   if (_showsCard(SfCard.objectsSelected))
                     _buildCardRow(_buildResultsCard(),       ResultCell(isRunning: _resultsRunning, data: _resultsResult)),
                   const SizedBox(height: 16),
@@ -1484,8 +1706,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 aaPreviewData: _aaPreviewData,
                 isLoading: _isLoading,
                 mode: _selectedMode,
+                panels: _panels,
                 onBoxDrawn: _sendBoxPrompt,
                 onPointDrawn: _sendPointPrompt,
+                onPanelDrawn: (b) => _addPanel(b[0], b[1], b[2], b[3]),
               ),
             ),
           ),
@@ -1812,10 +2036,20 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _buildPanelsCard() {
+    return PanelsCard(
+      panels: _panels,
+      hasImage: _sessionId != null && _uiImage != null,
+      onDeletePanel: _deletePanel,
+    );
+  }
+
   Widget _buildBalloonScrubCard() {
     return BalloonScrubCard(
       hasImage: _sessionId != null && _uiImage != null,
       lastDetectedCount: _lastDetectedCount,
+      isResumedSession: _isResumedSession,
+      resumedWbScrubPass: _wbScrubPass,
       isDetecting: _isDetectingBalloons,
       onDetect: _detectBalloons,
     );
@@ -1860,8 +2094,16 @@ class DisplayAreaTabs extends StatefulWidget {
   final Map<String, dynamic>? aaPreviewData;
   final bool isLoading;
   final SelectionMode? mode;
+  /// Panel bounds to outline on the canvas (v4 §4) — page-pixel maps, the
+  /// same raw shape main.dart's `_panels` holds. Display + authoring only;
+  /// these are NOT segments and never reach [LayeredSegmentationCanvas].
+  final List<Map<String, dynamic>> panels;
   final void Function(List<double>) onBoxDrawn;
   final void Function(List<double>) onPointDrawn;
+  /// A completed panel drag, already in integer page pixels
+  /// `[x0, y0, x1, y1]` — not the normalised cx/cy/w/h [onBoxDrawn] uses,
+  /// because /panel/add stores page pixels verbatim.
+  final void Function(List<int>) onPanelDrawn;
 
   const DisplayAreaTabs({
     super.key,
@@ -1873,8 +2115,10 @@ class DisplayAreaTabs extends StatefulWidget {
     required this.aaPreviewData,
     required this.isLoading,
     required this.mode,
+    this.panels = const [],
     required this.onBoxDrawn,
     required this.onPointDrawn,
+    required this.onPanelDrawn,
   });
 
   @override
@@ -1968,8 +2212,10 @@ class _DisplayAreaTabsState extends State<DisplayAreaTabs> with SingleTickerProv
       result: widget.result,
       isLoading: widget.isLoading,
       mode: widget.mode,
+      panels: widget.panels,
       onBoxDrawn: widget.onBoxDrawn,
       onPointDrawn: widget.onPointDrawn,
+      onPanelDrawn: widget.onPanelDrawn,
     );
   }
 }
@@ -1988,8 +2234,12 @@ class SegmentationCanvas extends StatefulWidget {
   /// [SelectionMode.point] accepts taps; anything else leaves the canvas inert.
   final SelectionMode? mode;
 
+  /// Panel bounds to outline, in page pixels (v4 §4).
+  final List<Map<String, dynamic>> panels;
+
   final Function(List<double>) onBoxDrawn;
   final Function(List<double>) onPointDrawn;
+  final void Function(List<int>) onPanelDrawn;
 
   const SegmentationCanvas({
     super.key,
@@ -1999,8 +2249,10 @@ class SegmentationCanvas extends StatefulWidget {
     this.result,
     required this.isLoading,
     required this.mode,
+    this.panels = const [],
     required this.onBoxDrawn,
     required this.onPointDrawn,
+    required this.onPanelDrawn,
   });
 
   @override
@@ -2013,13 +2265,18 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
 
   bool get _boxing => widget.mode == SelectionMode.box;
   bool get _pointing => widget.mode == SelectionMode.point;
+  /// Panel authoring (v4 §4). Shares the rubber-band drag with box mode —
+  /// the gesture is identical, only what it produces differs: a box prompt
+  /// goes to SAM3, a panel goes to /panel/add and never touches it.
+  bool get _panelling => widget.mode == SelectionMode.panel;
+  bool get _dragging => _boxing || _panelling;
 
   @override
   void didUpdateWidget(SegmentationCanvas oldWidget) {
     super.didUpdateWidget(oldWidget);
     // Leaving box mode mid-drag would otherwise leave the rubber-band rect
     // painted with no way to finish or cancel it.
-    if (!_boxing && (_startDrag != null || _currentDrag != null)) {
+    if (!_dragging && (_startDrag != null || _currentDrag != null)) {
       _startDrag = null;
       _currentDrag = null;
     }
@@ -2068,6 +2325,18 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
                 painter: PromptPainter(result: widget.result),
               ),
 
+              // Panel outlines (v4 §4), in the SAME interaction overlay as
+              // the prompt markers and in the same image-pixel coordinate
+              // space — deliberately NOT a LayeredSegmentationCanvas layer:
+              // the layer set stays at four, and a panel is authoring
+              // furniture like a prompt marker, not display content like a
+              // mask. Painted after PromptPainter so an outline stays
+              // visible over a prompt marker it overlaps.
+              CustomPaint(
+                size: Size.infinite,
+                painter: PanelOutlinePainter(panels: widget.panels),
+              ),
+
               // Gesture detector for prompting. Only the handlers belonging to
               // the active mode are attached: leaving the pan recognizer live
               // in point mode would let it claim taps before onTapUp fires.
@@ -2083,28 +2352,45 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
                         }
                       }
                     : null,
-                onPanStart: _boxing
+                onPanStart: _dragging
                     ? (details) => setState(() {
                           _startDrag = details.localPosition;
                           _currentDrag = details.localPosition;
                         })
                     : null,
-                onPanUpdate: _boxing
+                onPanUpdate: _dragging
                     ? (details) => setState(() => _currentDrag = details.localPosition)
                     : null,
-                onPanEnd: _boxing
+                onPanEnd: _dragging
                     ? (details) {
                         if (_startDrag != null && _currentDrag != null) {
                           final rect = Rect.fromPoints(_startDrag!, _currentDrag!);
 
-                          // Normalize coordinates for the API call.
-                          final double nx = rect.center.dx / widget.uiImage.width;
-                          final double ny = rect.center.dy / widget.uiImage.height;
-                          final double nw = rect.width / widget.uiImage.width;
-                          final double nh = rect.height / widget.uiImage.height;
+                          if (_panelling) {
+                            // Page pixels, verbatim — a panel is stored as
+                            // drawn (v4 §4), so unlike a box prompt there is
+                            // nothing to normalise. This LayoutBuilder's
+                            // coordinate space already IS image pixels (see
+                            // _buildInteractionOverlay), so the only work is
+                            // rounding. The backend clamps and enforces its
+                            // own minimum size, so no floor is applied here:
+                            // duplicating MIN_PANEL_SIDE on this side would
+                            // be a second threshold to keep in sync, and a
+                            // too-small drag is already a silent no-op.
+                            widget.onPanelDrawn([
+                              rect.left.round(), rect.top.round(),
+                              rect.right.round(), rect.bottom.round(),
+                            ]);
+                          } else {
+                            // Normalize coordinates for the API call.
+                            final double nx = rect.center.dx / widget.uiImage.width;
+                            final double ny = rect.center.dy / widget.uiImage.height;
+                            final double nw = rect.width / widget.uiImage.width;
+                            final double nh = rect.height / widget.uiImage.height;
 
-                          if (nw > 0.005 && nh > 0.005) { // Avoid tiny boxes
-                            widget.onBoxDrawn([nx, ny, nw, nh]);
+                            if (nw > 0.005 && nh > 0.005) { // Avoid tiny boxes
+                              widget.onBoxDrawn([nx, ny, nw, nh]);
+                            }
                           }
                         }
                         setState(() {
@@ -2114,7 +2400,7 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
                       }
                     : null,
                 child: MouseRegion(
-                  cursor: (_pointing || _boxing)
+                  cursor: (_pointing || _dragging)
                       ? SystemMouseCursors.precise
                       : MouseCursor.defer,
                   child: Container(color: Colors.transparent),
@@ -2135,6 +2421,47 @@ class _SegmentationCanvasState extends State<SegmentationCanvas> {
       ),
     );
   }
+}
+
+/// Outlines every authored panel (v4 §4) in the interaction overlay.
+///
+/// Draws in IMAGE-PIXEL coordinates: the overlay this sits in is already
+/// sized to the image inside a FittedBox (see
+/// `_SegmentationCanvasState._buildInteractionOverlay`), so panel bounds —
+/// which are stored as page pixels — need no conversion at all.
+///
+/// This is not a display layer. The layer set stays at four
+/// (Original/Masks/Raw/Current) and has no panel checkbox; panels are
+/// authoring furniture, shown wherever prompt markers are shown.
+class PanelOutlinePainter extends CustomPainter {
+  final List<Map<String, dynamic>> panels;
+
+  PanelOutlinePainter({required this.panels});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (panels.isEmpty) return;
+    // Amber, distinct from the prompt markers' blue/red (Target/Avoid) and
+    // from the mask overlays, so a panel boundary can never be misread as a
+    // selection. 3px because these are page-pixel coordinates on a ~1800px
+    // page scaled down to fit, where a 1px line all but disappears.
+    final stroke = Paint()
+      ..color = const Color(0xFFFFB300)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.0;
+    for (final panel in panels) {
+      final x0 = (panel['x0'] as num?)?.toDouble();
+      final y0 = (panel['y0'] as num?)?.toDouble();
+      final x1 = (panel['x1'] as num?)?.toDouble();
+      final y1 = (panel['y1'] as num?)?.toDouble();
+      if (x0 == null || y0 == null || x1 == null || y1 == null) continue;
+      canvas.drawRect(Rect.fromLTRB(x0, y0, x1, y1), stroke);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant PanelOutlinePainter oldDelegate) =>
+      oldDelegate.panels != panels;
 }
 
 /// A painter for drawing the user's input prompts (positive/negative boxes).

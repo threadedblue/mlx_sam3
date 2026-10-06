@@ -1224,7 +1224,15 @@ class TestExport:
 
         rows = _payload_rows(*sfe.build_sf_payload(session))
 
-        assert set(rows[f"sess-1:{rec.mask_id}"]) == {"pass", "caption", "crop_png_bytes"}
+        # `panel_crop_png_bytes`/`panel_source` are unconditional (v4 §4) —
+        # a mask with no panel over it still exports the full-page fallback
+        # plus the marker saying so, so they appear here alongside the
+        # columns this test is actually about. `text_tag` is the omitted one.
+        assert set(rows[f"sess-1:{rec.mask_id}"]) == {
+            "pass", "caption", "crop_png_bytes",
+            "panel_crop_png_bytes", "panel_source",
+        }
+        assert "text_tag" not in rows[f"sess-1:{rec.mask_id}"]
 
 
 class TestExportCropBytesNotMaskGeometry:

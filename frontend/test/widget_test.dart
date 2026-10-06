@@ -470,6 +470,7 @@ void main() {
         isLoading: false,
         mode: mode,
         onPointDrawn: points.add,
+        onPanelDrawn: (_) {},
         onBoxDrawn: boxes.add,
       )));
     }
@@ -758,6 +759,7 @@ void main() {
           mode: null,
           onBoxDrawn: (_) {},
           onPointDrawn: (_) {},
+              onPanelDrawn: (_) {},
         ));
 
     // AaPreviewTableWidget reloads via AaPreviewWorker's real Isolate.run()

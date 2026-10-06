@@ -53,6 +53,23 @@ SOURCE_BOX = "box"
 SOURCE_POINT = "point"
 SOURCE_BALLOON = "balloon"
 
+# Smallest accepted panel side, in page pixels (v4 §4, manual authoring).
+# 16px is the floor, not a guess at a real panel size: the real pages this
+# runs against are ~1740x2376, where the narrowest genuine panel measured
+# during the panel-bounds validation was 241px wide (little-nemo_0000's
+# tier-6 strip), so 16 is an order of magnitude below anything legitimate
+# while still rejecting the actual failure mode — a click or a 2px twitch
+# registering as a drag and leaving a sliver in the panel list. Deliberately
+# an absolute pixel floor rather than a fraction of the image: what makes a
+# panel unusable is being too small to see and click a delete control for,
+# which does not scale with page size.
+MIN_PANEL_SIDE = 16
+
+# `panel_source` value on an exported mask row when NO panel covered it and
+# the whole page was used instead. A sentinel string rather than an omitted
+# column: see build_sf_payload for why the fallback has to stay visible.
+PANEL_SOURCE_FULL_PAGE = "_full_page"
+
 
 class DatasetStatus(str, Enum):
     UNASSIGNED = "unassigned"
@@ -61,6 +78,10 @@ class DatasetStatus(str, Enum):
 
 class UnknownMaskError(KeyError):
     """No MaskRecord with that mask_id exists in this session."""
+
+
+class UnknownPanelError(KeyError):
+    """No PanelRecord with that panel_id exists in this session."""
 
 
 @dataclass(frozen=True)
@@ -77,6 +98,47 @@ class MaskRecord:
     held: bool = False
     # Set only by SFSession.attach_caption; present iff dataset_status is KEEP.
     caption: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PanelRecord:
+    """A manually authored panel boundary — v4 §4's `panel_bounds`.
+
+    A panel is a LAYOUT REGION, not an object: it is never segmented, never
+    carries a caption of its own, and is deliberately NOT a `MaskRecord`.
+    Nothing here goes near SAM3 — authoring one is pure geometry capture.
+
+    Integer page-pixel coordinates, half-open `[x0, x1) x [y0, y1)` to match
+    `_bbox_from_geometry`'s own convention elsewhere in this module.
+
+    NO PASS NUMBER, deliberately — unlike `MaskRecord`. v4 §4 describes the
+    record as carrying "which pass/layer it was captured against", but every
+    pass of a session is the same image dimensions (a scrub inpaints pixels,
+    it never crops or resizes), so one bbox is valid against every pass. A
+    pass field here could only ever go stale or disagree with the mask it is
+    being matched against; `assign_panel` takes the mask's pass instead, and
+    `panel_crop_png_bytes` is handed whichever pass image the caller wants.
+    """
+    panel_id: str
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+
+    @property
+    def width(self) -> int:
+        return self.x1 - self.x0
+
+    @property
+    def height(self) -> int:
+        return self.y1 - self.y0
+
+    @property
+    def area(self) -> int:
+        return self.width * self.height
+
+    def as_box(self) -> tuple[int, int, int, int]:
+        return (self.x0, self.y0, self.x1, self.y1)
 
 
 @dataclass(frozen=True)
@@ -324,6 +386,23 @@ def _norm_cxcywh_to_pixel_xyxy(box: Sequence[float], width: int, height: int) ->
             (cx + w / 2) * width, (cy + h / 2) * height)
 
 
+def _geometry_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    """Tight `[x0, y0, x1, y1)` bounds of a binary mask, in page pixels.
+
+    Same convention and same arithmetic as `services._bbox_from_geometry`
+    and `aa_persistence._bbox_from_geometry`; kept local rather than
+    imported because both of those modules import THIS one, so either
+    direction of sharing would be circular (the same reason
+    `_crop_png_bytes` is duplicated here — see its docstring). An all-zero
+    mask returns a zero-area box at the origin, which `assign_panel` then
+    treats as degenerate.
+    """
+    ys, xs = np.nonzero(_binary_mask(mask))
+    if len(xs) == 0:
+        return (0, 0, 0, 0)
+    return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
 def _bbox_iou(a: Sequence[float], b: Sequence[float]) -> float:
     ax0, ay0, ax1, ay1 = a
     bx0, by0, bx1, by1 = b
@@ -423,6 +502,11 @@ class SFSession:
         self.segmentor = segmentor
         self.state = state
         self.masks: list[MaskRecord] = []
+        # Manually authored panel boundaries (v4 §4). Layout regions, NOT
+        # objects: nothing here is a MaskRecord, nothing here has ever been
+        # near SAM3, and nothing here is pass-scoped (see PanelRecord).
+        # Kept in authoring order — the Panels card lists them as drawn.
+        self.panels: list[PanelRecord] = []
         self._pass = ORIGINAL_PASS
         # Scrubbed image per pass >= 1. Pass 0's image is `original`. Every
         # pass is kept, not just the latest: a record's crop has to come from
@@ -480,6 +564,7 @@ class SFSession:
         masks: list[MaskRecord],
         last_scrub: Optional[ScrubRecord] = None,
         wb_scrub_pass: Optional[int] = None,
+        panels: Optional[list[PanelRecord]] = None,
     ) -> None:
         """Reconstruct state from persistence in one call, rather than the
         caller reaching into `_pass`/`_pass_images`/`masks` directly.
@@ -502,6 +587,11 @@ class SFSession:
         self.masks = list(masks)
         self.last_scrub = last_scrub
         self.wb_scrub_pass = wb_scrub_pass
+        # `None` means "this caller has no panels to restore", which for a
+        # session saved before panels existed is the same as "none were ever
+        # authored" — both correctly land on an empty list rather than
+        # leaving whatever this object happened to hold.
+        self.panels = list(panels) if panels else []
 
     @property
     def working_copy(self) -> Optional[WorkingCopy]:
@@ -784,6 +874,47 @@ class SFSession:
             raise ValueError("caption must be non-empty; a keep record with no caption never reaches the training set")
         return self._update(mask_id, dataset_status=DatasetStatus.KEEP, caption=caption)
 
+    # -- panels (v4 §4: layout regions, never objects) ------------------------
+
+    def add_panel(self, x0: int, y0: int, x1: int, y1: int) -> PanelRecord:
+        """Record a manually drawn panel boundary.
+
+        Pure geometry: this never calls the segmentor, never creates a
+        MaskRecord, and never touches `state`/`masks`/the pass chain. A panel
+        is a layout region, so nothing about selection or scrubbing applies.
+
+        Coordinates are clamped to the image, then validated: a box that is
+        inverted, degenerate, or smaller than `MIN_PANEL_SIDE` on either side
+        is refused rather than silently fixed up, because the only way to get
+        one is a stray click or an off-canvas drag, and recording it would put
+        an undeletable sliver in the panel list.
+        """
+        width, height = self.original.size
+        cx0, cx1 = sorted((int(x0), int(x1)))
+        cy0, cy1 = sorted((int(y0), int(y1)))
+        cx0 = max(0, min(cx0, width))
+        cx1 = max(0, min(cx1, width))
+        cy0 = max(0, min(cy0, height))
+        cy1 = max(0, min(cy1, height))
+        if cx1 - cx0 < MIN_PANEL_SIDE or cy1 - cy0 < MIN_PANEL_SIDE:
+            raise ValueError(
+                f"panel must be at least {MIN_PANEL_SIDE}x{MIN_PANEL_SIDE}px "
+                f"after clamping to the {width}x{height} image; got "
+                f"{cx1 - cx0}x{cy1 - cy0}"
+            )
+        panel = PanelRecord(panel_id=str(uuid.uuid4()), x0=cx0, y0=cy0, x1=cx1, y1=cy1)
+        self.panels.append(panel)
+        return panel
+
+    def delete_panel(self, panel_id: str) -> PanelRecord:
+        """Remove a panel by id. Raises `UnknownPanelError` if absent, rather
+        than succeeding silently — the caller is a UI delete button, and a
+        no-op that reports success would leave a row on screen."""
+        for i, panel in enumerate(self.panels):
+            if panel.panel_id == panel_id:
+                return self.panels.pop(i)
+        raise UnknownPanelError(f"no panel with id {panel_id!r} in this session")
+
     def set_held(self, mask_id: str, held: bool) -> MaskRecord:
         """Queue (or un-queue) a selection for the current pass's next scrub.
 
@@ -868,6 +999,338 @@ class SFSession:
         return WorkingCopy(self.image_for_pass(to_pass))
 
 
+def assign_panel(
+    mask_bbox: Sequence[float], panels: Sequence[PanelRecord]
+) -> Optional[PanelRecord]:
+    """Which panel a mask belongs to — the one holding the largest share of
+    `mask_bbox`'s area. Pure; no session, no I/O.
+
+    `mask_bbox` is `[x0, y0, x1, y1]` in page pixels, the same shape
+    `_bbox_from_geometry` returns.
+
+    Rules, in order:
+      * No panel overlaps the bbox at all -> None. The caller then uses the
+        full page; this function does NOT invent a fallback panel, so that
+        "fell back" stays distinguishable from "genuinely assigned".
+      * Otherwise the panel containing the largest absolute overlap area
+        wins — a mask straddling two panels goes to whichever holds more of
+        it, which is the only answer that does not need a tie-break policy
+        for the common case.
+      * NESTED panels are the exception that needs its own rule: an inset
+        sitting inside a host panel overlaps the bbox by the same area the
+        host does (the inset's whole area, when the mask is inside the
+        inset), so "largest overlap" alone would tie, and resolving that tie
+        by panel area would pick the HOST — exactly backwards. Among
+        panels whose overlap is tied at the maximum, the SMALLEST panel
+        wins, matching the innermost-frame rule the panel-bounds validation
+        settled on.
+      * A degenerate bbox (zero width or height) has no area to share out,
+        so it cannot have a "largest share" — it falls back to containment:
+        the smallest panel that contains it, else None.
+
+    Ties beyond nesting (two equally-sized panels with equal overlap) resolve
+    to the first in `panels`, i.e. authoring order — deterministic rather
+    than arbitrary.
+    """
+    if not panels:
+        return None
+    mx0, my0, mx1, my1 = (float(v) for v in mask_bbox)
+    if mx1 < mx0:
+        mx0, mx1 = mx1, mx0
+    if my1 < my0:
+        my0, my1 = my1, my0
+
+    degenerate = (mx1 - mx0) <= 0 or (my1 - my0) <= 0
+
+    best: Optional[PanelRecord] = None
+    best_overlap = 0.0
+    for panel in panels:
+        ox = max(0.0, min(mx1, panel.x1) - max(mx0, panel.x0))
+        oy = max(0.0, min(my1, panel.y1) - max(my0, panel.y0))
+        if degenerate:
+            # No area to compare; containment is the only meaningful test.
+            # Use >= so a point exactly on a panel's edge still counts as in.
+            if not (panel.x0 <= mx0 <= panel.x1 and panel.y0 <= my0 <= panel.y1):
+                continue
+            if best is None or panel.area < best.area:
+                best = panel
+            continue
+        overlap = ox * oy
+        if overlap <= 0:
+            continue
+        if overlap > best_overlap:
+            best, best_overlap = panel, overlap
+        elif overlap == best_overlap and best is not None and panel.area < best.area:
+            # The nesting case: same overlap, so the inner frame wins.
+            best = panel
+    return best
+
+
+def panel_crop_png_bytes(image: Image.Image, box: Sequence[int]) -> bytes:
+    """A panel's rectangular cutout of `image`, as RGBA PNG bytes.
+
+    Pure; the caller chooses which pass image to hand in (see
+    `build_sf_payload`, which uses each mask's OWN pass image). Unlike
+    `_crop_png_bytes` there is no alpha-masking step: a panel is a
+    rectangular layout region, not a segmented object, so the crop is the
+    rectangle itself.
+
+    The box is clamped to the image before cropping, so a panel recorded
+    against one pass cannot raise on another; an empty intersection yields a
+    1x1 transparent PNG rather than a zero-size image PIL refuses to encode.
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    w, h = image.size
+    x0, x1 = max(0, min(x0, w)), max(0, min(x1, w))
+    y0, y1 = max(0, min(y0, h)), max(0, min(y1, h))
+    if x1 <= x0 or y1 <= y0:
+        return _png_bytes(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
+    return _png_bytes(image.convert("RGBA").crop((x0, y0, x1, y1)))
+
+
+# ── LLM export (v1) ───────────────────────────────────────────────────────
+#
+# A read-only, separate export path alongside build_sf_payload — NOT a
+# replacement for it. build_sf_payload's own output/tests are unchanged;
+# this exists because an LLM vision submission has different needs than the
+# training-set export: a shared macro-context page (Artifact 1), a panel
+# crop cut from THAT page rather than the mask's own pass (Artifact 2), and
+# a segment crop that is TIGHT (not full-canvas) with no alpha channel at
+# all (Artifact 3) — see the three helpers and build_llm_export_payload
+# below for why each of those differs from what build_sf_payload already
+# does.
+
+# "wb_scrub" when Artifact 1 is the pass a balloon scrub actually produced;
+# "original" when no balloon scrub ever ran (wb_scrub_pass is None) and
+# Artifact 1 falls back to pass 0. A legacy session saved before
+# wb_scrub_pass existed at all also reads back None — this makes that case
+# visible as "original" rather than silently indistinguishable from a page
+# that genuinely has no balloons.
+PAGE_RULE_WB_SCRUB = "wb_scrub"
+PAGE_RULE_ORIGINAL = "original"
+
+# JPEG quality for every LLM-export artifact that uses JPEG (the macro-
+# context page and panel crops). 85 is the standard "visually lossless for
+# this purpose" choice; measured on a real page during the investigation
+# that designed this contract, JPEG 85 ran ~14x smaller than the equivalent
+# PNG with no visible loss in a vision-API context.
+LLM_EXPORT_JPEG_QUALITY = 85
+
+# Artifact 1 is downscaled to this long side before being written to disk.
+# Sending more buys no extra fidelity: a vision API downscales further on
+# its own regardless of what is sent (OpenAI's own pipeline fits to a 2048
+# square, then caps the shortest side to 768), so anything past this is
+# pure upload cost.
+ARTIFACT1_MAX_LONG_SIDE = 1536
+
+# Composited background for a segment's tight crop (Artifact 3), wherever
+# the mask does not cover a pixel inside its own bounding box. A measured
+# choice, not a default: across 13 real segments from a real session, white
+# collided with 21.4% of subject pixels (luminance > 210), black with 4.6%
+# (luminance < 45) but is indistinguishable from the OTHER failure mode this
+# guards against — silently dropping the alpha channel turns a transparent
+# pixel black (`Image.convert("RGB")` on an RGBA image, confirmed) — while
+# mid-grey collided with only 8.1% and cannot be mistaken for that bug.
+_SEGMENT_CROP_BACKGROUND = (128, 128, 128)
+
+
+def resolve_artifact1_pass(wb_scrub_pass: Optional[int]) -> tuple[int, str]:
+    """Which pass is Artifact 1, and why — `(page_pass, page_rule)`.
+
+    Pure arithmetic, independent of any session object, so the pass/rule
+    pairing for None/1/2/... can be pinned in isolation from pixel work.
+    """
+    if wb_scrub_pass is None:
+        return ORIGINAL_PASS, PAGE_RULE_ORIGINAL
+    return wb_scrub_pass, PAGE_RULE_WB_SCRUB
+
+
+def segment_crop_png_bytes(image: Image.Image, mask: np.ndarray) -> bytes:
+    """A mask's TIGHT crop (Artifact 3), composited onto opaque mid-grey
+    outside the mask. PNG, RGB — no alpha channel.
+
+    Deliberately NOT `_crop_png_bytes` (full-canvas RGBA, transparent
+    outside the mask) — that function and `build_sf_payload`'s use of it
+    are unchanged; this is a new, separate helper for a different need:
+
+      * TIGHT, not full-canvas: a vision API downscales the whole image it
+        is sent to a fixed budget regardless of content, so a small object
+        sent on a full page can arrive smaller than its own native pixels
+        (measured: a 97x70 balloon arrived at 43x31 inside a 1740x2376 page
+        sent through a vision API's own resize pipeline).
+      * NO alpha, ever: JPEG cannot encode RGBA at all
+        (`OSError: cannot write mode RGBA as JPEG`, confirmed) and a PNG's
+        alpha is not safe to rely on downstream either — any later
+        `.convert("RGB")` silently turns a transparent pixel BLACK, which a
+        composited grey background can never be confused with. Still PNG
+        rather than JPEG: unlike the already-huge macro-context page, the
+        object itself should not lose fidelity to lossy compression.
+
+    An all-zero mask (nothing set) has no bounding box to crop to and
+    returns a 1x1 grey pixel — the same "nothing here" shape
+    `panel_crop_png_bytes` returns for a zero-area box, not a crash.
+    """
+    binary = _binary_mask(mask)
+    mask_image = Image.fromarray(binary * 255, mode="L")
+    composed = Image.new("RGB", image.size, _SEGMENT_CROP_BACKGROUND)
+    composed.paste(image.convert("RGB"), (0, 0), mask_image)
+    x0, y0, x1, y1 = _geometry_bbox(mask)
+    if x1 <= x0 or y1 <= y0:
+        return _png_bytes(Image.new("RGB", (1, 1), _SEGMENT_CROP_BACKGROUND))
+    return _png_bytes(composed.crop((x0, y0, x1, y1)))
+
+
+def _jpeg_bytes(image: Image.Image, quality: int = LLM_EXPORT_JPEG_QUALITY) -> bytes:
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def _downscaled_to_long_side(image: Image.Image, max_long_side: int) -> Image.Image:
+    """`image`, resized so its longer side is at most `max_long_side` —
+    unchanged (same object, not a copy) if it already fits. Aspect ratio
+    preserved."""
+    w, h = image.size
+    long_side = max(w, h)
+    if long_side <= max_long_side:
+        return image
+    scale = max_long_side / long_side
+    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    return image.resize(new_size, Image.Resampling.LANCZOS)
+
+
+def _panel_crop_jpeg_bytes(
+    image: Image.Image, box: Sequence[int], quality: int = LLM_EXPORT_JPEG_QUALITY,
+) -> bytes:
+    """A panel's rectangular JPEG cutout of `image` — the LLM-export sibling
+    of `panel_crop_png_bytes`, differing in exactly the two ways this
+    contract needs: JPEG/RGB (a vision-API message part, not an archival
+    RGBA PNG) and always cut from Artifact 1's page — the caller passes
+    THAT image in, never a mask's own pass image.
+
+    Same clamp-before-crop defensiveness as `panel_crop_png_bytes`,
+    duplicated rather than shared: the two encode differently (JPEG has no
+    alpha to begin with, so there is no transparent-fallback case to share),
+    and this module already duplicates small pass-image crop logic across
+    its export paths rather than add a shared dependency neither existing
+    path asked for (see `_crop_png_bytes`'s own docstring).
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    w, h = image.size
+    x0, x1 = max(0, min(x0, w)), max(0, min(x1, w))
+    y0, y1 = max(0, min(y0, h)), max(0, min(y1, h))
+    if x1 <= x0 or y1 <= y0:
+        return _jpeg_bytes(Image.new("RGB", (1, 1), _SEGMENT_CROP_BACKGROUND), quality=quality)
+    return _jpeg_bytes(image.crop((x0, y0, x1, y1)), quality=quality)
+
+
+def build_llm_export_payload(session: SFSession, include: str = "keep") -> dict:
+    """Assemble the read-only LLM-submission payload (v1) for `session` —
+    pure, in-memory; no file is written here (the caller, services.py's
+    `SegmentationService.export_llm_payload`, writes Artifact 1 to its
+    stable path and base64-encodes everything for the wire).
+
+    `include` selects which masks are rows at all:
+      * `"keep"` (default) — `dataset_status == KEEP`, the exact filter
+        `build_sf_payload` already uses; this export's default is meant to
+        agree with the training-set export, not introduce a second notion
+        of "kept".
+      * `"held_or_keep"` — also includes anything queued for the next
+        scrub but not yet captioned.
+    Any other value raises `ValueError` (the caller turns that into a 422,
+    same convention as `SFSession.add_panel`'s own validation).
+
+    Returns a dict of RAW bytes (not base64, not JSON-shaped) — see
+    `services.export_llm_payload` for the wire-shape step:
+      ``{"page_pass", "page_rule", "width", "height", "page_jpeg_bytes",
+      "panels": [...], "segments": [...]}``.
+
+    PANEL DEDUPLICATION: a panel row is produced at most once per distinct
+    `panel_id` actually assigned to an INCLUDED segment — not once per
+    `session.panels` regardless of use. A page can carry panels nothing
+    captioned ever falls inside; cropping and encoding those would be pure
+    waste for a payload whose whole point is "what this LLM call needs".
+
+    PASS SOURCING, the one place this genuinely diverges from
+    `build_sf_payload`'s panel-crop behaviour: Artifact 2 (`panel_crop`) is
+    always cut from Artifact 1's page, the session's shared macro-context
+    image — never from the assigned mask's own pass, unlike
+    `build_sf_payload`'s `panel_crop_png_bytes` call, which deliberately
+    uses each mask's own pass for ITS purpose (consistency with that mask's
+    own object crop in a training sample). Here the contract is different:
+    every segment in one submission shares ONE page, so its panel context
+    must come from that same page too, not drift per mask. Artifact 3
+    (`segment_crop`) is the one still sourced from the mask's own pass
+    image, via the existing `image_for_pass` — pass-aware exactly like
+    `build_sf_payload`.
+    """
+    if include not in ("keep", "held_or_keep"):
+        raise ValueError(f"include must be 'keep' or 'held_or_keep', got {include!r}")
+
+    page_pass, page_rule = resolve_artifact1_pass(session.wb_scrub_pass)
+    page_image = session.image_for_pass(page_pass).convert("RGB")
+    width, height = page_image.size
+    page_jpeg_bytes = _jpeg_bytes(_downscaled_to_long_side(page_image, ARTIFACT1_MAX_LONG_SIDE))
+
+    def included(mask: MaskRecord) -> bool:
+        if mask.dataset_status is DatasetStatus.KEEP:
+            return True
+        return include == "held_or_keep" and mask.held
+
+    # Decoded once per pass actually touched by an included segment, not
+    # once per mask — same reuse-across-rows shape as build_sf_payload's own
+    # pass_images cache, just built lazily since which passes are needed
+    # depends on which masks `included()` keeps.
+    pass_images: dict[int, Image.Image] = {}
+
+    def image_for(pass_: int) -> Image.Image:
+        if pass_ not in pass_images:
+            pass_images[pass_] = session.image_for_pass(pass_).convert("RGBA")
+        return pass_images[pass_]
+
+    segments: list[dict] = []
+    panel_crops: dict[str, dict] = {}  # panel_id -> {"bbox", "crop_jpeg_bytes"}
+
+    for mask in session.masks:
+        if not included(mask):
+            continue
+        bbox = _geometry_bbox(mask.geometry)
+        crop_png_bytes = segment_crop_png_bytes(image_for(mask.pass_), mask.geometry)
+
+        panel = assign_panel(bbox, session.panels)
+        panel_id = panel.panel_id if panel is not None else None
+        if panel is not None and panel_id not in panel_crops:
+            panel_crops[panel_id] = {
+                "bbox": panel.as_box(),
+                "crop_jpeg_bytes": _panel_crop_jpeg_bytes(page_image, panel.as_box()),
+            }
+
+        segments.append({
+            "mask_id": mask.mask_id,
+            "caption": mask.caption or "",
+            "pass": mask.pass_,
+            "bbox": bbox,
+            "panel_id": panel_id,
+            "crop_png_bytes": crop_png_bytes,
+            "pre_wb": session.wb_scrub_pass is not None and mask.pass_ < session.wb_scrub_pass,
+        })
+
+    panels = [
+        {"panel_id": pid, "bbox": v["bbox"], "crop_jpeg_bytes": v["crop_jpeg_bytes"]}
+        for pid, v in panel_crops.items()
+    ]
+
+    return {
+        "page_pass": page_pass,
+        "page_rule": page_rule,
+        "width": width,
+        "height": height,
+        "page_jpeg_bytes": page_jpeg_bytes,
+        "panels": panels,
+        "segments": segments,
+    }
+
+
 def build_sf_payload(session: SFSession) -> tuple[list[str], list[str], list]:
     """Serialize an `SFSession`'s kept work into the SF-AA export payload.
 
@@ -927,5 +1390,30 @@ def build_sf_payload(session: SFSession) -> tuple[list[str], list[str], list]:
             rows.append(row_key)
             cols.append("text_tag")
             vals.append(mask.text_tag)
+
+        # The panel this mask sits in (v4 §4): pure layout context for the
+        # LoRA, carrying no caption of its own. Cropped from `base_image` —
+        # the mask's OWN pass image, the same one its object crop above
+        # comes from, never the session's current pass: a keeper captioned
+        # in pass 1 of a session now at pass 4 must show the page as it
+        # looked when that object was there, and a later scrub may have
+        # repainted the very pixels its panel context depends on.
+        #
+        # `panel_source` is always written, never omitted, because the
+        # difference between "this is panel 3" and "no panel covered this
+        # mask, so here is the whole page" is not recoverable from the crop
+        # bytes themselves — a full-page fallback and a page-sized panel
+        # produce identical pixels. A consumer that silently treated the
+        # fallback as a real panel would be training on the wrong claim.
+        panel = assign_panel(_geometry_bbox(mask.geometry), session.panels)
+        if panel is None:
+            panel_box = (0, 0, base_image.width, base_image.height)
+            panel_source = PANEL_SOURCE_FULL_PAGE
+        else:
+            panel_box = panel.as_box()
+            panel_source = panel.panel_id
+        rows += [row_key, row_key]
+        cols += ["panel_crop_png_bytes", "panel_source"]
+        vals += [_b64(panel_crop_png_bytes(base_image, panel_box)), panel_source]
 
     return bridge.build_triples(rows, cols, vals)

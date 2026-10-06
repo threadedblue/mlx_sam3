@@ -208,6 +208,30 @@ class ApiService {
   /// `sf_engine.SFSession.attach_caption`. This is the Prompt card's
   /// caption-mode call (see main.dart), distinct from [segmentWithText]'s
   /// SAM3 text-grounding call.
+  /// The draft caption text for one mask, expanded from the session's prompt
+  /// template (templating v1). Read-only on the backend: it creates nothing,
+  /// writes nothing, and never reaches SAM3.
+  ///
+  /// `draft` is "" when the session has no template — the caller then leaves
+  /// the caption box exactly as it was.
+  Future<String?> promptDraft(String sessionId, String maskId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/mask/prompt-draft'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId, 'mask_id': maskId}),
+      );
+      if (response.statusCode == 200) {
+        return (jsonDecode(response.body) as Map<String, dynamic>)['draft'] as String?;
+      }
+      debugPrint('Prompt draft failed: ${response.statusCode} ${response.body}');
+      return null;
+    } catch (e) {
+      debugPrint('Error fetching prompt draft: $e');
+      return null;
+    }
+  }
+
   Future<Map<String, dynamic>?> attachCaption(String sessionId, String maskId, String caption) async {
     try {
       final response = await http.post(
@@ -270,6 +294,54 @@ class ApiService {
       return null;
     } catch (e) {
       debugPrint('Error detecting balloons: $e');
+      return null;
+    }
+  }
+
+  /// Record a manually drawn panel boundary (v4 §4), in integer page pixels.
+  ///
+  /// Panels are layout regions, not objects: this endpoint never touches
+  /// SAM3 and never creates a mask, so the response carries only the panel
+  /// list — deliberately no `results`/`all_masks`, since nothing about the
+  /// session's selections can have changed.
+  Future<Map<String, dynamic>?> addPanel(
+    String sessionId, int x0, int y0, int x1, int y1) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/panel/add'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'session_id': sessionId,
+          'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
+        }),
+      );
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      // 422 is the ordinary "that drag was too small" rejection, not an
+      // error worth surfacing as a failure banner.
+      debugPrint('Add panel failed: ${response.statusCode} ${response.body}');
+      return null;
+    } catch (e) {
+      debugPrint('Error adding panel: $e');
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>?> deletePanel(String sessionId, String panelId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/panel/delete'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId, 'panel_id': panelId}),
+      );
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      debugPrint('Delete panel failed: ${response.statusCode} ${response.body}');
+      return null;
+    } catch (e) {
+      debugPrint('Error deleting panel: $e');
       return null;
     }
   }

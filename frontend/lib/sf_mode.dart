@@ -20,6 +20,7 @@ enum SfCard {
   displayLayers,
   balloonScrub,
   lamaBackgroundScrub,
+  panels,
   save,
 }
 
@@ -32,6 +33,24 @@ const List<SfCard> kAllCards = [
   SfCard.prompt,
   SfCard.boxSelect,
   SfCard.pointSelect,
+  SfCard.objectsSelected,
+  SfCard.balloonScrub,
+  SfCard.lamaBackgroundScrub,
+  SfCard.displayLayers,
+  SfCard.save,
+];
+
+/// Comix's toolset: everything in [kAllCards] plus the Panels card, placed
+/// next to the other canvas-drawing cards rather than at the end — a panel is
+/// authored by dragging on the canvas, like Box Select, not by a terminal
+/// action like Save.
+const List<SfCard> kComixCards = [
+  SfCard.session,
+  SfCard.upload,
+  SfCard.prompt,
+  SfCard.boxSelect,
+  SfCard.pointSelect,
+  SfCard.panels,
   SfCard.objectsSelected,
   SfCard.balloonScrub,
   SfCard.lamaBackgroundScrub,
@@ -67,12 +86,12 @@ enum SfMode {
 
 /// Cards for [mode], or the full unfiltered set when [mode] is null.
 ///
-/// Comix is every card: its toolset is the general-purpose cards plus Balloon
-/// Scrub, which is simply everything that exists today. That makes Comix and
-/// "unfiltered" identical *right now* — deliberately so, since Comix is the
-/// only implemented mode and nothing should disappear when it is selected.
-/// They are kept as separate concepts rather than aliased because they diverge
-/// the moment a Poster-only card is added.
+/// Comix is the general-purpose cards plus Balloon Scrub plus Panels. It is
+/// no longer identical to "unfiltered": [SfCard.panels] (v4 §4) is the first
+/// genuinely mode-specific card, which is exactly the divergence the two were
+/// kept as separate concepts for. Panel cutouts are a comics-layout notion,
+/// so a no-mode launch — defined as "unchanged from pre-mode behaviour" —
+/// does not get it.
 ///
 /// Poster and Cine return empty: their toolsets are not scoped yet (v4 §3
 /// sequences Comix first, then Poster, with Cine needing its own design pass).
@@ -83,7 +102,7 @@ List<SfCard> cardsFor(SfMode? mode) {
     case null:
       return kAllCards;
     case SfMode.comix:
-      return kAllCards;
+      return kComixCards;
     case SfMode.poster:
       return const [];
     case SfMode.cine:

@@ -42,11 +42,13 @@ from services import (
     serialize_state,
     serialize_sf_masks,
     serialize_sf_masks_all_passes,
+    serialize_panels,
 )
 import aa_persistence
 import sf_engine
 import balloon_detector
 import source_fingerprint
+import prompt_template as prompt_template_mod
 
 # Set from Part 1's zero-shot validation on Little Nemo 0026/0042/0122: 91%
 # recall of text regions with zero false positives on artwork, chosen over a
@@ -180,6 +182,41 @@ class PointPromptRequest(BaseModel):
     text_substitute: Optional[str] = None
 
 
+class AddPanelRequest(BaseModel):
+    """A manually drawn panel boundary, in integer page pixels (v4 §4).
+
+    Page pixels, not the normalised cx/cy/w/h a box PROMPT uses: a panel is
+    layout geometry stored as-is, never handed to SAM3, so there is nothing
+    to normalise for and a round-trip through floats would only lose
+    precision on the exact edges the user drew.
+    """
+    session_id: str
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+
+
+class DeletePanelRequest(BaseModel):
+    session_id: str
+    panel_id: str
+
+
+class PromptDraftRequest(BaseModel):
+    session_id: str
+    mask_id: str
+
+
+class ExportLlmPayloadRequest(BaseModel):
+    session_id: str
+    # "keep" (default) matches build_sf_payload's own filter — this
+    # export's default is meant to agree with the training-set export, not
+    # introduce a second notion of "kept". "held_or_keep" additionally
+    # includes anything queued for the next scrub but not yet captioned.
+    # Any other value is a 422 — see sf_engine.build_llm_export_payload.
+    include: str = "keep"
+
+
 class SetHeldRequest(BaseModel):
     session_id: str
     mask_id: str
@@ -219,6 +256,10 @@ class InitSessionRequest(BaseModel):
     # when it is launching a NEW session. An empty value must never overwrite
     # the mode already stored for this session — see the guard in init_session.
     mode: str = ""
+    # Templating v1. Same empty-means-leave-alone contract as `mode`: DN sends
+    # a template only when creating a NEW session, so an empty value here must
+    # never overwrite one already stored — see the guard in init_session.
+    prompt_template: str = ""
 
 
 class LoraAppendRequest(BaseModel):
@@ -805,6 +846,156 @@ async def balloon_scrub(file: UploadFile = File(...)):
     }
 
 
+@app.post("/panel/add")
+async def add_panel(request: AddPanelRequest):
+    """Record a manually drawn panel boundary (v4 §4).
+
+    PANELS ARE NOT OBJECTS. This endpoint deliberately does not touch SAM3,
+    does not create a MaskRecord, and does not appear in `results`/
+    `all_masks` — it is pure layout-geometry capture. That is the whole
+    point of the manual tool: panel detection was validated zero-shot first
+    (manga 14/25, comic 17/25, ray-cast 11/25) and none of it was good
+    enough to build on, so the authored bounds ARE the source of truth.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+
+    try:
+        panel = sf_session.add_panel(request.x0, request.y0, request.x1, request.y1)
+    except ValueError as exc:
+        # Inverted, degenerate, or below the minimum side after clamping.
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Persistence is explicit-Save-only, same as every other mutation here.
+    return {
+        "session_id": request.session_id,
+        "panel_id": panel.panel_id,
+        "panels": serialize_panels(sf_session),
+    }
+
+
+@app.post("/panel/delete")
+async def delete_panel(request: DeletePanelRequest):
+    """Remove one panel by id (v4 §4). No mask is involved, so nothing about
+    selection, holding or the pass chain changes."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+
+    try:
+        sf_session.delete_panel(request.panel_id)
+    except sf_engine.UnknownPanelError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    return {
+        "session_id": request.session_id,
+        "panels": serialize_panels(sf_session),
+    }
+
+
+@app.post("/panel/list")
+async def list_panels(request: SessionRequest):
+    """Every panel currently authored on this session (v4 §4)."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+
+    return {
+        "session_id": request.session_id,
+        "panels": serialize_panels(sf_session),
+    }
+
+
+@app.post("/export/llm-payload")
+async def export_llm_payload(request: ExportLlmPayloadRequest):
+    """Read-only LLM submission payload (v1) for every included segment —
+    see `sf_engine.build_llm_export_payload` for the artifact rules (Artifact
+    1 = the macro-context page at `wb_scrub_pass`/pass 0; Artifact 2 = a
+    panel crop cut from THAT page; Artifact 3 = the mask's own tight,
+    grey-composited crop).
+
+    READ-ONLY, BY CONSTRUCTION. Nothing here mutates a MaskRecord, holds a
+    mask, touches registry.parquet/segment.parquet, or reaches SAM3 — the
+    only write is Artifact 1's JPEG file, regenerated at a stable path, not
+    a persisted field. `build_sf_payload`'s own output and tests are
+    unchanged by this; this is a separate export for a separate consumer
+    (a DN LLM node), not a replacement for the training-set export.
+
+    Same cold-cache contract as /mask/hold, /panel/*, etc.:
+    `get_or_create_sf_session` only ever reads the in-memory cache, so a
+    resumed session that has not yet called /loadSession 404s here too.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+
+    try:
+        return service.export_llm_payload(request.session_id, sf_session, request.include)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/mask/prompt-draft")
+async def mask_prompt_draft(request: PromptDraftRequest):
+    """The draft caption text for one mask, from this session's prompt
+    template (templating v1).
+
+    READ-ONLY, BY CONSTRUCTION. It creates nothing, writes nothing, mutates
+    no record, and never reaches SAM3 — it reads the stored template plus
+    facts already on the MaskRecord and returns a string. The result is NOT
+    persisted anywhere: it becomes permanent only if the user edits/accepts
+    it and presses Save Caption, which is the existing /mask/caption path,
+    unchanged.
+
+    `draft` is "" when the session has no template, which is what tells the
+    frontend to leave the caption box exactly as it is today.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+
+    try:
+        mask = sf_session.get_mask(request.mask_id)
+    except sf_engine.UnknownMaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    template = (service.sessions.get(request.session_id) or {}).get("prompt_template") or ""
+    if not template:
+        return {"draft": ""}
+
+    # The same pure assignment the export path uses — not a second rule.
+    bbox = sf_engine._geometry_bbox(mask.geometry)
+    panel = sf_engine.assign_panel(bbox, sf_session.panels)
+    # 1-based, matching the Panels card's own row numbering; None -> "full page".
+    index = sf_session.panels.index(panel) + 1 if panel is not None else None
+
+    return {
+        "draft": prompt_template_mod.expand_prompt_template(
+            template,
+            text_tag=mask.text_tag,
+            pass_=mask.pass_,
+            bbox=bbox,
+            panel_label=prompt_template_mod.panel_label(index),
+        )
+    }
+
+
 @app.post("/mask/hold")
 async def set_mask_held(request: SetHeldRequest):
     """Queue (or un-queue) a selection for the current pass's next scrub —
@@ -1069,6 +1260,12 @@ async def init_session(request: InitSessionRequest):
         # first /initSession call and silently fall back to unfiltered.
         if request.mode:
             init_data["mode"] = request.mode
+        # Mandatory guard, not defensive: register_session_data MERGES into
+        # whatever is cached, so a key present with an empty value would
+        # clobber a stored template with "". DN sends "" on every call that
+        # is not creating a new session.
+        if request.prompt_template:
+            init_data["prompt_template"] = request.prompt_template
         service.register_session_data(request.session_id, init_data)
         return {
             "session_id": request.session_id,

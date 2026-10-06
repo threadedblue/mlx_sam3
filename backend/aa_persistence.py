@@ -77,6 +77,21 @@ Row/column scheme (SF is one-image-per-session; no `image_id` layer):
                       pre-v2 background image (old `_background` sentinel)
                       is read as pass 1's image if no `_pass_image:1` row
                       exists.
+
+                      Row `session_id:_panels` (v4 §4) holds every manually
+                      authored panel boundary — ONE row for all of them,
+                      one column each, key `f"{index:04d}:{panel_id}"`,
+                      value the JSON bbox `[x0, y0, x1, y1]` in integer page
+                      pixels. Panels are layout regions, never objects: no
+                      `MaskRecord` exists for them, nothing about them has
+                      touched SAM3, and they carry no pass number (every
+                      pass of a session shares one set of dimensions, so a
+                      panel bbox is valid against all of them). The row is
+                      ABSENT when the session has no panels, exactly like
+                      `_wb_scrub` — deleting the last panel removes the row
+                      rather than writing an empty one. The index prefix on
+                      the column key preserves authoring order through
+                      D4M.jl's column sort, the same device linkage uses.
   linkage.parquet  — row `session_id:_global` for every prompt. SF's SAM3
                       pipeline has no way to target one already-identified
                       segment — `add_geometric_prompt` re-runs grounding over
@@ -134,6 +149,21 @@ _PASS_IMAGE_PREFIX = "_pass_image"  # v2: one row per pass >= 1, "_pass_image:<p
 # balloons. Absent row == no WB scrub has run, which is also what a
 # zero-balloon page correctly looks like.
 _WB_SCRUB_TARGET = "_wb_scrub"
+# v4 §4: manually authored panel bounds. ONE sentinel row holding every
+# panel as its own column, rather than a row per panel, so that "this
+# session has no panels" is representable as the row simply not existing —
+# the same absent-means-none rule `_wb_scrub` uses. Deleting the last panel
+# therefore removes the row; an empty row is never written.
+#
+# Column key is f"{index:04d}:{panel_id}", the identical trick
+# linkage.parquet already uses for its ordered prompt collection and for the
+# identical reason: D4M.jl's Assoc stores columns in sorted-key order, and a
+# bare uuid4 key would reshuffle the panel list on every reload. The
+# zero-padded authoring index sorts back to the order they were drawn in.
+# Value is the JSON bbox `[x0, y0, x1, y1]` (ints, page pixels) — one value
+# per panel rather than four columns each, because a panel is only ever read
+# and written whole.
+_PANELS_TARGET = "_panels"
 _GLOBAL_TARGET = "_global"
 
 # "mode" (v4 §3): which SegForge toolset this session was created under.
@@ -142,9 +172,17 @@ _GLOBAL_TARGET = "_global"
 # launch and sends empty on resume, exactly as it does for image_url.
 # Absent/empty reads back as None, which means "legacy/unfiltered", NOT
 # "assume Comix" (see the frontend's SfMode.cardsFor).
+# "prompt_template" (templating v1): the per-mask prompt template DN's Seg
+# Forge node supplies at /initSession. Persisted here, alongside mode and for
+# the identical reason — a resumed session must know its own template without
+# DoubleNaught re-supplying it, and DN only ever sends one when creating a NEW
+# session. Being in this tuple is also what makes register_session_data's
+# restore-before-merge guard protect it: that branch restores exactly these
+# fields from disk when the cache is cold, so a later /upload cannot blank it.
+# Absent/empty reads back as "" — meaning "no template", never a default one.
 _REGISTRY_FIELDS = (
     "name", "description", "created_at", "image_url", "original_filename",
-    "mode",
+    "mode", "prompt_template",
 )
 
 # Public alias: services.register_session_data restores these fields when it
@@ -284,6 +322,17 @@ def _build_segments_from_masks(session_id: str, sf_session: "sf_engine.SFSession
         rows.append(f"{session_id}:{_WB_SCRUB_TARGET}")
         cols.append("pass")
         vals.append(str(sf_session.wb_scrub_pass))
+
+    # Absent row == no panels (see _PANELS_TARGET). The `if` is what makes
+    # deleting the last panel remove the row rather than write an empty one:
+    # every Save rebuilds these triples from scratch, so not appending here
+    # IS the deletion.
+    if sf_session.panels:
+        panel_row = f"{session_id}:{_PANELS_TARGET}"
+        for index, panel in enumerate(sf_session.panels):
+            rows.append(panel_row)
+            cols.append(f"{index:04d}:{panel.panel_id}")
+            vals.append(json.dumps([panel.x0, panel.y0, panel.x1, panel.y1]))
 
     for mask in sf_session.masks:
         base_image = pass_images.get(mask.pass_, pass_images[0])
@@ -438,6 +487,7 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
     image_bytes: Optional[bytes] = None
     pass_images: dict[int, bytes] = {}
     wb_scrub_pass: Optional[int] = None
+    panels: list[dict[str, Any]] = []
     segments: list[dict[str, Any]] = []
     seg_path = d / "segment.parquet"
     if seg_path.exists():
@@ -462,6 +512,21 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
                 continue
             if target_id == _WB_SCRUB_TARGET:
                 wb_scrub_pass = int(attrs["pass"])
+                continue
+            if target_id == _PANELS_TARGET:
+                # Sort by the zero-padded index prefix to restore authoring
+                # order after D4M.jl's internal column sort — same step
+                # linkage's prompt replay does, for the same reason.
+                for col_key in sorted(attrs):
+                    x0, y0, x1, y1 = json.loads(attrs[col_key])
+                    panels.append({
+                        # The index prefix is a storage-ordering device, not
+                        # identity: strip it so the panel_id round-trips as
+                        # the id the API and the frontend's delete call use.
+                        "panel_id": col_key.split(":", 1)[1],
+                        "x0": int(x0), "y0": int(y0),
+                        "x1": int(x1), "y1": int(y1),
+                    })
                 continue
             dataset_status = attrs.get("dataset_status", "unassigned")
             segments.append({
@@ -499,12 +564,17 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
         "created_at": fields.get("created_at") or None,
         "image_url": fields.get("image_url") or None,
         "mode": fields.get("mode") or None,
+        # "" rather than None for absence: the expander treats an empty
+        # template as "no template" and the draft endpoint returns an empty
+        # draft, so there is no None case for any caller to special-case.
+        "prompt_template": fields.get("prompt_template") or "",
         "original_filename": fields.get("original_filename") or None,
         "width": width,
         "height": height,
         "image_bytes": image_bytes,
         "pass_images": pass_images,
         "wb_scrub_pass": wb_scrub_pass,
+        "panels": panels,
         "segments": segments,
         "prompts": prompts,
         "ui_settings": json.loads(fields["ui_settings"]) if fields.get("ui_settings") else {},

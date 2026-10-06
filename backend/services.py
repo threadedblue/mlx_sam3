@@ -169,6 +169,26 @@ def _invalidate_stale_crops(sf_session) -> None:
     sf_session.last_refreshed_mask_ids = set()
 
 
+def serialize_panels(sf_session) -> list:
+    """Wire shape for a session's panel bounds (v4 §4) — the one place this
+    is built, shared by /loadSession and every /panel/* response so they
+    cannot drift.
+
+    Deliberately NOT part of `serialize_sf_masks`/`..._all_passes`: those are
+    mask ledgers, and a panel is not a mask. Keeping it a separate field also
+    keeps `results`/`all_masks` byte-identical to what they were before
+    panels existed, so nothing that reads them can be perturbed by a panel.
+
+    Integer page pixels, no pass field — see sf_engine.PanelRecord.
+    """
+    if sf_session is None:
+        return []
+    return [
+        {"panel_id": p.panel_id, "x0": p.x0, "y0": p.y0, "x1": p.x1, "y1": p.y1}
+        for p in sf_session.panels
+    ]
+
+
 def serialize_sf_masks(sf_session, state: dict) -> dict:
     """Wire shape for the /segment/* responses, built from SFSession's
     *recorded selections* rather than raw `state["masks"]`.
@@ -418,9 +438,24 @@ class SegmentationService:
                 caption=seg.get("caption"),
             ))
 
+        # Panels (v4 §4) are layout geometry, restored straight from the
+        # persisted bboxes — there is nothing to reconstruct them FROM
+        # otherwise, unlike masks (which at least have mask_bytes) or `state`
+        # (replayable from prompts). A session saved before panels existed
+        # has no `_panels` row, which reads back as [] and restores as none.
+        panels = [
+            sf_engine.PanelRecord(
+                panel_id=p["panel_id"],
+                x0=int(p["x0"]), y0=int(p["y0"]),
+                x1=int(p["x1"]), y1=int(p["y1"]),
+            )
+            for p in (raw.get("panels") or [])
+        ]
+
         sf_session.restore(
             current_pass, pass_images, masks,
             wb_scrub_pass=raw.get("wb_scrub_pass"),
+            panels=panels,
         )
         return sf_session
 
@@ -491,6 +526,11 @@ class SegmentationService:
                 "description": raw["description"],
                 "image_url": raw["image_url"],
                 "mode": raw.get("mode"),
+                # Warmed here as well as by register_session_data's merge, so
+                # /mask/prompt-draft sees a RESUMED session's template too —
+                # a field added to only one of the two warm paths is exactly
+                # the drift this codebase has been bitten by before.
+                "prompt_template": raw.get("prompt_template") or "",
             }
             self.sessions[session_id] = session_data
             self.sf_sessions[session_id] = self._reconstruct_sf_session(session_id, raw, state)
@@ -855,10 +895,33 @@ class SegmentationService:
         # on a fresh launch. None means legacy/unfiltered, never "Comix".
         response["mode"] = raw.get("mode")
 
+        # The prompt template this session was created with (templating v1),
+        # read back from registry.parquet exactly like `mode`. "" means no
+        # template, which is what makes /mask/prompt-draft return an empty
+        # draft and the frontend leave the caption box untouched.
+        response["prompt_template"] = raw.get("prompt_template") or ""
+
         # Which pass a balloon scrub produced, so a resumed session still
         # labels its WB-scrub layer — `MaskRecord.source` is not persisted,
         # so this number is the only thing that survives to identify it.
         response["wb_scrub_pass"] = raw.get("wb_scrub_pass")
+
+        # The session's current pass — /loadSession never sent this before,
+        # so the frontend had no way to tell a resumed post-scrub session
+        # (Pass N, N > 0) from a fresh one and show the same "Pass N-1 ->
+        # Pass N" label the live scrub response already gives it (bug-3
+        # audit finding #3). 0 when there is no reconstructed SFSession at
+        # all (a session staged via /initSession but never uploaded to) —
+        # the same "nothing to show" case the frontend already treats pass
+        # 0 as.
+        response["pass"] = sf_session.pass_ if sf_session is not None else 0
+
+        # Manually authored panel bounds (v4 §4). Sourced from the
+        # reconstructed SFSession rather than straight from `raw["panels"]`
+        # so that what resume shows is the same object the /panel/*
+        # endpoints will mutate — one source of truth, not two readings of
+        # the same row that could disagree after a failed reconstruction.
+        response["panels"] = serialize_panels(sf_session)
 
         view_layers = raw["ui_settings"].get("view_layers")
         if view_layers is not None:
@@ -977,6 +1040,71 @@ class SegmentationService:
             "path": str(segments_dir),
             "image_stem": image_stem,
             "processing_time_ms": (time.perf_counter() - start_time) * 1000
+        }
+
+    def export_llm_payload(
+        self, session_id: str, sf_session: "sf_engine.SFSession", include: str,
+    ) -> Dict[str, Any]:
+        """Read-only LLM submission payload (v1) — see
+        `sf_engine.build_llm_export_payload` for the actual assembly, which
+        does every pixel operation purely in memory.
+
+        This method's own job is exactly the two things that function
+        deliberately does NOT do:
+
+          1. Write Artifact 1 (the macro-context page) to its stable path
+             under this session's OWN storage (`aa_persistence.session_dir`
+             — `storage/sf/sessions/<id>/`, not the legacy
+             `self.storage_dir` `create_segments` writes under), OVERWRITING
+             whatever was there. Regenerated on every call rather than
+             cached or persisted as a field: the file can then never go
+             stale against whatever `wb_scrub_pass` actually is right now,
+             at the cost of redoing the downscale/encode each time — cheap
+             next to everything else this endpoint already does.
+          2. Base64-encode the crop bytes for the JSON wire shape, the same
+             step every other serializer in this module already does via
+             `_b64` (`serialize_sf_masks`'s `crop_png_bytes`, etc.) — kept
+             here rather than in the pure builder so that function's return
+             value stays raw bytes, not a wire format.
+
+        Nothing here mutates `sf_session`, writes to registry.parquet or
+        segment.parquet, or calls the segmentor — the only write is the one
+        JPEG file named above.
+        """
+        payload = sf_engine.build_llm_export_payload(sf_session, include=include)
+
+        page_path = aa_persistence.session_dir(session_id) / "artifact1.jpg"
+        page_path.write_bytes(payload["page_jpeg_bytes"])
+
+        return {
+            "session_id": session_id,
+            "page": {
+                "page_path": str(page_path),
+                "page_pass": payload["page_pass"],
+                "page_rule": payload["page_rule"],
+                "width": payload["width"],
+                "height": payload["height"],
+            },
+            "panels": [
+                {
+                    "panel_id": p["panel_id"],
+                    "bbox": list(p["bbox"]),
+                    "panel_crop": _b64(p["crop_jpeg_bytes"]),
+                }
+                for p in payload["panels"]
+            ],
+            "segments": [
+                {
+                    "mask_id": s["mask_id"],
+                    "caption": s["caption"],
+                    "pass": s["pass"],
+                    "bbox": list(s["bbox"]),
+                    "panel_id": s["panel_id"],
+                    "segment_crop": _b64(s["crop_png_bytes"]),
+                    "pre_wb": s["pre_wb"],
+                }
+                for s in payload["segments"]
+            ],
         }
 
     async def append_lora_entry(self, session_id: str, segment_index: int, original_prompt: str) -> Dict[str, Any]:

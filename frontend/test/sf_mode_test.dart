@@ -30,7 +30,14 @@ void main() {
       // Regression guard on today's behaviour: a standalone launch, an old
       // DoubleNaught, or a pre-mode session must lose nothing.
       expect(cardsFor(null), kAllCards);
-      expect(cardsFor(null).length, SfCard.values.length);
+      // This used to assert `== SfCard.values.length` — "unfiltered shows
+      // every card that exists". That stopped being the contract when
+      // SfCard.panels (v4 §4) arrived as the first genuinely mode-specific
+      // card, which is exactly the divergence kAllCards and Comix were kept
+      // as separate concepts for. The real contract is the one above
+      // (unfiltered == kAllCards, unchanged from pre-mode behaviour); what
+      // follows pins the new fact rather than the old proxy for it.
+      expect(cardsFor(null), isNot(contains(SfCard.panels)));
     });
 
     test('comix shows every card, including Balloon Scrub', () {
