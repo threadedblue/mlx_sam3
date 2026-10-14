@@ -45,7 +45,6 @@ class SegmentLayersCard extends StatelessWidget {
             children: [
               _buildLayerCheckbox('Original', layerState.showOriginal, layerState.setOriginal),
               _buildLayerCheckbox('Masks', layerState.showMasks, layerState.setMasks),
-              _buildLayerCheckbox('Raw', layerState.showRaw, layerState.setRaw),
               _buildLayerCheckbox('Current', layerState.showCurrent, layerState.setCurrent),
               if (hasWbScrubLayer)
                 _buildLayerCheckbox(

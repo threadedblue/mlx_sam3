@@ -34,6 +34,10 @@ class ObjectsSelectedCard extends StatelessWidget {
   final void Function(String maskId, bool held) onSetHeld;
   final VoidCallback onClearPrompts;
 
+  /// Deletes one selection outright (for "I masked that by mistake").
+  /// Optional: without it no remove control is shown.
+  final void Function(String maskId)? onRemove;
+
   const ObjectsSelectedCard({
     super.key,
     required this.maskCount,
@@ -41,6 +45,7 @@ class ObjectsSelectedCard extends StatelessWidget {
     required this.enabled,
     required this.onSetHeld,
     required this.onClearPrompts,
+    this.onRemove,
   });
 
   @override
@@ -91,6 +96,15 @@ class ObjectsSelectedCard extends StatelessWidget {
                     controlAffinity: ListTileControlAffinity.leading,
                     contentPadding: EdgeInsets.zero,
                     dense: true,
+                    secondary: onRemove == null
+                        ? null
+                        : IconButton(
+                            key: Key('remove-mask-${seg.maskId}'),
+                            icon: const Icon(Icons.close, size: 18),
+                            tooltip: 'Remove this selection',
+                            visualDensity: VisualDensity.compact,
+                            onPressed: enabled ? () => onRemove!(seg.maskId!) : null,
+                          ),
                     // Checked by default (§5) — this is an opt-OUT of the
                     // next scrub batch, not an opt-in Hold anymore.
                     title: Text(holdable.length == 1

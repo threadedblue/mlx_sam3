@@ -433,6 +433,11 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _sessionId;
   String? _imageUrl; // Supplied at launch, non-editable
 
+  /// The in-flight (or finished) launch-session load. The auto image download
+  /// waits for it: a saved session brings its own bytes, and racing it with a
+  /// download of the (possibly stale) launch URL produced a spurious 404.
+  Future<void>? _launchSessionLoad;
+
   /// Whether SF was launched standalone (no launch args). Determines whether
   /// the Image URL field shows a file picker affordance.
   late final bool _isStandalone;
@@ -526,6 +531,12 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Null until the first detection run this session — distinct from 0.
   int? _lastDetectedCount;
   String? _lastScrubLabel;
+
+  /// Whether a scrub exists to step back from, and the last undo's refusal
+  /// reason (shown under the Undo button).
+  bool _canUndo = false;
+  bool _isUndoing = false;
+  String? _undoMessage;
   /// True once [_loadLaunchSession] has successfully loaded a session from
   /// the backend (not just attempted — a session with nothing stored yet
   /// leaves this false, same as a brand-new upload). [BalloonScrubCard]
@@ -590,7 +601,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _isStandalone = _imageUrl == null && (LaunchConfig.sessionId == null || widget.initialSessionId != null);
     // Whatever the backend already holds for this session goes on screen at
     // once — it needs no model, so the window is never blank while SAM loads.
-    _loadLaunchSession();
+    _launchSessionLoad = _loadLaunchSession();
     // The Select button is disabled while the prompt is empty, so the field has
     // to trigger a rebuild as it is typed into.
     _textController.addListener(_onPromptTextChanged);
@@ -764,6 +775,9 @@ class _HomeScreenState extends State<HomeScreen> {
       // full history. At pass 0 there is no transition to show.
       final pass = (session['pass'] as num?)?.toInt() ?? 0;
       _lastScrubLabel = pass > 0 ? _formatScrubLabel(pass - 1, pass) : null;
+      // Optimistic on resume (history is not persisted); the backend answers
+      // honestly if there turns out to be nothing to undo.
+      _canUndo = pass > 0;
       // A resumed session starts clean: everything it carries just came
       // FROM the last save, not from unsaved work in this run. Explicit
       // rather than relying on both counters defaulting to 0 on a fresh
@@ -791,7 +805,11 @@ class _HomeScreenState extends State<HomeScreen> {
     final haveBytes = _imageBytes != null;
     if (!haveBytes && (_imageUrl == null || _imageUrl!.isEmpty)) return;
     _autoLoadStarted = true;
-    _loadImageFromUrl();
+    // A resumed session must finish loading first: once its bytes are in,
+    // _loadImageFromUrl returns early and never touches the URL.
+    (_launchSessionLoad ?? Future<void>.value()).whenComplete(() {
+      if (mounted) _loadImageFromUrl();
+    });
   }
 
   /// Open file picker to select an image file (standalone mode only).
@@ -1027,7 +1045,13 @@ class _HomeScreenState extends State<HomeScreen> {
         debugPrint('Upload complete. sessionId=$_sessionId, imageSize=$_imageSize');
       }
     } catch (e) {
-      if (mounted) setState(() => _error = e.toString());
+      if (_imageBytes != null) {
+        // The page is already on screen (a saved session's own bytes), so a
+        // failed re-download of the launch URL is not worth an error banner.
+        debugPrint('Image URL load failed; keeping the loaded image: $e');
+      } else if (mounted) {
+        setState(() => _error = e.toString());
+      }
     } finally {
       if (mounted) setState(() { _isLoading = false; _imageSourceRunning = false; });
     }
@@ -1373,8 +1397,16 @@ class _HomeScreenState extends State<HomeScreen> {
           // Only a balloon scrub sets this; an ordinary S&S scrub leaves
           // whatever it already was (null, or an earlier WB pass).
           _wbScrubPass = (response['wb_scrub_pass'] as num?)?.toInt() ?? _wbScrubPass;
+          _canUndo = response['can_undo'] as bool? ?? true;
+          _undoMessage = null;
           _mutationCount++;
         });
+        // Pass 0 still contains everything just scrubbed. If it stays on, an
+        // object that was scrubbed shows again whenever Current is hidden to
+        // look at masks. So a scrub switches the reference layer off and the
+        // working image on; Original can be turned back on to compare.
+        _layerState?.setOriginal(false);
+        _layerState?.setCurrent(true);
       } else {
         // scrubLamaBackground doesn't rethrow (see ApiService) — a null
         // response means the call itself failed (network error, or the
@@ -1387,6 +1419,83 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _error = e.toString());
     } finally {
       if (mounted) setState(() { _isScrubbing = false; });
+    }
+  }
+
+  /// Deletes one current-pass selection ("masked by mistake"). The backend
+  /// answers with the pass's remaining selections, which replace what is
+  /// drawn, so the screen can never disagree with the session.
+  Future<void> _removeMask(String maskId) async {
+    if (_sessionId == null) return;
+    final response = await _api.removeMask(_sessionId!, maskId);
+    if (!mounted) return;
+    if (response == null) {
+      setState(() => _error = 'Could not remove that selection.');
+      return;
+    }
+    setState(() {
+      _result = response['result'] as Map<String, dynamic>?;
+      _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+      _updateSegmentsFromResult();
+      if (_focusedMaskId == maskId) {
+        _focusedMaskId = null;
+        _draftRequestedFor = null;
+      }
+      _mutationCount++;
+    });
+  }
+
+  /// Steps back one scrub: the previous pass's image returns, the masks that
+  /// were scrubbed are selected and queued again. Refused (with the reason
+  /// shown) if it would lose captioned work.
+  Future<void> _undoScrub() async {
+    if (_sessionId == null || _isUndoing) return;
+    setState(() { _isUndoing = true; _undoMessage = null; });
+    try {
+      final response = await _api.undoScrub(_sessionId!);
+      if (!mounted) return;
+      if (response == null) {
+        setState(() => _error = 'Undo failed.');
+        return;
+      }
+      if (response['ok'] != true) {
+        setState(() => _undoMessage = response['detail'] as String?);
+        return;
+      }
+      final b64 = response['image_b64'] as String?;
+      Uint8List? bytes;
+      ui.Image? decoded;
+      if (b64 != null && b64.isNotEmpty) {
+        try {
+          bytes = base64Decode(b64);
+          decoded = await _decodeImage(bytes);
+        } catch (e) {
+          debugPrint('Could not decode restored image: $e');
+        }
+      }
+      if (!mounted) return;
+      final pass = (response['pass'] as num?)?.toInt() ?? 0;
+      setState(() {
+        if (bytes != null && decoded != null) {
+          _imageBytes = bytes;
+          _uiImage = decoded;
+          _imageSize = Size(
+            (response['width'] as num?)?.toDouble() ?? decoded.width.toDouble(),
+            (response['height'] as num?)?.toDouble() ?? decoded.height.toDouble(),
+          );
+        }
+        _result = response['result'] as Map<String, dynamic>?;
+        _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+        _updateSegmentsFromResult();
+        _focusedMaskId = null;
+        _draftRequestedFor = null;
+        _lastScrubLabel = pass > 0 ? _formatScrubLabel(pass - 1, pass) : null;
+        _wbScrubPass = (response['wb_scrub_pass'] as num?)?.toInt();
+        _canUndo = response['can_undo'] as bool? ?? false;
+        _mutationCount++;
+      });
+    } finally {
+      if (mounted) setState(() { _isUndoing = false; });
     }
   }
 
@@ -1523,8 +1632,8 @@ class _HomeScreenState extends State<HomeScreen> {
       if (original is bool) layerState.setOriginal(original);
       final masks = viewLayers['masks'];
       if (masks is bool) layerState.setMasks(masks);
-      final raw = viewLayers['raw'];
-      if (raw is bool) layerState.setRaw(raw);
+      // `viewLayers['raw']` may still be present in sessions saved before the
+      // Raw layer was removed; it is deliberately ignored.
       final current = viewLayers['current'];
       if (current is bool) layerState.setCurrent(current);
     } finally {
@@ -1540,7 +1649,6 @@ class _HomeScreenState extends State<HomeScreen> {
         'view_layers': {
           'original': _layerState!.showOriginal,
           'masks': _layerState!.showMasks,
-          'raw': _layerState!.showRaw,
           'current': _layerState!.showCurrent,
         }
       });
@@ -2004,6 +2112,7 @@ class _HomeScreenState extends State<HomeScreen> {
       enabled: _sessionId != null && !_isLoading,
       onSetHeld: _setMaskHeld,
       onClearPrompts: _reset,
+      onRemove: _removeMask,
     );
   }
 
@@ -2033,6 +2142,10 @@ class _HomeScreenState extends State<HomeScreen> {
       lastScrubLabel: _lastScrubLabel,
       isScrubbing: _isScrubbing,
       onScrub: _scrubLamaBackground,
+      canUndo: _canUndo,
+      isUndoing: _isUndoing,
+      onUndo: _undoScrub,
+      undoMessage: _undoMessage,
     );
   }
 

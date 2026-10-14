@@ -201,7 +201,7 @@ void main() {
 
   group('Fix 3: view_layers restored on resume', () {
     testWidgets(
-        'raw=false round-trips to an unchecked Raw layer, other keys keep defaults',
+        'a legacy raw key is ignored; other keys round-trip and missing ones keep defaults',
         (tester) async {
       final resumed = await _pumpResumedSession(tester,
           sessionPayload: _sessionPayload(extra: {
@@ -221,8 +221,8 @@ void main() {
       final layerState = resumed.layerState;
       expect(layerState.showOriginal, isTrue, reason: 'explicit true round-trips');
       expect(layerState.showMasks, isFalse, reason: 'explicit false round-trips');
-      expect(layerState.showRaw, isFalse,
-          reason: 'the real stored shape (3213231f) this bug was found against');
+      // 'raw' (the real stored shape these sessions carry) is read and
+      // dropped: the Raw layer no longer exists, and must not crash a resume.
       expect(layerState.showCurrent, isTrue,
           reason: 'missing key must keep LayerState\'s own default');
     });
@@ -236,7 +236,6 @@ void main() {
       final layerState = resumed.layerState;
       expect(layerState.showOriginal, isTrue);
       expect(layerState.showMasks, isTrue);
-      expect(layerState.showRaw, isTrue);
       expect(layerState.showCurrent, isTrue);
     });
 
@@ -261,7 +260,7 @@ void main() {
         afterLoad: (layerState, tracker) async {
           expect(tracker.calls, 0,
               reason: 'the restoration itself must not have saved anything');
-          layerState.setRaw(false);
+          layerState.setMasks(false);
         },
       );
 

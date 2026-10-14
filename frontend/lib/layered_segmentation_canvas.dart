@@ -33,18 +33,16 @@ class Segment {
   });
 }
 
-/// A widget that displays an image and its segmentations in four distinct,
+/// A widget that displays an image and its segmentations in three distinct,
 /// toggleable layers:
 /// 1. [Original]: Pass 0 — the true original image, never overwritten by a
 ///    scrub.
 /// 2. [Masks]: Colored overlays representing the segmentation masks.
-/// 3. [Raw]: The parts of the CURRENT-pass image "cut out" by the masks —
-///    a live preview against what's actually on screen right now, not a
-///    long-since-scrubbed original.
-/// 4. [Current]: The current-pass working image, drawn directly (the same
-///    source [Raw] cuts from). Replaces the old "Final" layer, whose
-///    per-segment `retouchedImage` compositing mechanism was never
-///    populated by anything in this codebase and has been retired.
+/// 3. [Current]: The current-pass working image, drawn directly. Replaces
+///    the old "Final" layer, whose per-segment `retouchedImage` compositing
+///    mechanism was never populated by anything in this codebase and has
+///    been retired. (There used to be a "Raw" cutout layer between Masks and
+///    Current; it duplicated what Masks already shows and was removed.)
 class LayeredSegmentationCanvas extends StatelessWidget {
   final ui.Image originalImage;
   final ui.Image currentImage;
@@ -94,20 +92,7 @@ class LayeredSegmentationCanvas extends StatelessWidget {
                   size: Size.infinite,
                 ),
               ),
-              // Layer 3: Raw Cutouts from the CURRENT-pass image, not pass 0
-              // — a live cutout preview should check a selection against
-              // what's actually on screen right now.
-              Visibility(
-                visible: layerState.showRaw,
-                child: CustomPaint(
-                  painter: RawCutoutsPainter(
-                    image: currentImage,
-                    segments: segments,
-                  ),
-                  size: Size.infinite,
-                ),
-              ),
-              // Layer 4: Current — the current-pass working image itself.
+              // Layer 3: Current — the current-pass working image itself.
               Visibility(
                 visible: layerState.showCurrent,
                 child: CustomPaint(
@@ -270,42 +255,7 @@ class MasksPainter extends CustomPainter {
 }
 
 
-/// Layer 3: Draws the parts of [image] that correspond to the masks.
-class RawCutoutsPainter extends CustomPainter {
-  final ui.Image image;
-  final List<Segment> segments;
-
-  RawCutoutsPainter({required this.image, required this.segments});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final imageRect = Rect.fromLTWH(0, 0, size.width, size.height);
-
-    for (final segment in segments) {
-      // Create a temporary drawing layer.
-      canvas.saveLayer(imageRect, Paint());
-
-      // Draw the source image into the temporary layer.
-      canvas.drawImage(image, Offset.zero, Paint());
-
-      // Use BlendMode.dstIn to keep the destination (image) pixels only where
-      // the source (mask path) is drawn, effectively creating a cutout.
-      final maskPaint = Paint()..blendMode = BlendMode.dstIn;
-      canvas.drawPath(segment.path, maskPaint);
-
-      // Composite the temporary layer back onto the main canvas.
-      canvas.restore();
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant RawCutoutsPainter oldDelegate) {
-    return image != oldDelegate.image ||
-        !listEquals(segments, oldDelegate.segments);
-  }
-}
-
-/// Layer 4: Draws the current-pass working image directly. Replaces the old
+/// Layer 3: Draws the current-pass working image directly. Replaces the old
 /// "Final" concept: nothing in this codebase ever populated a per-segment
 /// retouched composite, and what "Final" was actually trying to preview
 /// ("the whole page as it currently stands") is exactly what the current

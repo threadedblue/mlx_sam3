@@ -40,6 +40,16 @@ class LBSCard extends StatelessWidget {
   final bool isScrubbing;
   final VoidCallback onScrub;
 
+  /// Whether there is a scrub to step back from. Optional so the card works
+  /// unchanged where undo is not wired.
+  final bool canUndo;
+  final bool isUndoing;
+  final VoidCallback? onUndo;
+
+  /// Why the last undo was refused (e.g. captioned work would be lost), shown
+  /// under the button; null when there is nothing to say.
+  final String? undoMessage;
+
   const LBSCard({
     super.key,
     required this.pendingCount,
@@ -47,6 +57,10 @@ class LBSCard extends StatelessWidget {
     required this.lastScrubLabel,
     required this.isScrubbing,
     required this.onScrub,
+    this.canUndo = false,
+    this.isUndoing = false,
+    this.onUndo,
+    this.undoMessage,
   });
 
   @override
@@ -114,6 +128,30 @@ class LBSCard extends StatelessWidget {
                       : const Text('Scrub Selected Regions'),
                 ),
               ),
+              if (onUndo != null) ...[
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    key: const Key('undo-scrub'),
+                    onPressed: (canUndo && !isUndoing && !isScrubbing) ? onUndo : null,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+                    ),
+                    child: const Text('Undo last scrub'),
+                  ),
+                ),
+                if (undoMessage != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    undoMessage!,
+                    key: const Key('undo-message'),
+                    style: textTheme.bodySmall?.copyWith(color: Colors.amber),
+                  ),
+                ],
+              ],
             ],
           ),
         ),

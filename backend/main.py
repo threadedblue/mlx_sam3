@@ -728,6 +728,7 @@ async def lama_scrub(request: LamaScrubRequest):
         # zero-balloon page never shows a phantom WB layer. A scrub is the
         # only moment this can change.
         "wb_scrub_pass": sf_session.wb_scrub_pass,
+        "can_undo": bool(sf_session.scrub_history),
     }
 
 
@@ -1020,6 +1021,80 @@ async def set_mask_held(request: SetHeldRequest):
         "mask_id": record.mask_id,
         "held": record.held,
         "all_masks": serialize_sf_masks_all_passes(sf_session),
+    }
+
+
+class RemoveMaskRequest(BaseModel):
+    session_id: str
+    mask_id: str
+
+
+@app.post("/mask/remove")
+async def remove_mask(request: RemoveMaskRequest):
+    """Delete a current-pass selection (the "masked by mistake" action) —
+    sf_engine.SFSession.remove_mask. Nothing is inpainted."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+
+    try:
+        record = sf_session.remove_mask(request.mask_id)
+    except sf_engine.UnknownMaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return {
+        "session_id": request.session_id,
+        "removed_mask_id": record.mask_id,
+        # The current pass's selections, shaped like a /segment/* result, so
+        # the client redraws from the same source of truth.
+        "result": serialize_sf_masks(sf_session, sf_session.state),
+        "all_masks": serialize_sf_masks_all_passes(sf_session),
+    }
+
+
+@app.post("/lama/undo")
+async def lama_undo(request: SessionRequest):
+    """Undo the most recent scrub — sf_engine.SFSession.undo_last_scrub.
+    Returns the restored pass's image and masks, shaped like /lama/scrub so
+    the client reuses its handling. 409 (with the reason) when undoing would
+    lose captioned work or there is nothing to undo."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    session = service.get_session(request.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=400, detail="Session has no image uploaded yet")
+
+    try:
+        undone = sf_session.undo_last_scrub()
+    except sf_engine.CannotUndoScrubError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    session["state"] = sf_session.state
+
+    image = sf_session.image_for_pass(sf_session.pass_)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return {
+        "session_id": request.session_id,
+        "image_b64": base64.b64encode(buf.getvalue()).decode("utf-8"),
+        "width": image.width,
+        "height": image.height,
+        "pass": sf_session.pass_,
+        "undone_from_pass": undone.to_pass,
+        "restored_held_mask_ids": list(undone.mask_ids),
+        "can_undo": bool(sf_session.scrub_history),
+        "result": serialize_sf_masks(sf_session, sf_session.state),
+        "all_masks": serialize_sf_masks_all_passes(sf_session),
+        "wb_scrub_pass": sf_session.wb_scrub_pass,
     }
 
 

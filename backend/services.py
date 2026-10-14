@@ -1077,8 +1077,25 @@ class SegmentationService:
         page_path.write_bytes(payload["page_jpeg_bytes"])
 
         return {
+            # Contract marker. DN's LLM node recognises a Seg Forge export by
+            # this value alone, so bump it on any breaking change to the shape.
+            "schema": "sf.llm_payload/v1",
             "session_id": session_id,
+            # The page's source image name — DN names each loraset page folder
+            # from it. Empty when the session never recorded one.
+            "original_filename": (
+                (self.get_session(session_id) or {}).get("original_filename") or ""
+            ),
+            # The session's own name (e.g. "page_000"): DN labels the loraset
+            # page folder with it, falling back to the image file name.
+            "session_name": (
+                ((self.get_session(session_id) or {}).get("name") or "").strip()
+            ),
             "page": {
+                # The page as data, not just a path: the consumer is a
+                # different process (often a different machine's view of the
+                # filesystem) and has to send the pixels to a vision model.
+                "page_b64": _b64(payload["page_jpeg_bytes"]),
                 "page_path": str(page_path),
                 "page_pass": payload["page_pass"],
                 "page_rule": payload["page_rule"],

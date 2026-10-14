@@ -417,7 +417,7 @@ void main() {
         .single;
 
     testWidgets(
-        'Original stays pinned to pass 0 across a simulated scrub; Raw and Current follow the current pass',
+        'Original stays pinned to pass 0 across a simulated scrub; Current follows the current pass',
         (tester) async {
       // "Load": pass 0 and the current pass start out identical, matching
       // main.dart setting _originalUiImage/_uiImage from the same decoded
@@ -430,7 +430,6 @@ void main() {
 
       expect(painterOf<OriginalImagePainter>(tester).image, same(pass0));
       expect(painterOf<CurrentImagePainter>(tester).image, same(pass0));
-      expect(painterOf<RawCutoutsPainter>(tester).image, same(pass0));
 
       // "Scrub": only the current-pass slot moves, exactly like
       // _scrubLamaBackground's setState block in main.dart — originalImage
@@ -445,8 +444,6 @@ void main() {
           reason: 'Original must still show pass 0, unchanged, after a scrub');
       expect(painterOf<CurrentImagePainter>(tester).image, same(pass1),
           reason: 'Current must reflect the post-scrub image');
-      expect(painterOf<RawCutoutsPainter>(tester).image, same(pass1),
-          reason: 'Raw cuts from the current pass, not pass 0 — SETTLED in the v3 spec');
     });
   });
 

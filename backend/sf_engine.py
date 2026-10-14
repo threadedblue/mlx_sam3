@@ -149,6 +149,14 @@ class ScrubRecord:
     from_pass: int
     to_pass: int
     mask_ids: tuple[str, ...]
+    # What `wb_scrub_pass` was BEFORE this scrub ran, so undoing it can put
+    # the Display Layers "WB-scrub result" layer back exactly. Defaulted so a
+    # record rebuilt from storage (which never persisted it) still constructs.
+    prev_wb_scrub_pass: Optional[int] = None
+
+
+class CannotUndoScrubError(ValueError):
+    """Undo was refused; the message says why and what to do about it."""
 
 
 class ImmutableOriginal:
@@ -515,6 +523,11 @@ class SFSession:
         # still exported.
         self._pass_images: dict[int, Image.Image] = {}
         self.last_scrub: Optional[ScrubRecord] = None
+        # Every scrub this session has done, oldest first, so scrubs can be
+        # undone one after another down to the page as first loaded. In
+        # memory only: a reloaded session knows just its `last_scrub`, so it
+        # can undo one level (see `restore`).
+        self.scrub_history: list[ScrubRecord] = []
         # Which pass a WB (word-balloon) scrub produced, or None if one has
         # never run. v4 §2's layer table calls this layer "WB-scrub result"
         # and expects it at pass 1 — but pass 1 only MEANS that if Balloon
@@ -586,6 +599,7 @@ class SFSession:
         self._pass_images = dict(pass_images)
         self.masks = list(masks)
         self.last_scrub = last_scrub
+        self.scrub_history = [last_scrub] if last_scrub is not None else []
         self.wb_scrub_pass = wb_scrub_pass
         # `None` means "this caller has no panels to restore", which for a
         # session saved before panels existed is the same as "none were ever
@@ -932,6 +946,81 @@ class SFSession:
             )
         return self._update(mask_id, held=held)
 
+    def remove_mask(self, mask_id: str) -> MaskRecord:
+        """Delete a selection made in the CURRENT pass — the "I masked that
+        by mistake" action. Returns the removed record.
+
+        Current pass only: an earlier pass's record is already part of that
+        pass's history (it may have been scrubbed or exported), so removing
+        it is a different, riskier action and is refused rather than done
+        quietly. A captioned record can be removed; removing it is the
+        user's explicit act and it simply stops being a keeper.
+
+        Pure bookkeeping on `masks`: nothing is inpainted and the pass chain
+        is untouched. SAM3's own grounding state still contains the object,
+        so selecting it again (or running a text prompt that finds it)
+        legitimately brings it back as a fresh record.
+        """
+        record = self.get_mask(mask_id)
+        if record.pass_ != self._pass:
+            raise ValueError(
+                f"cannot remove {mask_id!r}: it belongs to pass {record.pass_}, "
+                f"and only pass {self._pass} selections can be removed"
+            )
+        self.masks = [m for m in self.masks if m.mask_id != mask_id]
+        if self.last_touched_mask_id == mask_id:
+            self.last_touched_mask_id = None
+        return record
+
+    def undo_last_scrub(self) -> ScrubRecord:
+        """Step back one scrub: the pass chain, the held flags and the
+        Display Layers WB layer return to how they were just before it.
+
+        What comes back: the previous pass becomes current, every mask that
+        was held for that scrub is held again, and `wb_scrub_pass` is what it
+        was. What goes away: the scrubbed image, and any selections made in
+        the pass the scrub created (they were traced against pixels that no
+        longer exist).
+
+        REFUSED, not forced, when a selection in the pass being discarded
+        carries a caption: undoing would silently destroy captioned work.
+        The caller is told how many; remove or finish those first.
+
+        Every input is computed before the session is mutated, so if the
+        segmentor's `set_image` raises, nothing has changed.
+        """
+        if not self.scrub_history:
+            raise CannotUndoScrubError("nothing to undo: no scrub has been done in this session")
+        rec = self.scrub_history[-1]
+        if rec.to_pass != self._pass:
+            raise CannotUndoScrubError(
+                f"cannot undo: the last scrub led to pass {rec.to_pass}, but the session is at pass {self._pass}"
+            )
+        kept = [m for m in self.masks if m.pass_ == rec.to_pass and m.dataset_status == DatasetStatus.KEEP]
+        if kept:
+            raise CannotUndoScrubError(
+                f"cannot undo: {len(kept)} captioned selection(s) were made after that scrub "
+                f"and would be lost. Remove them first, or keep working from this pass."
+            )
+
+        previous_image = self.image_for_pass(rec.from_pass)
+        new_state = self.segmentor.set_image(previous_image)
+
+        held_again = set(rec.mask_ids)
+        self.masks = [
+            replace(m, held=True) if m.mask_id in held_again else m
+            for m in self.masks
+            if m.pass_ != rec.to_pass
+        ]
+        self._pass_images.pop(rec.to_pass, None)
+        self.state = new_state
+        self._pass = rec.from_pass
+        self.scrub_history.pop()
+        self.last_scrub = self.scrub_history[-1] if self.scrub_history else None
+        self.wb_scrub_pass = rec.prev_wb_scrub_pass
+        self.last_touched_mask_id = None
+        return rec
+
     def discard_ungrounded_selections(self) -> None:
         """Reset-time cleanup for the CURRENT pass: discard selections that
         exist only because SAM3's now-cleared prompt state was backing
@@ -988,7 +1077,11 @@ class SFSession:
         self.masks = [replace(m, held=False) if m.mask_id in batch_ids else m for m in self.masks]
         self.state = new_state
         self._pass = to_pass
-        self.last_scrub = ScrubRecord(from_pass, to_pass, tuple(m.mask_id for m in batch))
+        self.last_scrub = ScrubRecord(
+            from_pass, to_pass, tuple(m.mask_id for m in batch),
+            prev_wb_scrub_pass=self.wb_scrub_pass,
+        )
+        self.scrub_history.append(self.last_scrub)
         # Derived from what was actually scrubbed, not from a caller's claim
         # or from the pass number: a batch containing balloon-detected masks
         # makes the resulting pass the WB-scrub result, wherever it lands in

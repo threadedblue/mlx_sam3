@@ -624,8 +624,15 @@ class TestExportEndpoint:
 
         assert r.status_code == 200
         body = r.json()
-        assert set(body) == {"session_id", "page", "panels", "segments"}
-        assert set(body["page"]) == {"page_path", "page_pass", "page_rule", "width", "height"}
+        assert set(body) == {"schema", "session_id", "page", "panels", "segments"}
+        assert body["schema"] == "sf.llm_payload/v1"
+        assert set(body["page"]) == {
+            "page_b64", "page_path", "page_pass", "page_rule", "width", "height",
+        }
+        # the page ships as data, and is exactly the bytes written to disk
+        assert base64.b64decode(body["page"]["page_b64"]) == pathlib.Path(
+            body["page"]["page_path"]
+        ).read_bytes()
         assert body["page"]["page_rule"] == "original"
         assert body["page"]["page_pass"] == 0
         seg = body["segments"][0]

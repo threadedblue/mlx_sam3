@@ -276,6 +276,55 @@ class ApiService {
     }
   }
 
+  /// Deletes a current-pass selection (`SFSession.remove_mask`) — the
+  /// "masked by mistake" action. Nothing is inpainted. The response carries
+  /// the pass's remaining selections as `result`.
+  Future<Map<String, dynamic>?> removeMask(String sessionId, String maskId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/mask/remove'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId, 'mask_id': maskId}),
+      );
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      }
+      debugPrint('Remove mask failed: ${response.statusCode} ${response.body}');
+      return null;
+    } catch (e) {
+      debugPrint('Error removing mask: $e');
+      return null;
+    }
+  }
+
+  /// Undoes the most recent scrub (`SFSession.undo_last_scrub`).
+  ///
+  /// Returns `{'ok': true, ...response}` on success, or `{'ok': false,
+  /// 'detail': reason}` when the backend refused (409: nothing to undo, or
+  /// it would lose captioned work) so the caller can show the reason
+  /// instead of a generic failure. Null only if the call itself failed.
+  Future<Map<String, dynamic>?> undoScrub(String sessionId) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/lama/undo'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'session_id': sessionId}),
+      );
+      if (response.statusCode == 200) {
+        return {'ok': true, ...jsonDecode(response.body) as Map<String, dynamic>};
+      }
+      if (response.statusCode == 409) {
+        final detail = (jsonDecode(response.body) as Map<String, dynamic>)['detail'];
+        return {'ok': false, 'detail': '$detail'};
+      }
+      debugPrint('Undo scrub failed: ${response.statusCode} ${response.body}');
+      return null;
+    } catch (e) {
+      debugPrint('Error undoing scrub: $e');
+      return null;
+    }
+  }
+
   /// Detect every speech balloon on the session's current pass and hold each
   /// one for review. Selection only — this never scrubs; the returned shape is
   /// an ordinary selection response, so it flows through the same result
