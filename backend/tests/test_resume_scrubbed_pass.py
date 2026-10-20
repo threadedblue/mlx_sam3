@@ -388,3 +388,61 @@ class TestResumeReportsCurrentPass:
 
         response = service.load_session_from_disk(SID)
         assert response["pass"] == 0
+
+
+# ── Resume does not replay prompts it would throw away ──────────────────────
+
+
+class TestResumeSkipsDiscardedReplay:
+    """A session past pass 0 had its prompts replayed against the ORIGINAL image
+    and the result thrown away (`_reconstruct_sf_session` re-`set_image`s on the
+    current pass). That replay is a SAM3 forward per saved prompt; on a scrubbed
+    session with many prompts it was minutes of unused work."""
+
+    def _count_calls(self, service):
+        calls = {"text": 0, "set_image": 0}
+        seg = service.processor
+        orig_text, orig_set = seg.set_text_prompt, seg.set_image
+
+        def text(prompt, state):
+            calls["text"] += 1
+            return orig_text(prompt, state)
+
+        def set_image(image):
+            calls["set_image"] += 1
+            return orig_set(image)
+
+        seg.set_text_prompt, seg.set_image = text, set_image
+        return calls
+
+    def test_a_scrubbed_session_does_not_replay_its_prompts(self, service):
+        sf_session = _upload(service)
+        service.processor.geo_rects = [RECT_A]
+        rec = sf_session.add_box_selection(_norm_box_100(RECT_A), True)[0]
+        sf_session.set_held(rec.mask_id, True)
+        sf_session.run_lama_pass(PaintingInpainter(color=(255, 0, 0, 255)))
+        service.sessions[SID]["state"] = sf_session.state
+        service.sessions[SID]["prompts"] = ["balloon", "title", "cloud"]
+        service.save_session_to_disk(SID)
+        _restart(service)
+
+        calls = self._count_calls(service)
+        response = service.load_session_from_disk(SID)
+
+        assert calls["text"] == 0, "prompts were replayed into a state that is then discarded"
+        assert calls["set_image"] == 1, "only the current pass's image needs embedding"
+        assert rec.mask_id in response["all_masks"]["mask_ids"]
+        # The session is still fully usable: it has a real state of its own.
+        assert service.sf_sessions[SID].state is service.sessions[SID]["state"]
+        assert service.sf_sessions[SID].state is not None
+
+    def test_a_pass_zero_session_still_replays_its_prompts(self, service):
+        _upload(service)
+        service.sessions[SID]["prompts"] = ["balloon", "title"]
+        service.save_session_to_disk(SID)
+        _restart(service)
+
+        calls = self._count_calls(service)
+        service.load_session_from_disk(SID)
+
+        assert calls["text"] == 2

@@ -74,6 +74,11 @@ PANEL_SOURCE_FULL_PAGE = "_full_page"
 class DatasetStatus(str, Enum):
     UNASSIGNED = "unassigned"
     KEEP = "keep"
+    # "Never needs": a person decided this segment will never be captioned or
+    # trained on (a balloon, a title, anything scrubbed away). Distinct from
+    # UNASSIGNED, which means "not decided yet" and is what the captioner's
+    # batch and the review queue are for. Never exported: only KEEP is.
+    DISCARD = "discard"
 
 
 class UnknownMaskError(KeyError):
@@ -98,6 +103,13 @@ class MaskRecord:
     held: bool = False
     # Set only by SFSession.attach_caption; present iff dataset_status is KEEP.
     caption: Optional[str] = None
+    # A captioner model's UNREVIEWED first attempt. Deliberately separate from
+    # `caption` and never changes `dataset_status`: `keep` + `caption` is what
+    # reaches the training set, so a draft must not be able to. A person
+    # reviewing a draft (edit or approve) goes through `attach_caption`, which
+    # leaves the draft in place so "approved unchanged" vs "edited" is
+    # `caption == draft_caption`.
+    draft_caption: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -358,7 +370,7 @@ def _best_match(
 def _carries_user_state(record: MaskRecord) -> bool:
     """Whether the user has attached anything to this record that SAM3's
     re-grounding knows nothing about and must not be able to discard."""
-    return record.dataset_status == DatasetStatus.KEEP or record.held
+    return record.dataset_status != DatasetStatus.UNASSIGNED or record.held
 
 
 def _b64(data: bytes) -> str:
@@ -876,6 +888,37 @@ class SFSession:
         assert updated is not None
         return updated
 
+    def set_draft_caption(self, mask_id: str, draft: str) -> MaskRecord:
+        """Record a model's draft. Never touches `caption`/`dataset_status`.
+
+        A mask a person has already captioned (`keep`) is left alone: the
+        draft is an attempt at work that is done, and overwriting it would
+        lose the record of what the model said before the person edited.
+        """
+        if not draft or not draft.strip():
+            raise ValueError("draft caption must be non-empty")
+        record = self.get_mask(mask_id)
+        if record.dataset_status is DatasetStatus.KEEP and record.draft_caption:
+            return record
+        return self._update(mask_id, draft_caption=draft.strip())
+
+    def set_never(self, mask_id: str, never: bool) -> MaskRecord:
+        """Mark a segment "never needs" (`discard`), or take the mark back.
+
+        A captioned (`keep`) segment is refused: marking it would silently drop
+        a training pair, so a person must clear its caption first. Clearing the
+        mark returns a `discard` segment to `unassigned`; anything else is left
+        as it is.
+        """
+        record = self.get_mask(mask_id)
+        if never:
+            if record.dataset_status is DatasetStatus.KEEP:
+                raise ValueError("this segment is captioned; a captioned segment cannot be marked never-needs")
+            return self._update(mask_id, dataset_status=DatasetStatus.DISCARD)
+        if record.dataset_status is DatasetStatus.DISCARD:
+            return self._update(mask_id, dataset_status=DatasetStatus.UNASSIGNED)
+        return record
+
     def attach_caption(self, mask_id: str, caption: str) -> MaskRecord:
         """Caption an existing selection, which marks it `keep`.
 
@@ -887,6 +930,19 @@ class SFSession:
         if not caption or not caption.strip():
             raise ValueError("caption must be non-empty; a keep record with no caption never reaches the training set")
         return self._update(mask_id, dataset_status=DatasetStatus.KEEP, caption=caption)
+
+    def clear_caption(self, mask_id: str) -> MaskRecord:
+        """Delete a segment's caption: `keep` goes back to `unassigned`.
+
+        The model draft is dropped too, so a deleted caption leaves the segment
+        plainly uncaptioned (and eligible for another captioner run) instead of
+        resurfacing as a draft awaiting review. A segment that is not captioned
+        is left as it is.
+        """
+        record = self.get_mask(mask_id)
+        if record.dataset_status is not DatasetStatus.KEEP:
+            return record
+        return self._update(mask_id, dataset_status=DatasetStatus.UNASSIGNED, caption=None, draft_caption=None)
 
     # -- panels (v4 §4: layout regions, never objects) ------------------------
 

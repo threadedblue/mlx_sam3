@@ -1,3 +1,4 @@
+import 'action_button_style.dart';
 import 'package:flutter/material.dart';
 
 /// "Save" card: writes the current session to storage on an explicit click
@@ -45,13 +46,7 @@ class SaveCard extends StatelessWidget {
                 width: double.infinity,
                 child: ElevatedButton(
                   onPressed: (!hasSession || isLoading) ? null : onSave,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF007F00),
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(24),
-                    ),
-                  ),
+                  style: actionButtonStyle(busy: isLoading),
                   child: const Text("Save"),
                 ),
               ),

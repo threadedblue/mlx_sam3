@@ -1,3 +1,4 @@
+import 'action_button_style.dart';
 import 'package:flutter/material.dart';
 
 import '../layered_segmentation_canvas.dart';
@@ -117,11 +118,7 @@ class ObjectsSelectedCard extends StatelessWidget {
                 width: double.infinity,
                 child: OutlinedButton(
                   onPressed: enabled ? onClearPrompts : null,
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    side: const BorderSide(color: Colors.white),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-                  ),
+                  style: actionButtonStyle(),
                   child: const Text("Clear Prompts"),
                 ),
               ),

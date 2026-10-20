@@ -45,6 +45,7 @@ from services import (
     serialize_panels,
 )
 import aa_persistence
+import captioner
 import sf_engine
 import balloon_detector
 import source_fingerprint
@@ -104,18 +105,63 @@ STORAGE_DIR = BASE_DIR.parent.parent / "storage" / "sessions"
 INFERENCE_DIR = BASE_DIR.parent.parent / "storage" / "inference"
 INFERENCE_CONFIG = BASE_DIR.parent.parent / "storage" / "inference_config.json"
 
+# ── Timestamped diagnostics ──────────────────────────────────────────────────
+# Output was block-buffered under launchd and carried no times, so a slow start
+# or a stalled /health could not be read from the log. Line-buffer stdout and
+# stamp every message, every uvicorn access line, and any stretch where the
+# event loop was blocked (while it is, /health cannot be answered).
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+_PROCESS_START = time.monotonic()
+
+
+def tlog(message: str) -> None:
+    """A timestamped line, with seconds since process start."""
+    stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"{stamp} [+{time.monotonic() - _PROCESS_START:7.1f}s] {message}", flush=True)
+
+
+def _stamp_uvicorn_access_log() -> None:
+    import logging
+
+    for name in ("uvicorn.access", "uvicorn.error"):
+        for handler in logging.getLogger(name).handlers:
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
+
+
+async def _watch_event_loop(threshold: float = 0.5, interval: float = 0.25) -> None:
+    """Report any time the event loop was unavailable for longer than
+    [threshold] seconds. A synchronous call inside an `async def` handler (a
+    session load, a model pass) blocks every other request, /health included."""
+    last = time.monotonic()
+    while True:
+        await asyncio.sleep(interval)
+        now = time.monotonic()
+        blocked = now - last - interval
+        if blocked > threshold:
+            tlog(f"EVENT LOOP BLOCKED for {blocked:.1f}s (health and every other request waited)")
+        last = now
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup."""
     load_dotenv()
+    _stamp_uvicorn_access_log()
+    tlog("startup: begin (the port does not accept connections until this finishes)")
 
     global model, processor
 
     sam3_root = os.path.dirname(sam3.__file__)
 
+    t0 = time.monotonic()
     model = build_sam3_image_model()
     processor = Sam3Processor(model)
-    print("SAM3 model loaded successfully!")
+    tlog(f"SAM3 model loaded successfully! ({time.monotonic() - t0:.1f}s)")
 
     # Initialize Service Layer
     global service
@@ -132,7 +178,12 @@ async def lifespan(app: FastAPI):
     # Pre-load last-used inference model in background (non-blocking)
     _maybe_preload_inference_model()
 
+    watcher = asyncio.create_task(_watch_event_loop())
+    tlog("startup: complete, accepting requests")
+
     yield
+
+    watcher.cancel()
 
     # Release inference pipeline VRAM on shutdown
     try:
@@ -657,6 +708,9 @@ async def segment_balloons(request: SessionRequest):
         )
         for record in records:
             sf_session.set_held(record.mask_id, True)
+            # A detected balloon is scrubbed out of the page and never
+            # captioned: mark it so it never enters the caption queue.
+            sf_session.set_never(record.mask_id, True)
             held.append(record.mask_id)
 
     processing_time_ms = (time.perf_counter() - start_time) * 1000
@@ -1127,6 +1181,139 @@ async def attach_mask_caption(request: AttachCaptionRequest):
     }
 
 
+class ClearCaptionsRequest(BaseModel):
+    session_id: str
+    mask_ids: List[str]
+
+
+@app.post("/mask/caption/clear")
+async def clear_mask_captions(request: ClearCaptionsRequest):
+    """Delete captions: each listed segment goes back to uncaptioned
+    (sf_engine.SFSession.clear_caption). All ids are validated first."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+    try:
+        for mask_id in request.mask_ids:
+            sf_session.get_mask(mask_id)
+    except sf_engine.UnknownMaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    for mask_id in request.mask_ids:
+        sf_session.clear_caption(mask_id)
+    # Persistence is explicit-Save-only — no autosave here.
+    return {"session_id": request.session_id, "all_masks": serialize_sf_masks_all_passes(sf_session)}
+
+
+class MaskNeverRequest(BaseModel):
+    session_id: str
+    mask_ids: List[str]
+    never: bool
+
+
+@app.post("/mask/never")
+async def set_masks_never(request: MaskNeverRequest):
+    """Mark segments "never needs" (or take the mark back) — the Captions
+    table's checkbox. All-or-nothing: every id is validated before any change,
+    so a bulk tick can't half-apply."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+    try:
+        records = [sf_session.get_mask(mask_id) for mask_id in request.mask_ids]
+    except sf_engine.UnknownMaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if request.never:
+        captioned = [r.mask_id for r in records if r.dataset_status is sf_engine.DatasetStatus.KEEP]
+        if captioned:
+            raise HTTPException(status_code=422, detail=f"{len(captioned)} segment(s) are captioned and cannot be marked never-needs")
+    for record in records:
+        sf_session.set_never(record.mask_id, request.never)
+    # Persistence is explicit-Save-only — no autosave here.
+    return {
+        "session_id": request.session_id,
+        "never": request.never,
+        "all_masks": serialize_sf_masks_all_passes(sf_session),
+    }
+
+
+class CaptionerRunRequest(BaseModel):
+    session_id: str
+    # None = every mask with neither a caption nor a draft yet.
+    mask_ids: Optional[List[str]] = None
+
+
+@app.get("/captioner/config")
+async def captioner_config():
+    """What the captioner will run with, and whether it can run at all."""
+    cfg = captioner.config()
+    return {**cfg, "ready": bool(cfg["python"])}
+
+
+@app.post("/captioner/run")
+async def captioner_run(request: CaptionerRunRequest):
+    """Draft captions with the trained captioner, in the background.
+
+    Results land as DRAFTS (`draft_caption`), never as `caption`/`keep`: only
+    a person's edit or approval (`/mask/caption`) makes a caption trainable.
+    Poll `/captioner/status/{job_id}`; the table's `all_masks` refresh shows
+    drafts as they arrive."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not available")
+    sf_session = service.get_or_create_sf_session(request.session_id)
+    if sf_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or has no image yet")
+    if not captioner.config()["python"]:
+        raise HTTPException(
+            status_code=503,
+            detail="No captioner available: set SF_CAPTIONER_PYTHON to a Python with mlx-vlm installed.",
+        )
+
+    wanted = request.mask_ids if request.mask_ids is not None else captioner.masks_needing_draft(sf_session.masks)
+    for mask_id in wanted:
+        try:
+            sf_session.get_mask(mask_id)
+        except sf_engine.UnknownMaskError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+    if not wanted:
+        return {"job_id": None, "total": 0}
+
+    def caption_one(mask_id: str) -> None:
+        mask = sf_session.get_mask(mask_id)
+        image = sf_session.image_for_pass(mask.pass_)
+        png = sf_engine.segment_crop_png_bytes(image, mask.geometry)
+        sf_session.set_draft_caption(mask_id, captioner.caption_png(png))
+
+    try:
+        job = captioner.start(wanted, caption_one)
+    except captioner.CaptionerError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"job_id": job.id, "total": job.total}
+
+
+@app.get("/captioner/status/{job_id}")
+async def captioner_status(job_id: str, session_id: str):
+    info = captioner.status(job_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail="Unknown captioner job")
+    result = dict(info)
+    if service is not None:
+        sf_session = service.get_or_create_sf_session(session_id)
+        if sf_session is not None:
+            result["all_masks"] = serialize_sf_masks_all_passes(sf_session)
+    return result
+
+
+@app.post("/captioner/cancel/{job_id}")
+async def captioner_cancel(job_id: str):
+    if not captioner.cancel(job_id):
+        raise HTTPException(status_code=404, detail="Unknown captioner job")
+    return {"cancelled": True}
+
+
 @app.post("/dataset/compile")
 async def compile_dataset(request: CompileDatasetRequest):
     """Compiles a LoRA training set from every saved session's kept,
@@ -1415,6 +1602,8 @@ async def load_session(session_id: str):
     image dimensions and prompt results. This allows the frontend to fully
     reconstruct and display a previously saved session.
     """
+    t0 = time.monotonic()
+    tlog(f"loadSession {session_id[:8]}: begin")
     try:
         return service.load_session_from_disk(session_id)
     except FileNotFoundError as e:
@@ -1422,6 +1611,8 @@ async def load_session(session_id: str):
     except Exception as e:
         # A general catch-all for other potential file or system errors.
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+    finally:
+        tlog(f"loadSession {session_id[:8]}: done in {time.monotonic() - t0:.1f}s")
 
 @app.post("/updateState", response_model=Dict[str, Any])
 async def update_state(request: SessionRequest):

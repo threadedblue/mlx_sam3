@@ -1,3 +1,4 @@
+import 'action_button_style.dart';
 import 'package:flutter/material.dart';
 
 /// LaMa Background Scrub card: triggers a scrub of the current pass's held
@@ -113,11 +114,7 @@ class LBSCard extends StatelessWidget {
                   // no visible effect. Falls out naturally once
                   // _scrubLamaBackground clears `_segments` post-scrub.
                   onPressed: (isScrubbing || !hasSelection) ? null : onScrub,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF007F00),
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-                  ),
+                  style: actionButtonStyle(busy: isScrubbing),
                   child: isScrubbing
                       ? const SizedBox(
                           // Same 20x20/strokeWidth 2 as ResultCell's spinner.
@@ -135,11 +132,7 @@ class LBSCard extends StatelessWidget {
                   child: OutlinedButton(
                     key: const Key('undo-scrub'),
                     onPressed: (canUndo && !isUndoing && !isScrubbing) ? onUndo : null,
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white,
-                      side: const BorderSide(color: Colors.white),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-                    ),
+                    style: actionButtonStyle(busy: isUndoing),
                     child: const Text('Undo last scrub'),
                   ),
                 ),

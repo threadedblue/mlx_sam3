@@ -9,6 +9,7 @@
 //
 // If your current ApiService only accepts File, update it to accept bytes, or create an overload.
 
+import 'widgets/action_button_style.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -17,6 +18,7 @@ import 'dart:ui' as ui;
 import 'package:http/http.dart' as http;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:file_picker/file_picker.dart';
 import 'package:aa_preview_table/aa_preview_table.dart';
 
@@ -30,6 +32,8 @@ import 'models/result_datum.dart';
 import 'widgets/result_cell.dart';
 import 'widgets/balloon_scrub_card.dart';
 import 'widgets/panels_card.dart';
+import 'widgets/captions_tab.dart';
+import 'widgets/captions_card.dart';
 import 'widgets/box_select_card.dart';
 import 'widgets/lbs_card.dart';
 import 'widgets/objects_selected_card.dart';
@@ -395,13 +399,8 @@ class _SessionPickerScreenState extends State<SessionPickerScreen> {
               width: double.infinity,
               child: ElevatedButton(
                 onPressed: _createNew,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.green,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(24),
-                  ),
+                style: actionButtonStyle().copyWith(
+                  padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 12)),
                 ),
                 child: const Text('+ New Session'),
               ),
@@ -476,6 +475,8 @@ class _HomeScreenState extends State<HomeScreen> {
   // was scrubbed past, when `_result` reset to null — confirmed live, the
   // exact case reported ("I did the scrub. AA preview shows nothing.").
   Map<String, dynamic>? _aaPreviewData;
+  /// Bumped by the Captions card; the display tabs switch to the Captions tab.
+  final ValueNotifier<int> _openCaptionsRequest = ValueNotifier<int>(0);
   List<Segment> _segments = [];
   // Dirty tracking for the "Unsaved Changes" prompt (_hasUnsavedWork
   // below). _mutationCount increments once per successful call to every
@@ -491,6 +492,14 @@ class _HomeScreenState extends State<HomeScreen> {
   int _mutationCount = 0;
   int _savedAtMutationCount = 0;
   bool _isLoading = false;
+
+  // Captioner run (Captioner card). One run at a time; polled while it works.
+  String? _captionerJobId;
+  String? _captionerSession;
+  String? _captionerProgress;
+  String? _captionerError;
+  int _captionerDone = 0;
+  Timer? _captionerTimer;
   String? _error;
   String _backendStatus = "checking";
   SelectionMode? _selectedMode;
@@ -637,6 +646,8 @@ class _HomeScreenState extends State<HomeScreen> {
     _textController.removeListener(_onPromptTextChanged);
     _textController.dispose();
     _layerState?.removeListener(_onLayerStateChanged);
+    _openCaptionsRequest.dispose();
+    _captionerTimer?.cancel();
     super.dispose();
   }
 
@@ -1166,6 +1177,165 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _error = e.toString());
     } finally {
       if (mounted) setState(() { _isLoading = false; _textPromptRunning = false; });
+    }
+  }
+
+  /// The Captions tab's save: re-captions an already-captioned mask. Returns
+  /// an error message, or null on success. The backend overwrites the stored
+  /// caption (`/mask/caption`) and returns the refreshed all-passes ledger; like
+  /// every mutation it counts as unsaved work until the session is saved.
+  Future<String?> _saveEditedCaption(String maskId, String caption) async {
+    final sessionId = _sessionId;
+    if (sessionId == null) return 'No session is open.';
+    try {
+      final response = await _api.attachCaption(sessionId, maskId, caption);
+      if (!mounted) return null;
+      if (response == null) return 'The server returned nothing.';
+      setState(() {
+        _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+        _mutationCount++;
+      });
+      return null;
+    } catch (e) {
+      return e.toString().replaceFirst('Exception: ', '');
+    }
+  }
+
+  /// Runs the captioner over every segment with neither a caption nor a draft.
+  /// Results arrive as drafts the table shows under "Needs review"; nothing is
+  /// kept (and nothing reaches training) until a person edits or approves it.
+  Future<void> _runCaptioner() async {
+    final sessionId = _sessionId;
+    if (sessionId == null || _captionerJobId != null) return;
+    setState(() {
+      _captionerError = null;
+      _captionerProgress = 'Starting…';
+      _captionerDone = 0;
+    });
+    try {
+      final started = await _api.runCaptioner(sessionId);
+      if (!mounted) return;
+      final jobId = started['job_id'] as String?;
+      if (jobId == null) {
+        setState(() => _captionerProgress = null);
+        return;
+      }
+      setState(() {
+        _captionerJobId = jobId;
+        _captionerSession = sessionId;
+        _captionerProgress = '0 of ${started['total']}';
+      });
+      _captionerTimer?.cancel();
+      _captionerTimer = Timer.periodic(const Duration(seconds: 2), (_) => _pollCaptioner());
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _captionerProgress = null;
+        _captionerError = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  Future<void> _pollCaptioner() async {
+    final jobId = _captionerJobId;
+    final sessionId = _captionerSession;
+    if (jobId == null || sessionId == null) return;
+    try {
+      final status = await _api.captionerStatus(sessionId, jobId);
+      if (!mounted || _captionerJobId != jobId) return;
+      final done = (status['done'] as num?)?.toInt() ?? 0;
+      final total = (status['total'] as num?)?.toInt() ?? 0;
+      final failed = (status['failed'] as List?)?.length ?? 0;
+      final state = status['state'] as String? ?? 'running';
+      final finished = state != 'running';
+      setState(() {
+        // Only adopt the ledger if the user is still looking at that session.
+        if (sessionId == _sessionId && status['all_masks'] is Map<String, dynamic>) {
+          _aaPreviewData = status['all_masks'] as Map<String, dynamic>;
+        }
+        if (done != _captionerDone) {
+          _captionerDone = done;
+          _mutationCount++; // drafts are session data: unsaved until Save
+        }
+        _captionerProgress = '$done of $total';
+        if (finished) {
+          _captionerJobId = null;
+          _captionerProgress = null;
+          if (failed > 0) {
+            _captionerError = '$failed segment${failed == 1 ? '' : 's'} could not be captioned'
+                '${status['last_error'] != null ? ': ${status['last_error']}' : ''}';
+          }
+        }
+      });
+      if (finished) {
+        _captionerTimer?.cancel();
+        _openCaptionsRequest.value++; // show the table, on Needs review
+      }
+    } catch (e) {
+      // A dropped poll is not a failed run; the next tick tries again.
+      debugPrint('Captioner status poll failed: $e');
+    }
+  }
+
+  /// The Captions table's "Never" checkbox. Applies at once; like every
+  /// mutation it is unsaved work until the session is saved. Returns an error
+  /// message, or null.
+  Future<String?> _setMasksNever(List<String> maskIds, bool never) async {
+    final sessionId = _sessionId;
+    if (sessionId == null) return 'No session is open.';
+    try {
+      final response = await _api.setMasksNever(sessionId, maskIds, never);
+      if (!mounted) return null;
+      setState(() {
+        _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+        _mutationCount++;
+      });
+      // Keep the canvas's own copy in step, so a never-needs mask no longer
+      // offers the caption box.
+      for (final id in maskIds) {
+        _patchMaskLocally(id, datasetStatus: never ? 'discard' : 'unassigned');
+      }
+      return null;
+    } catch (e) {
+      return e.toString().replaceFirst('Exception: ', '');
+    }
+  }
+
+  /// The Captions table's "Delete caption": the segment goes back to
+  /// uncaptioned. Unsaved work until the session is saved. Returns an error
+  /// message, or null.
+  Future<String?> _clearCaptions(List<String> maskIds) async {
+    final sessionId = _sessionId;
+    if (sessionId == null) return 'No session is open.';
+    try {
+      final response = await _api.clearCaptions(sessionId, maskIds);
+      if (!mounted) return null;
+      setState(() {
+        _aaPreviewData = response['all_masks'] as Map<String, dynamic>?;
+        _mutationCount++;
+      });
+      for (final id in maskIds) {
+        _patchMaskLocally(id, datasetStatus: 'unassigned');
+      }
+      return null;
+    } catch (e) {
+      return e.toString().replaceFirst('Exception: ', '');
+    }
+  }
+
+  /// The caption table's session save. Same call and the same unsaved-work
+  /// bookkeeping as [_saveSession] (the Save card), but it reports failure to the
+  /// table instead of the page's error banner. Returns an error message, or null.
+  Future<String?> _saveSessionForTable() async {
+    final sessionId = _sessionId;
+    if (sessionId == null) return 'No session is open.';
+    try {
+      final response = await _api.saveSession(sessionId);
+      if (!mounted) return null;
+      if (response != null) setState(() => _savedAtMutationCount = _mutationCount);
+      return null;
+    } catch (e) {
+      return e.toString().replaceFirst('Exception: ', '');
     }
   }
 
@@ -1769,6 +1939,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   if (_showsCard(SfCard.displayLayers))
                     _buildCardRow(_buildSegmentLayersCard(), const ResultCell(isRunning: false, data: [])),
                   const SizedBox(height: 16),
+                  if (_showsCard(SfCard.captions))
+                    _buildCardRow(_buildCaptionsCard(),      const ResultCell(isRunning: false, data: [])),
+                  const SizedBox(height: 16),
                   if (_showsCard(SfCard.save))
                     _buildCardRow(_buildSaveCard(),          const ResultCell(isRunning: false, data: [])),
                   if (_error != null) ...[
@@ -1818,6 +1991,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 onBoxDrawn: _sendBoxPrompt,
                 onPointDrawn: _sendPointPrompt,
                 onPanelDrawn: (b) => _addPanel(b[0], b[1], b[2], b[3]),
+                onCaptionSave: _saveEditedCaption,
+                onCaptionSaveSession: _saveSessionForTable,
+                onCaptionNever: _setMasksNever,
+                onCaptionClear: _clearCaptions,
+                openCaptionsRequest: _openCaptionsRequest,
               ),
             ),
           ),
@@ -1927,13 +2105,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   icon: const Icon(Icons.folder_open, size: 16),
                   label: const Text("Switch Session"),
                   onPressed: _switchSession,
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    side: const BorderSide(color: Colors.white),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(24),
-                    ),
-                  ),
+                  style: actionButtonStyle(),
                 ),
               ),
             ],
@@ -2168,6 +2340,20 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _buildCaptionsCard() {
+    final all = segmentEntriesFrom(_aaPreviewData);
+    return CaptionsCard(
+      blank: all.where((e) => !e.captioned && !e.needsReview && !e.never).length,
+      never: all.where((e) => e.never).length,
+      captioned: all.where((e) => e.captioned).length,
+      hasSession: _sessionId != null,
+      onRun: _runCaptioner,
+      running: _captionerJobId != null || _captionerProgress != null,
+      progress: _captionerProgress,
+      runError: _captionerError,
+    );
+  }
+
   Widget _buildSaveCard() {
     return SaveCard(
       hasSession: _sessionId != null,
@@ -2217,6 +2403,20 @@ class DisplayAreaTabs extends StatefulWidget {
   /// `[x0, y0, x1, y1]` — not the normalised cx/cy/w/h [onBoxDrawn] uses,
   /// because /panel/add stores page pixels verbatim.
   final void Function(List<int>) onPanelDrawn;
+  /// Saves an edited caption from the Captions tab; returns an error message,
+  /// or null on success. Null (the default) leaves the tab read-only.
+  final Future<String?> Function(String maskId, String caption)? onCaptionSave;
+  /// Writes the session after the table's edits are applied; null leaves that to
+  /// the Save card.
+  final Future<String?> Function()? onCaptionSaveSession;
+
+  /// Ticks / unticks "never needs" for the Captions table.
+  final Future<String?> Function(List<String> maskIds, bool never)? onCaptionNever;
+
+  /// Deletes captions (segments return to uncaptioned).
+  final Future<String?> Function(List<String> maskIds)? onCaptionClear;
+  /// Each change switches to the Captions tab (the sidebar card's "Open table").
+  final ValueListenable<int>? openCaptionsRequest;
 
   const DisplayAreaTabs({
     super.key,
@@ -2232,6 +2432,11 @@ class DisplayAreaTabs extends StatefulWidget {
     required this.onBoxDrawn,
     required this.onPointDrawn,
     required this.onPanelDrawn,
+    this.onCaptionSave,
+    this.onCaptionSaveSession,
+    this.onCaptionNever,
+    this.onCaptionClear,
+    this.openCaptionsRequest,
   });
 
   @override
@@ -2244,11 +2449,24 @@ class _DisplayAreaTabsState extends State<DisplayAreaTabs> with SingleTickerProv
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
+    widget.openCaptionsRequest?.addListener(_showCaptions);
+  }
+
+  void _showCaptions() => _tabController.animateTo(1);
+
+  @override
+  void didUpdateWidget(DisplayAreaTabs old) {
+    super.didUpdateWidget(old);
+    if (old.openCaptionsRequest != widget.openCaptionsRequest) {
+      old.openCaptionsRequest?.removeListener(_showCaptions);
+      widget.openCaptionsRequest?.addListener(_showCaptions);
+    }
   }
 
   @override
   void dispose() {
+    widget.openCaptionsRequest?.removeListener(_showCaptions);
     _tabController.dispose();
     super.dispose();
   }
@@ -2261,6 +2479,7 @@ class _DisplayAreaTabsState extends State<DisplayAreaTabs> with SingleTickerProv
           controller: _tabController,
           tabs: const [
             Tab(text: "Canvas"),
+            Tab(text: "Captions"),
             Tab(text: "AA Preview"),
           ],
         ),
@@ -2269,6 +2488,15 @@ class _DisplayAreaTabsState extends State<DisplayAreaTabs> with SingleTickerProv
             controller: _tabController,
             children: [
               _buildCanvasTab(context),
+              // Review and correct captions already saved. Same all-passes
+              // ledger as AA Preview, for the same reason.
+              CaptionsTab(
+                aaPreviewData: widget.aaPreviewData,
+                onSave: widget.onCaptionSave,
+                onSaveSession: widget.onCaptionSaveSession,
+                onNever: widget.onCaptionNever,
+                onClear: widget.onCaptionClear,
+              ),
               // Built directly from `widget.aaPreviewData` on every
               // rebuild of THIS widget — not computed once and cached —
               // so every mutation the parent already calls setState() for

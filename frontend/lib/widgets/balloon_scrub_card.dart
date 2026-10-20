@@ -1,3 +1,4 @@
+import 'action_button_style.dart';
 import 'package:flutter/material.dart';
 
 /// Balloon Scrub card: runs the comic speech-balloon detector over the current
@@ -107,11 +108,7 @@ class BalloonScrubCard extends StatelessWidget {
                   // while a call is in flight, and disabled with no image to
                   // detect against.
                   onPressed: (isDetecting || !hasImage) ? null : onDetect,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF007F00),
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-                  ),
+                  style: actionButtonStyle(busy: isDetecting),
                   child: isDetecting
                       ? const SizedBox(
                           // Same 20x20/strokeWidth 2 as LBSCard's and

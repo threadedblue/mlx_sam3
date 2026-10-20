@@ -21,6 +21,7 @@ enum SfCard {
   balloonScrub,
   lamaBackgroundScrub,
   panels,
+  captions,
   save,
 }
 
@@ -37,6 +38,7 @@ const List<SfCard> kAllCards = [
   SfCard.balloonScrub,
   SfCard.lamaBackgroundScrub,
   SfCard.displayLayers,
+  SfCard.captions,
   SfCard.save,
 ];
 
@@ -55,6 +57,7 @@ const List<SfCard> kComixCards = [
   SfCard.balloonScrub,
   SfCard.lamaBackgroundScrub,
   SfCard.displayLayers,
+  SfCard.captions,
   SfCard.save,
 ];
 

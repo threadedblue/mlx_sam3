@@ -42,8 +42,10 @@ def _clear_crop_cache():
     reason. mask_ids are uuid4-derived, so no cross-test collision is even
     possible; this is purely hygiene."""
     services._crop_cache.clear()
+    services._thumb_cache.clear()
     yield
     services._crop_cache.clear()
+    services._thumb_cache.clear()
 
 
 class TestCropCacheReuse:
@@ -209,3 +211,50 @@ class TestAllPassesCropIsPassAware:
             assert crop1.getpixel((x, y)) == pass1_image.getpixel((x, y))
             # pass 1 is the scrub's repaint — must not match pass 0's crop.
             assert crop1.getpixel((x, y))[:3] == (255, 0, 0)
+
+
+class TestCaptionThumbnails:
+    def test_all_masks_carry_a_trimmed_thumbnail_of_each_object(self):
+        seg = FakeSam3()
+        session = _session(seg)
+        rec = _select_one(session, seg, "front", (1, 4, 2, 5))
+        session.attach_caption(rec.mask_id, "a thing")
+
+        result = services.serialize_sf_masks_all_passes(session)
+        idx = result["mask_ids"].index(rec.mask_id)
+        thumb = Image.open(io.BytesIO(base64.b64decode(result["thumb_png_bytes"][idx])))
+
+        x0, y0, x1, y1 = (int(v) for v in result["boxes"][idx])
+        # Trimmed to the object's box, not page-sized like crop_png_bytes.
+        assert thumb.size == (x1 - x0, y1 - y0)
+        full = Image.open(io.BytesIO(base64.b64decode(result["crop_png_bytes"][idx])))
+        assert thumb.size != full.size
+        # Object pixels survive, in place, and the empty surround stays transparent.
+        for y, x in zip(*[a.tolist() for a in np.nonzero(rec.geometry)]):
+            assert thumb.getpixel((x - x0, y - y0)) == full.getpixel((x, y))
+
+    def test_a_large_object_is_shrunk_to_the_thumbnail_limit(self, monkeypatch):
+        monkeypatch.setattr(services, "THUMB_MAX_SIDE", 3)
+        seg = FakeSam3()
+        session = _session(seg)
+        rec = _select_one(session, seg, "front", (0, 6, 0, 6))
+        result = services.serialize_sf_masks_all_passes(session)
+        thumb = Image.open(io.BytesIO(base64.b64decode(
+            result["thumb_png_bytes"][result["mask_ids"].index(rec.mask_id)])))
+        assert max(thumb.size) <= 3
+
+    def test_thumbnail_is_cached_and_survives_a_caption_edit(self, monkeypatch):
+        seg = FakeSam3()
+        session = _session(seg)
+        rec = _select_one(session, seg, "front", (1, 4, 2, 5))
+        session.attach_caption(rec.mask_id, "first")
+        first = services.serialize_sf_masks_all_passes(session)
+        idx = first["mask_ids"].index(rec.mask_id)
+
+        def boom(*a, **k):
+            raise AssertionError("thumbnail was recomputed")
+        monkeypatch.setattr(sfe, "_png_bytes", boom)
+        session.attach_caption(rec.mask_id, "second")  # overwrite a keep caption
+        second = services.serialize_sf_masks_all_passes(session)
+        assert second["captions"][idx] == "second"
+        assert second["thumb_png_bytes"][idx] == first["thumb_png_bytes"][idx]

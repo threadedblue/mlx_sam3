@@ -7,6 +7,11 @@ import base64
 import time
 import uuid
 from datetime import datetime
+
+
+def _tl(message: str) -> None:
+    """A timestamped diagnostic line (session loading is slow and was unmeasured)."""
+    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} [load] {message}", flush=True)
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -135,6 +140,14 @@ def _b64(data: bytes) -> str:
 # the point.
 _crop_cache: Dict[str, str] = {}
 
+# Review thumbnails for the Captions tab: the mask's object trimmed to its tight
+# bounding box and shrunk to THUMB_MAX_SIDE. Needed because `crop_png_bytes` is
+# page-sized (the object sits where it was on the page, transparent elsewhere),
+# which is useless at list-row size and heavy to decode once per row. Cached per
+# mask_id exactly like the crop, and evicted with it when geometry is refreshed.
+THUMB_MAX_SIDE = 256
+_thumb_cache: Dict[str, str] = {}
+
 
 def _cached_crop_png_b64(sf_session, mask: "sf_engine.MaskRecord") -> str:
     """This mask's crop PNG, base64-encoded — computed once per mask_id for
@@ -154,6 +167,28 @@ def _cached_crop_png_b64(sf_session, mask: "sf_engine.MaskRecord") -> str:
     return cached
 
 
+def _cached_thumb_png_b64(sf_session, mask: "sf_engine.MaskRecord") -> str:
+    """This mask's object, trimmed to its bounding box, at most THUMB_MAX_SIDE on
+    the long side, base64 RGBA PNG; "" when the mask is empty. Pass-aware like
+    [_cached_crop_png_b64]: cut from the image the mask was traced against."""
+    cached = _thumb_cache.get(mask.mask_id)
+    if cached is None:
+        x0, y0, x1, y1 = (int(v) for v in _bbox_from_geometry(mask.geometry))
+        if x1 <= x0 or y1 <= y0:
+            cached = ""
+        else:
+            base_image = sf_session.image_for_pass(mask.pass_).convert("RGBA")
+            box = (x0, y0, x1, y1)
+            alpha = Image.fromarray(sf_engine._binary_mask(mask.geometry) * 255, mode="L").crop(box)
+            piece = base_image.crop(box)
+            out = Image.new("RGBA", piece.size, (0, 0, 0, 0))
+            out.paste(piece, (0, 0), alpha)
+            out.thumbnail((THUMB_MAX_SIDE, THUMB_MAX_SIDE))
+            cached = _b64(sf_engine._png_bytes(out))
+        _thumb_cache[mask.mask_id] = cached
+    return cached
+
+
 def _invalidate_stale_crops(sf_session) -> None:
     """Evict any cached crop whose mask_id had its geometry refreshed since
     the last call.
@@ -166,6 +201,7 @@ def _invalidate_stale_crops(sf_session) -> None:
     """
     for mask_id in sf_session.last_refreshed_mask_ids:
         _crop_cache.pop(mask_id, None)
+        _thumb_cache.pop(mask_id, None)
     sf_session.last_refreshed_mask_ids = set()
 
 
@@ -229,6 +265,7 @@ def serialize_sf_masks(sf_session, state: dict) -> dict:
         "dataset_statuses": [m.dataset_status.value for m in records],
         "held_flags": [m.held for m in records],
         "captions": [m.caption for m in records],
+        "draft_captions": [m.draft_caption for m in records],
         "text_tags": [m.text_tag for m in records],
         "crop_png_bytes": [_cached_crop_png_b64(sf_session, m) for m in records],
         # Every record here is already filtered to sf_session.pass_ (see the
@@ -300,10 +337,12 @@ def serialize_sf_masks_all_passes(sf_session) -> dict:
         "dataset_statuses": [m.dataset_status.value for m in records],
         "held_flags": [m.held for m in records],
         "captions": [m.caption for m in records],
+        "draft_captions": [m.draft_caption for m in records],
         "text_tags": [m.text_tag for m in records],
         "scores": [float(m.score) if m.score is not None else 0.0 for m in records],
         "boxes": [_bbox_from_geometry(m.geometry) for m in records],
         "crop_png_bytes": [_cached_crop_png_b64(sf_session, m) for m in records],
+        "thumb_png_bytes": [_cached_thumb_png_b64(sf_session, m) for m in records],
         "passes": [m.pass_ for m in records],
     }
 
@@ -436,6 +475,7 @@ class SegmentationService:
                 dataset_status=sf_engine.DatasetStatus(seg.get("dataset_status", "unassigned")),
                 held=bool(seg.get("held", False)),
                 caption=seg.get("caption"),
+                draft_caption=seg.get("draft_caption"),
             ))
 
         # Panels (v4 §4) are layout geometry, restored straight from the
@@ -459,6 +499,13 @@ class SegmentationService:
         )
         return sf_session
 
+    @staticmethod
+    def _raw_current_pass(raw: Dict[str, Any]) -> int:
+        """The pass a persisted session is at — the same rule
+        `_reconstruct_sf_session` uses."""
+        pass_images_bytes = raw.get("pass_images") or {}
+        return max([0] + [int(seg["pass"]) for seg in raw["segments"]] + list(pass_images_bytes.keys()))
+
     def _load_session_into_memory(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
         Reads a session from its persisted Segment/Linkage/Registry AAs,
@@ -473,46 +520,64 @@ class SegmentationService:
             # 1. Load image bytes
             image = Image.open(io.BytesIO(raw["image_bytes"])).convert("RGB")
 
-            # 2. Re-initialize model state with the image
-            state = self.processor.set_image(image)
+            # A session past pass 0 throws this replay away:
+            # `_reconstruct_sf_session` re-`set_image`s on the current pass's
+            # own image and discards the pass-0-shaped replayed state (see its
+            # docstring). The replay is a SAM3 forward per saved prompt, so on
+            # a scrubbed session with many prompts it is minutes of work whose
+            # result is never used. Masks come from the persisted columns, not
+            # from replay. Only a pass-0 session keeps its accumulated prompt
+            # state, so only that case replays.
+            if self._raw_current_pass(raw) > 0:
+                _tl(f"{session_id[:8]}: past pass 0, skipping set_image and prompt replay (result would be discarded)")
+                state = None
+                prompts = raw["prompts"]
+            else:
+                # 2. Re-initialize model state with the image
+                _t = time.monotonic()
+                state = self.processor.set_image(image)
+                prompts = raw["prompts"]
+                _tl(f"{session_id[:8]}: set_image {time.monotonic() - _t:.1f}s; replaying {len(prompts)} prompt(s)")
+                _t_replay = time.monotonic()
 
-            # 3. Re-apply prompts, in original order, to reconstruct the full state
-            prompts = raw["prompts"]
-            for idx, p in enumerate(prompts):
-                try:
-                    if isinstance(p, str):  # Text prompt
-                        state = self.processor.set_text_prompt(p, state)
-                    elif isinstance(p, dict) and p.get("type") in ["box", "point"]:
-                        is_positive = p.get("label") == "positive"
-                        # Dispatch by TYPE, not by "whichever geometry key is
-                        # present". Replaying a point through
-                        # add_geometric_prompt sends a 2-element [x, y] into
-                        # the box path, which reshapes to (1, 1, 4) and throws
-                        # "Cannot reshape array of size 2 into shape (1,1,4)" —
-                        # failing the whole load, which the caller then reports
-                        # as a bare 404 "Session not found". Confirmed live on
-                        # 3 of 7 stored sessions. Points also have their own
-                        # trained pathway (see add_point_prompt's docstring);
-                        # the box path was never a valid input shape for them
-                        # even when the arity happened to line up.
-                        if p.get("type") == "point":
-                            point = p.get("point")
-                            if point:
-                                state = self.processor.add_point_prompt(point, is_positive, state)
-                        else:
-                            box = p.get("box")
-                            if box:
-                                state = self.processor.add_geometric_prompt(box, is_positive, state)
-                except Exception as e:
-                    # One unreplayable prompt must not cost the whole session.
-                    # Resuming with a partially reconstructed SAM3 state is
-                    # strictly better than a 404 that reads as "your work is
-                    # gone" — the masks themselves are restored from persisted
-                    # columns, not from replay (see this class's docstring).
-                    print(
-                        f"Warning: skipping unreplayable prompt {idx} "
-                        f"({p!r}) in session {session_id}: {e}"
-                    )
+                # 3. Re-apply prompts, in original order, to reconstruct the full state
+                for idx, p in enumerate(prompts):
+                    try:
+                        if isinstance(p, str):  # Text prompt
+                            state = self.processor.set_text_prompt(p, state)
+                        elif isinstance(p, dict) and p.get("type") in ["box", "point"]:
+                            is_positive = p.get("label") == "positive"
+                            # Dispatch by TYPE, not by "whichever geometry key is
+                            # present". Replaying a point through
+                            # add_geometric_prompt sends a 2-element [x, y] into
+                            # the box path, which reshapes to (1, 1, 4) and throws
+                            # "Cannot reshape array of size 2 into shape (1,1,4)" —
+                            # failing the whole load, which the caller then reports
+                            # as a bare 404 "Session not found". Confirmed live on
+                            # 3 of 7 stored sessions. Points also have their own
+                            # trained pathway (see add_point_prompt's docstring);
+                            # the box path was never a valid input shape for them
+                            # even when the arity happened to line up.
+                            if p.get("type") == "point":
+                                point = p.get("point")
+                                if point:
+                                    state = self.processor.add_point_prompt(point, is_positive, state)
+                            else:
+                                box = p.get("box")
+                                if box:
+                                    state = self.processor.add_geometric_prompt(box, is_positive, state)
+                    except Exception as e:
+                        # One unreplayable prompt must not cost the whole session.
+                        # Resuming with a partially reconstructed SAM3 state is
+                        # strictly better than a 404 that reads as "your work is
+                        # gone" — the masks themselves are restored from persisted
+                        # columns, not from replay (see this class's docstring).
+                        print(
+                            f"Warning: skipping unreplayable prompt {idx} "
+                            f"({p!r}) in session {session_id}: {e}"
+                        )
+
+                _tl(f"{session_id[:8]}: prompt replay {time.monotonic() - _t_replay:.1f}s")
 
             # 4. Construct the session object and store it in memory
             session_data = {
@@ -533,7 +598,9 @@ class SegmentationService:
                 "prompt_template": raw.get("prompt_template") or "",
             }
             self.sessions[session_id] = session_data
+            _t = time.monotonic()
             self.sf_sessions[session_id] = self._reconstruct_sf_session(session_id, raw, state)
+            _tl(f"{session_id[:8]}: reconstruct SFSession {time.monotonic() - _t:.1f}s")
 
             # Restore the single-object invariant most of this codebase
             # already assumes (session["state"] and sf_session.state are
@@ -683,7 +750,10 @@ class SegmentationService:
             return
 
         sf_session = self.sf_sessions.get(session_id)
+        _t = time.monotonic()
         aa_persistence.save_session(session_id, session, sf_session)
+        _tl(f"{session_id[:8]}: save_session {time.monotonic() - _t:.1f}s "
+            f"({len(sf_session.masks) if sf_session is not None else 0} masks)")
 
     def save_session_settings(self, session_id: str, settings: Dict[str, Any]):
         """Merges UI-specific settings into the session's persisted registry.
@@ -737,9 +807,13 @@ class SegmentationService:
         one with no image at all) is fine — the raw-based response below
         already handles that case on its own.
         """
+        _t_all = time.monotonic()
         self.get_session(session_id)
+        _tl(f"{session_id[:8]}: get_session {time.monotonic() - _t_all:.1f}s")
 
+        _t = time.monotonic()
         raw = aa_persistence.read_session_raw(session_id)
+        _tl(f"{session_id[:8]}: read_session_raw {time.monotonic() - _t:.1f}s ({len(raw['segments']) if raw else 0} segment rows)")
         if raw is None:
             raise FileNotFoundError(f"State file not found for session {session_id}")
 
@@ -774,6 +848,22 @@ class SegmentationService:
             # collapse onto pass 0 or any one "current" pass.
             mask = crop_by_mask_id.get(_resolved_mask_id(seg))
             return _cached_crop_png_b64(sf_session, mask) if mask is not None else None
+
+        def _thumb_for(seg: Dict[str, Any]) -> str:
+            # The Captions tab's picture. Same lookup as _crop_for; "" (not
+            # None) when there is no mask, matching serialize_sf_masks_all_passes.
+            mask = crop_by_mask_id.get(_resolved_mask_id(seg))
+            return _cached_thumb_png_b64(sf_session, mask) if mask is not None else ""
+
+        def _timed_list(label: str, fn) -> list:
+            _t0 = time.monotonic()
+            out = [fn(seg) for seg in raw["segments"]]
+            _tl(f"{session_id[:8]}: {label} for {len(out)} segment(s) {time.monotonic() - _t0:.1f}s")
+            return out
+
+        def _draft_for(seg: Dict[str, Any]) -> Optional[str]:
+            mask = crop_by_mask_id.get(_resolved_mask_id(seg))
+            return mask.draft_caption if mask is not None else seg.get("draft_caption")
 
         # A session registered by /initSession but never uploaded to has
         # metadata and no image. That is a session the caller can still use --
@@ -879,7 +969,11 @@ class SegmentationService:
                 "text_tags": [seg["text_tag"] or None for seg in raw["segments"]],
                 "scores": [seg["score"] or 0.0 for seg in raw["segments"]],
                 "boxes": [seg["bbox"] for seg in raw["segments"]],
-                "crop_png_bytes": [_crop_for(seg) for seg in raw["segments"]],
+                "crop_png_bytes": _timed_list("crops", _crop_for),
+                # Same two fields the live endpoints send; without them a
+                # resumed session's Captions tab shows no pictures and no drafts.
+                "thumb_png_bytes": _timed_list("thumbnails", _thumb_for),
+                "draft_captions": [_draft_for(seg) for seg in raw["segments"]],
                 "passes": [int(seg["pass"]) for seg in raw["segments"]],
             },
             "prompts": raw["prompts"],
@@ -927,6 +1021,7 @@ class SegmentationService:
         if view_layers is not None:
             response["view_layers"] = view_layers
 
+        _tl(f"{session_id[:8]}: load_session_from_disk total {time.monotonic() - _t_all:.1f}s")
         return response
 
     def delete_session_memory(self, session_id: str) -> bool:

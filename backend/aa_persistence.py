@@ -127,6 +127,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -359,6 +360,10 @@ def _build_segments_from_masks(session_id: str, sf_session: "sf_engine.SFSession
             rows.append(row_key)
             cols.append("caption")
             vals.append(mask.caption or "")
+        if mask.draft_caption:
+            rows.append(row_key)
+            cols.append("draft_caption")
+            vals.append(mask.draft_caption)
         if mask.text_tag:
             rows.append(row_key)
             cols.append("text_tag")
@@ -405,14 +410,27 @@ def save_session(
     """
     d = session_dir(session_id)
 
+    def _log(msg: str) -> None:
+        from datetime import datetime
+        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} [save] {session_id[:8]}: {msg}", flush=True)
+
+    t = time.monotonic()
     r_rows, r_cols, r_vals = _build_registry(session_id, session)
+    _log(f"build registry (Python) {time.monotonic() - t:.2f}s")
+    t = time.monotonic()
     bridge.save_parquet(str(d / "registry.parquet"), r_rows, r_cols, r_vals)
+    _log(f"write registry.parquet (JuliaCall+Julia) {time.monotonic() - t:.2f}s, {sum(len(v) for v in r_vals) / 1e6:.1f} MB")
     written = ["registry.parquet"]
 
     seg_path = d / "segment.parquet"
+    t = time.monotonic()
     seg_rows, seg_cols, seg_vals = _build_segments(session_id, session, sf_session)
+    _log(f"build segments (Python: PNG-encode + base64) {time.monotonic() - t:.2f}s, "
+         f"{len(seg_rows)} cells, {sum(len(v) for v in seg_vals) / 1e6:.1f} MB")
     if seg_rows:
+        t = time.monotonic()
         bridge.save_parquet(str(seg_path), seg_rows, seg_cols, seg_vals)
+        _log(f"write segment.parquet (JuliaCall+Julia) {time.monotonic() - t:.2f}s")
         written.append("segment.parquet")
     else:
         seg_path.unlink(missing_ok=True)
@@ -420,7 +438,9 @@ def save_session(
     link_path = d / "linkage.parquet"
     link_rows, link_cols, link_vals = _build_linkage(session_id, session)
     if link_rows:
+        t = time.monotonic()
         bridge.save_parquet(str(link_path), link_rows, link_cols, link_vals)
+        _log(f"write linkage.parquet (JuliaCall+Julia) {time.monotonic() - t:.2f}s, {len(link_rows)} rows")
         written.append("linkage.parquet")
     else:
         link_path.unlink(missing_ok=True)
@@ -544,6 +564,8 @@ def read_session_raw(session_id: str) -> Optional[dict[str, Any]]:
                 # text_tag defaults to "" (unknown) — never recorded on
                 # rows written before this column existed.
                 "text_tag": attrs.get("text_tag", ""),
+                # Model draft, if any; absent on sessions saved before it.
+                "draft_caption": attrs.get("draft_caption") or None,
             })
 
     prompts: list[Any] = []

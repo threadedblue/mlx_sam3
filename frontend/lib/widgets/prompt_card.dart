@@ -1,3 +1,4 @@
+import 'action_button_style.dart';
 import 'package:flutter/material.dart';
 
 import '../main.dart' show SelectionMode, promptCardCanSubmit;
@@ -103,13 +104,7 @@ class PromptCard extends StatelessWidget {
                     captionMode: captionMode,
                     selectedMode: selectedMode,
                   ) ? onSubmit : null,
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: captionMode ? const Color(0xFF007F00) : Colors.white,
-                    side: BorderSide(color: captionMode ? const Color(0xFF007F00) : Colors.white),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(24),
-                    ),
-                  ),
+                  style: actionButtonStyle(busy: isLoading),
                   child: Text(captionMode ? "Save Caption" : "Select"),
                 ),
               ),

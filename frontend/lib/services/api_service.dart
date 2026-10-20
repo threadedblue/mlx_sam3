@@ -551,4 +551,67 @@ class ApiService {
       debugPrint('Error saving session settings: $e');
     }
   }
+  /// Marks segments "never needs" ([never] true) or takes the mark back.
+  /// Returns the refreshed all-passes ledger under `all_masks`. Throws with the
+  /// server's reason (e.g. a captioned segment cannot be marked).
+  Future<Map<String, dynamic>> setMasksNever(String sessionId, List<String> maskIds, bool never) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/mask/never'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'session_id': sessionId, 'mask_ids': maskIds, 'never': never}),
+    );
+    if (response.statusCode == 200) return jsonDecode(response.body) as Map<String, dynamic>;
+    String detail = response.body;
+    try {
+      detail = (jsonDecode(response.body) as Map)['detail']?.toString() ?? detail;
+    } catch (_) {}
+    throw Exception(detail);
+  }
+
+  /// Deletes the captions of [maskIds]: each segment goes back to uncaptioned.
+  /// Returns `{all_masks}`.
+  Future<Map<String, dynamic>> clearCaptions(String sessionId, List<String> maskIds) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/mask/caption/clear'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'session_id': sessionId, 'mask_ids': maskIds}),
+    );
+    if (response.statusCode == 200) return jsonDecode(response.body) as Map<String, dynamic>;
+    String detail = response.body;
+    try {
+      detail = (jsonDecode(response.body) as Map)['detail']?.toString() ?? detail;
+    } catch (_) {}
+    throw Exception(detail);
+  }
+
+  /// Starts the captioner on every segment that has neither a caption nor a
+  /// draft (or just [maskIds]). Results arrive as drafts, never as captions.
+  /// Returns `{job_id, total}`; `job_id` is null when there is nothing to do.
+  Future<Map<String, dynamic>> runCaptioner(String sessionId, {List<String>? maskIds}) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/captioner/run'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'session_id': sessionId, if (maskIds != null) 'mask_ids': maskIds}),
+    );
+    if (response.statusCode == 200) return jsonDecode(response.body) as Map<String, dynamic>;
+    String detail = response.body;
+    try {
+      detail = (jsonDecode(response.body) as Map)['detail']?.toString() ?? detail;
+    } catch (_) {}
+    throw Exception(detail);
+  }
+
+  /// Progress of a captioner run, plus the refreshed all-passes ledger so
+  /// drafts show up as they arrive.
+  Future<Map<String, dynamic>> captionerStatus(String sessionId, String jobId) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/captioner/status/$jobId').replace(queryParameters: {'session_id': sessionId}),
+    );
+    if (response.statusCode == 200) return jsonDecode(response.body) as Map<String, dynamic>;
+    throw Exception('Captioner status failed: ${response.statusCode} ${response.body}');
+  }
+
+  Future<void> cancelCaptioner(String jobId) async {
+    await http.post(Uri.parse('$baseUrl/captioner/cancel/$jobId'));
+  }
 }
