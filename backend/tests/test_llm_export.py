@@ -624,7 +624,10 @@ class TestExportEndpoint:
 
         assert r.status_code == 200
         body = r.json()
-        assert set(body) == {"schema", "session_id", "page", "panels", "segments"}
+        assert set(body) == {
+            "schema", "session_id", "original_filename", "session_name",
+            "page", "panels", "segments",
+        }
         assert body["schema"] == "sf.llm_payload/v1"
         assert set(body["page"]) == {
             "page_b64", "page_path", "page_pass", "page_rule", "width", "height",

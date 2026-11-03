@@ -11,6 +11,13 @@ Configuration (environment, read per call so a restart is not needed):
                           backend venv next to this repo, if it exists.
     SF_CAPTIONER_MODEL    base model id. Default Qwen2-VL-2B-Instruct-bf16.
     SF_CAPTIONER_ADAPTER  adapter .safetensors path. Empty = plain base model.
+    SF_CAPTIONER_PROMPT_FILE
+                          .md file holding the prompt, re-read on EVERY run so
+                          an edit applies at once. Default: DN's
+                          storage/prompts/qwen_caption.md if it exists. Missing,
+                          unreadable or empty = "Describe this image.".
+                          `{{text_tag}}`, `{{pass}}`, `{{bbox}}`, `{{panel}}`
+                          are filled per segment (see prompt_template.py).
 
 A run is a background job over a list of masks: one subprocess per mask
 (model reload each time — slow but simple), each result written to the
@@ -31,6 +38,20 @@ from typing import Callable, Dict, List, Optional
 DEFAULT_MODEL = "mlx-community/Qwen2-VL-2B-Instruct-bf16"
 PROMPT = "Describe this image."
 _DN_VENV_PYTHON = Path(__file__).resolve().parents[2] / "DoubleNaught" / "backend" / ".venv" / "bin" / "python"
+_DN_PROMPT_FILE = Path(__file__).resolve().parents[2] / "DoubleNaught" / "storage" / "prompts" / "qwen_caption.md"
+
+
+def load_prompt_template() -> str:
+    """The captioner prompt, unexpanded. Read fresh each call; any failure to
+    find or read the file falls back to the built-in PROMPT rather than
+    stopping a run."""
+    configured = os.environ.get("SF_CAPTIONER_PROMPT_FILE", "")
+    path = Path(configured) if configured else _DN_PROMPT_FILE
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return PROMPT
+    return text or PROMPT
 
 
 def masks_needing_draft(masks) -> List[str]:
@@ -74,7 +95,7 @@ def clean_output(text: str) -> str:
     return "\n".join(kept).strip()
 
 
-def caption_file(image_path: str, timeout: float = 600) -> str:
+def caption_file(image_path: str, timeout: float = 600, prompt: Optional[str] = None) -> str:
     cfg = config()
     if not cfg["python"]:
         raise CaptionerError("no captioner interpreter: set SF_CAPTIONER_PYTHON to a Python with mlx-vlm installed")
@@ -82,7 +103,7 @@ def caption_file(image_path: str, timeout: float = 600) -> str:
         raise CaptionerError(f"adapter not found: {cfg['adapter']}")
     cmd = [
         cfg["python"], "-m", "mlx_vlm", "generate",
-        "--model", cfg["model"], "--image", image_path, "--prompt", PROMPT,
+        "--model", cfg["model"], "--image", image_path, "--prompt", prompt or PROMPT,
         "--max-tokens", "200", "--temperature", "0",
     ]
     if cfg["adapter"]:
@@ -100,12 +121,12 @@ def caption_file(image_path: str, timeout: float = 600) -> str:
     return text
 
 
-def caption_png(png_bytes: bytes) -> str:
+def caption_png(png_bytes: bytes, prompt: Optional[str] = None) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "segment.png")
         with open(path, "wb") as fh:
             fh.write(png_bytes)
-        return caption_file(path)
+        return caption_file(path, prompt=prompt)
 
 
 class _Job:

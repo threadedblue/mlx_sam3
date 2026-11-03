@@ -1281,11 +1281,18 @@ async def captioner_run(request: CaptionerRunRequest):
     if not wanted:
         return {"job_id": None, "total": 0}
 
+    # Read once per run (not per mask): one run uses one prompt, and the file
+    # is re-read on the next run, so an edit applies without a restart.
+    prompt_template_text = captioner.load_prompt_template()
+
     def caption_one(mask_id: str) -> None:
         mask = sf_session.get_mask(mask_id)
         image = sf_session.image_for_pass(mask.pass_)
         png = sf_engine.segment_crop_png_bytes(image, mask.geometry)
-        sf_session.set_draft_caption(mask_id, captioner.caption_png(png))
+        prompt = prompt_template_mod.expand_prompt_template(
+            prompt_template_text, text_tag=mask.text_tag, pass_=mask.pass_,
+        )
+        sf_session.set_draft_caption(mask_id, captioner.caption_png(png, prompt))
 
     try:
         job = captioner.start(wanted, caption_one)
